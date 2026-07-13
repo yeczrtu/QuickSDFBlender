@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender-independent reference algorithms for Quick SDF.
 
 The native module may accelerate these operations, but this module deliberately
@@ -139,6 +140,11 @@ def _side_indices(angles: np.ndarray, sign: int) -> np.ndarray:
 
 def _edt_rows_squared(cost: np.ndarray, *, block_rows: int = 1024) -> np.ndarray:
     """Felzenszwalb-Huttenlocher squared transform along the last axis.
+
+    This vectorized adaptation is based on Pedro Felzenszwalb's 2006
+    GPL-2.0-or-later implementation accompanying *Distance Transforms of
+    Sampled Functions*: https://cs.brown.edu/people/pfelzens/dt/ . Quick SDF
+    modifications are GPL-3.0-or-later; see ``THIRD_PARTY_NOTICES.md``.
 
     Rows are processed together with NumPy while the lower-envelope dimension
     remains sequential.  Blocking prevents the envelope workspaces from

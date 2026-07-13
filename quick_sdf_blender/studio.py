@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Transient Quick SDF Studio session and workspace management.
 
 The persistent project model deliberately does not contain an ``author_active``

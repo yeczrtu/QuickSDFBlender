@@ -4,13 +4,14 @@ id = "quick_sdf_blender"
 version = "0.3.2"
 name = "Quick SDF Studio"
 tagline = "Paint toon face shadows with an artist-first angle timeline"
-maintainer = "Quick SDF contributors"
+maintainer = "hoshino"
 type = "add-on"
 tags = ["Paint", "Material"]
 website = "https://github.com/yeczrtu/QuickSDFBlender"
 blender_version_min = "5.1.0"
 platforms = ["windows-x64"]
 license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 hoshino"]
 
 [permissions]
 files = "Import masks and export 16-bit threshold textures"

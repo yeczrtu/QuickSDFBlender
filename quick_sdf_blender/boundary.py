@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Boundary authoring and pure UV curve helpers for Quick SDF.
 
 The geometry functions in this module deliberately have no Blender dependency so

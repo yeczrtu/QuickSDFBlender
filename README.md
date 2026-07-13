@@ -60,4 +60,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_extension.ps
 
 ## License
 
-Quick SDF Studioは[GNU General Public License v3.0 or later](LICENSE)で公開されています。同梱native coreも同じライセンスです。実行時に使用するNumPyはBlender 5.1同梱版で、BSD-3-Clauseライセンスです。
+Quick SDF Studioは[GNU General Public License v3.0 or later](LICENSE)で公開されています。同梱native coreも同じライセンスです。利用しているアルゴリズムとランタイムの帰属情報は[Third-Party Notices](THIRD_PARTY_NOTICES.md)に記載しています。

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Quick SDF preview node group and reversible material assignment."""
 
 from __future__ import annotations

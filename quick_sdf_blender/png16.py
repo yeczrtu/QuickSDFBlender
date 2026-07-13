@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Minimal, dependency-free RGBA16 PNG encoding and atomic file output."""
 
 from __future__ import annotations

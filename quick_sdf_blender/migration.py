@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Quick SDF persistent-data migrations.
 
 Migration is deliberately idempotent.  Blender can invoke load/undo handlers

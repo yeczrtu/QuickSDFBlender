@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Artist-first launcher and Advanced controls for Quick SDF Studio.
 
 Daily angle selection lives in the full-width Studio timeline and daily paint

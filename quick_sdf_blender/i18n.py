@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Small, explicit English/Japanese UI dictionary for Quick SDF Studio."""
 
 from __future__ import annotations

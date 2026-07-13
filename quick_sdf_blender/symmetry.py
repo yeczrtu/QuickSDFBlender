@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender-independent UV symmetry helpers for Quick SDF.
 
 The authoring direction is deliberately one-way: positive-angle masks are the

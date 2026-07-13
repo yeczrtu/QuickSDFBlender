@@ -60,6 +60,14 @@ Vec3 cross(Vec3 first, Vec3 second) {
     };
 }
 
+/*
+ * The parabolic lower-envelope distance transform below is adapted from the
+ * implementation accompanying "Distance Transforms of Sampled Functions".
+ * Copyright (C) 2006 Pedro Felzenszwalb.
+ * Original code: GPL-2.0-or-later.
+ * Source: https://cs.brown.edu/people/pfelzens/dt/
+ * Quick SDF modifications: GPL-3.0-or-later; see THIRD_PARTY_NOTICES.md.
+ */
 void dt_1d(const double* f, double* d, int n, std::vector<int>& v,
            std::vector<double>& z) {
     int k = 0;

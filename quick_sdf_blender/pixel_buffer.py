@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Memory-conscious conversions for Blender image pixel buffers."""
 
 from __future__ import annotations

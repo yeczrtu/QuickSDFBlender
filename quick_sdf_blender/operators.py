@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Primary Blender operators for Quick SDF projects and angle masks."""
 
 from __future__ import annotations

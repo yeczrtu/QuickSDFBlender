@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Interactive Quick SDF timeline hosted by a compact Dope Sheet area."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Continuous, non-destructive Studio preview for the timeline seek rail."""
 
 from __future__ import annotations

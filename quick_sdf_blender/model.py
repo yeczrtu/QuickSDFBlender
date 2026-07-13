@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Persistent RNA data model for Quick SDF Blender.
 
 Only Blender ID pointers and plain RNA values are stored here.  Runtime caches must

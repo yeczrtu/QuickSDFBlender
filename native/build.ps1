@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $PSScriptRoot 'build'

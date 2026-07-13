@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender-independent image builders for Quick SDF review modes.
 
 All functions return display-ready, straight-alpha ``float32`` RGBA arrays in

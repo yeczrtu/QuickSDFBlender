@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender runtime helpers shared by operators, UI, and preview code."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Quick SDF paint tools for Blender's 3D and Image editors.
 
 The keymaps live on WorkSpaceTool definitions, so LMB is wrapped only while the
