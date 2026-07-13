@@ -3,8 +3,10 @@
 
 Blender's native undo does not reliably group edits to several ``Image``
 datablocks into one operation.  :class:`History` is the fallback used by Quick
-SDF: it stores only the smallest changed rectangle for each RGBA NumPy array
-and compresses both sides of that rectangle with zlib.
+SDF: it stores only the changed pixel indices and values for each RGBA NumPy
+array and compresses them with zlib. A projected stroke may touch UV islands
+spread across the texture, so a single bounding rectangle can be almost as
+large as the whole image even when only a small number of pixels changed.
 
 The class never mutates arrays supplied by the caller.  ``undo`` and ``redo``
 return full replacement arrays for the images affected by the action; image
@@ -27,13 +29,15 @@ DEFAULT_BYTE_BUDGET = 256 * 1024 * 1024
 class _ImageDelta:
     shape: tuple[int, int, int]
     dtype: str
-    bbox: tuple[int, int, int, int]
+    index_dtype: str
+    count: int
+    indices: bytes
     before: bytes
     after: bytes
 
     @property
     def storage_bytes(self) -> int:
-        return len(self.before) + len(self.after)
+        return len(self.indices) + len(self.before) + len(self.after)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,17 +104,21 @@ def _make_delta(
     if not np.any(changed):
         return None
 
-    ys, xs = np.nonzero(changed)
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    first_patch = np.ascontiguousarray(before[y0:y1, x0:x1, :])
-    second_patch = np.ascontiguousarray(after[y0:y1, x0:x1, :])
+    flat_indices = np.flatnonzero(changed.reshape(-1))
+    index_dtype = np.dtype("<u4" if changed.size <= np.iinfo(np.uint32).max else "<u8")
+    packed_indices = np.ascontiguousarray(flat_indices, dtype=index_dtype)
+    first = np.ascontiguousarray(before).reshape(-1, 4)
+    second = np.ascontiguousarray(after).reshape(-1, 4)
+    first_values = np.ascontiguousarray(first[flat_indices])
+    second_values = np.ascontiguousarray(second[flat_indices])
     return _ImageDelta(
         shape=(int(before.shape[0]), int(before.shape[1]), 4),
         dtype=before.dtype.str,
-        bbox=(y0, y1, x0, x1),
-        before=zlib.compress(first_patch.tobytes(order="C"), compression_level),
-        after=zlib.compress(second_patch.tobytes(order="C"), compression_level),
+        index_dtype=index_dtype.str,
+        count=int(flat_indices.size),
+        indices=zlib.compress(packed_indices.tobytes(order="C"), compression_level),
+        before=zlib.compress(first_values.tobytes(order="C"), compression_level),
+        after=zlib.compress(second_values.tobytes(order="C"), compression_level),
     )
 
 
@@ -121,19 +129,23 @@ def _restore_patch(current: np.ndarray, delta: _ImageDelta, payload: bytes) -> n
     if array.dtype.str != delta.dtype:
         raise TypeError(f"current image dtype {array.dtype} does not match history {delta.dtype}")
 
-    y0, y1, x0, x1 = delta.bbox
-    patch_shape = (y1 - y0, x1 - x0, 4)
-    expected_bytes = int(np.prod(patch_shape, dtype=np.int64)) * array.dtype.itemsize
     try:
+        raw_indices = zlib.decompress(delta.indices)
         raw = zlib.decompress(payload)
     except zlib.error as error:
         raise RuntimeError("corrupt compressed image history") from error
-    if len(raw) != expected_bytes:
+    index_dtype = np.dtype(delta.index_dtype)
+    expected_index_bytes = delta.count * index_dtype.itemsize
+    expected_bytes = delta.count * 4 * array.dtype.itemsize
+    if len(raw_indices) != expected_index_bytes or len(raw) != expected_bytes:
         raise RuntimeError("corrupt image history payload size")
 
-    patch = np.frombuffer(raw, dtype=np.dtype(delta.dtype)).reshape(patch_shape)
-    restored = np.array(array, copy=True, order="K")
-    restored[y0:y1, x0:x1, :] = patch
+    indices = np.frombuffer(raw_indices, dtype=index_dtype)
+    if np.any(indices >= array.shape[0] * array.shape[1]):
+        raise RuntimeError("corrupt image history pixel index")
+    values = np.frombuffer(raw, dtype=np.dtype(delta.dtype)).reshape(delta.count, 4)
+    restored = np.array(array, copy=True, order="C")
+    restored.reshape(-1, 4)[indices] = values
     return restored
 
 
@@ -194,6 +206,14 @@ class History:
     @property
     def redo_label(self) -> str | None:
         return self._redo[-1].label if self._redo else None
+
+    @property
+    def undo_keys(self) -> tuple[str, ...]:
+        return tuple(self._undo[-1].images) if self._undo else ()
+
+    @property
+    def redo_keys(self) -> tuple[str, ...]:
+        return tuple(self._redo[-1].images) if self._redo else ()
 
     def clear(self) -> None:
         self._undo.clear()
@@ -262,12 +282,12 @@ class History:
         return restored
 
     def undo(self, current: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Return affected images with the newest action's rectangles restored."""
+        """Return affected images with the newest action's pixels restored."""
 
         return self._apply(self._undo, self._redo, current, use_after=False)
 
     def redo(self, current: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Return affected images with the next action's rectangles reapplied."""
+        """Return affected images with the next action's pixels reapplied."""
 
         return self._apply(self._redo, self._undo, current, use_after=True)
 

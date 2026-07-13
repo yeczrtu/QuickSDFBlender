@@ -177,11 +177,10 @@ def _affected_indices(project: Any, keys: Sequence[tuple[int, Any]]) -> set[int]
     if not keys:
         return set()
     active = int(getattr(project, "active_angle_index", keys[0][0]))
-    current = float(getattr(project.angles[active], "angle", 0.0))
-    light = int(getattr(project, "paint_value", 0)) != 0
-    if light:
-        return {index for index, item in keys if float(item.angle) >= current - 1.0e-4}
-    return {index for index, item in keys if float(item.angle) <= current + 1.0e-4}
+    # Interactive strokes edit only the selected key so Blender remains as
+    # responsive as its native Texture Paint. Export performs the non-
+    # destructive cross-angle consistency repair.
+    return {active}
 
 
 def _seek_value(project: Any) -> float:

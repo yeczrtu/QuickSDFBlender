@@ -9,6 +9,7 @@ paint state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Callable
 
 import bpy
@@ -60,6 +61,11 @@ class StudioSession:
     projection_settings_suspended: bool = False
     stroke_brush_name: str = ""
     stroke_brush_color: tuple[float, float, float] | None = None
+    stroke_brush_secondary_color: tuple[float, float, float] | None = None
+    stroke_unified_use_color: bool | None = None
+    stroke_unified_color: tuple[float, float, float] | None = None
+    stroke_unified_secondary_color: tuple[float, float, float] | None = None
+    stroke_watchdog_deadline: float = 0.0
     stroke_from_view3d: bool = False
     projection_hint: str = ""
     export_review_active: bool = False
@@ -346,6 +352,20 @@ def back_to_paint(context: Any, project: Any) -> bool:
     """Return Preview to the stored edit key before any mutating action."""
 
     session = active_session(context)
+    if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        active_uuid = str(getattr(project, "active_angle_uuid", ""))
+        canvas = getattr(context.scene.tool_settings.image_paint, "canvas", None)
+        canvas_uuid = str(canvas.get("quick_sdf_angle_uuid", "")) if canvas is not None else ""
+        # The common paint path is already synchronized. Re-selecting the key
+        # here used to rebuild the preview material on every mouse press, which
+        # caused a black shader-compilation frame and severe input latency.
+        if (
+            session.view_mode == "EDIT"
+            and session.paint_key_uuid == active_uuid
+            and canvas_uuid == active_uuid
+            and not session.export_review_active
+        ):
+            return True
     key_uuid = session.paint_key_uuid if session is not None else str(getattr(project, "active_angle_uuid", ""))
     if select_paint_key(context, project, key_uuid=key_uuid):
         return True
@@ -379,7 +399,7 @@ def reconcile_view_state(context: Any | None = None) -> bool:
 
 
 def prepare_stroke_brush(context: Any, project: Any) -> None:
-    """Temporarily apply the selected binary color to the active Brush Asset."""
+    """Temporarily apply the selected binary colour without changing assets."""
 
     session = active_session(context)
     if session is None:
@@ -390,16 +410,60 @@ def prepare_stroke_brush(context: Any, project: Any) -> None:
     brush = getattr(image_paint, "brush", None)
     session.stroke_from_view3d = getattr(getattr(context, "area", None), "type", "") == "VIEW_3D"
     session.projection_hint = ""
+    value = 1.0 if int(getattr(project, "paint_value", 0)) else 0.0
+    inverse = 1.0 - value
+    unified = getattr(image_paint, "unified_paint_settings", None)
+    if unified is not None:
+        session.stroke_unified_use_color = bool(unified.use_unified_color)
+        session.stroke_unified_color = tuple(
+            float(channel) for channel in unified.color[:3]
+        )
+        session.stroke_unified_secondary_color = tuple(
+            float(channel) for channel in unified.secondary_color[:3]
+        )
+        try:
+            # Force the transient unified colour path so the active Brush Asset
+            # is never modified. Blender 5.1 otherwise chooses between Brush
+            # and Unified colours based on the user's setting.
+            unified.use_unified_color = True
+            unified.color = (value, value, value)
+            unified.secondary_color = (inverse, inverse, inverse)
+            session.stroke_watchdog_deadline = time.monotonic() + 0.25
+            if not bpy.app.timers.is_registered(_stroke_restore_watchdog):
+                bpy.app.timers.register(_stroke_restore_watchdog, first_interval=0.05)
+            return
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            try:
+                if session.stroke_unified_color is not None:
+                    unified.color = session.stroke_unified_color
+                if session.stroke_unified_secondary_color is not None:
+                    unified.secondary_color = session.stroke_unified_secondary_color
+                if session.stroke_unified_use_color is not None:
+                    unified.use_unified_color = session.stroke_unified_use_color
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                pass
+            session.stroke_unified_use_color = None
+            session.stroke_unified_color = None
+            session.stroke_unified_secondary_color = None
+    # Compatibility fallback for Blender builds without unified colour.
     if brush is None:
         return
     session.stroke_brush_name = str(getattr(brush, "name", ""))
     session.stroke_brush_color = tuple(float(channel) for channel in brush.color[:3])
-    value = 1.0 if int(getattr(project, "paint_value", 0)) else 0.0
+    session.stroke_brush_secondary_color = tuple(
+        float(channel) for channel in brush.secondary_color[:3]
+    )
     try:
         brush.color = (value, value, value)
+        brush.secondary_color = (inverse, inverse, inverse)
+        brush.update_tag()
+        session.stroke_watchdog_deadline = time.monotonic() + 0.25
+        if not bpy.app.timers.is_registered(_stroke_restore_watchdog):
+            bpy.app.timers.register(_stroke_restore_watchdog, first_interval=0.05)
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         session.stroke_brush_name = ""
         session.stroke_brush_color = None
+        session.stroke_brush_secondary_color = None
 
 
 def restore_stroke_brush(
@@ -410,39 +474,122 @@ def restore_stroke_brush(
     """Restore a Brush Asset after the native stroke, cancel, save, or exit."""
 
     session = session or _SESSION
-    if session is None or not session.stroke_brush_name or session.stroke_brush_color is None:
+    if session is None:
         return
-    brush = bpy.data.brushes.get(session.stroke_brush_name)
-    if brush is not None:
+    brush = bpy.data.brushes.get(session.stroke_brush_name) if session.stroke_brush_name else None
+    if brush is not None and session.stroke_brush_color is not None:
         try:
             brush.color = session.stroke_brush_color
+            if session.stroke_brush_secondary_color is not None:
+                brush.secondary_color = session.stroke_brush_secondary_color
+            brush.update_tag()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None or str(getattr(scene, "name", "")) != session.scene_name:
+        scene = bpy.data.scenes.get(session.scene_name)
+    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
+    unified = getattr(image_paint, "unified_paint_settings", None)
+    if unified is not None and session.stroke_unified_color is not None:
+        try:
+            unified.color = session.stroke_unified_color
+            if session.stroke_unified_secondary_color is not None:
+                unified.secondary_color = session.stroke_unified_secondary_color
+            if session.stroke_unified_use_color is not None:
+                unified.use_unified_color = session.stroke_unified_use_color
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
             pass
     session.stroke_brush_name = ""
     session.stroke_brush_color = None
+    session.stroke_brush_secondary_color = None
+    session.stroke_unified_use_color = None
+    session.stroke_unified_color = None
+    session.stroke_unified_secondary_color = None
+    session.stroke_watchdog_deadline = 0.0
+
+
+def _stroke_restore_watchdog() -> float | None:
+    """Restore temporary colours when Blender cancels a native modal stroke."""
+
+    session = _SESSION
+    if session is None:
+        return None
+    override_active = bool(
+        session.stroke_brush_color is not None
+        or session.stroke_unified_color is not None
+    )
+    if not override_active:
+        return None
+    window = find_window(session.window_pointer)
+    modal_ids = {
+        str(
+            getattr(operator, "bl_idname", "")
+            or getattr(getattr(operator, "bl_rna", None), "identifier", "")
+        )
+        for operator in getattr(window, "modal_operators", ())
+    }
+    if modal_ids & {"QUICKSDF_OT_range_paint", "QUICKSDF_OT_range_paint_invert"}:
+        return 0.05
+    if time.monotonic() < float(session.stroke_watchdog_deadline):
+        return 0.05
+    project = resolve_session_project(session)
+    restore_stroke_brush(session=session)
+    if project is not None:
+        try:
+            from .runtime import discard_interactive_paint_snapshot
+
+            discard_interactive_paint_snapshot(project)
+        except (AttributeError, ImportError, ReferenceError, RuntimeError):
+            pass
+    return None
+
+
+def _cancel_stroke_watchdog() -> None:
+    if bpy.app.timers.is_registered(_stroke_restore_watchdog):
+        try:
+            bpy.app.timers.unregister(_stroke_restore_watchdog)
+        except ValueError:
+            pass
+
+
+def _release_project_history(project: Any | None = None) -> None:
+    try:
+        from .operators import clear_histories
+
+        if project is None:
+            clear_histories()
+        else:
+            clear_histories(
+                str(getattr(project, "uuid", "")),
+                release_fence=True,
+            )
+    except (AttributeError, ImportError, ReferenceError, RuntimeError):
+        pass
+
+
+def _discard_project_paint_snapshot(project: Any | None) -> None:
+    if project is None:
+        return
+    try:
+        from .runtime import discard_paint_snapshot
+
+        discard_paint_snapshot(project)
+    except (AttributeError, ImportError, ReferenceError, RuntimeError):
+        pass
 
 
 def set_projection_hint(context: Any | None, *, no_change: bool) -> None:
+    """Clear the retired no-op warning without interrupting native painting.
+
+    A same-colour stroke and a projection miss are indistinguishable after the
+    native operator returns. Treating either as a red error was misleading and
+    occupied the standard Brush Asset controls in the Tool Header.
+    """
+
     session = active_session(context or bpy.context)
     if session is None:
         return
-    project = resolve_session_project(session)
-    if no_change:
-        from .i18n import tr
-
-        painting_light = bool(int(getattr(project, "paint_value", 0))) if project is not None else False
-        current = "Light" if painting_light else "Shadow"
-        opposite = "Shadow" if painting_light else "Light"
-        session.projection_hint = " · ".join(
-            (
-                tr("No visible change"),
-                tr(f"this area may already be {current}. Try {opposite}"),
-            )
-        )
-        if session.stroke_from_view3d:
-            session.projection_hint += f" · {tr('if the brush misses, move back or press Numpad 5')}"
-    else:
-        session.projection_hint = ""
+    session.projection_hint = ""
     tag_studio_redraw()
 
 
@@ -721,8 +868,26 @@ def _restore_preview(project: Any | None) -> None:
 
 
 def _assign_preview(project: Any, image: Any | None) -> None:
-    from .preview import assign_preview_material
+    from .preview import assign_preview_material, set_preview_image
 
+    obj = getattr(project, "target_object", None)
+    slot_index = int(getattr(project, "material_slot_index", -1))
+    material_name = str(getattr(project, "preview_material_name", ""))
+    material = bpy.data.materials.get(material_name) if material_name else None
+    if (
+        obj is not None
+        and 0 <= slot_index < len(getattr(obj, "material_slots", ()))
+        and material is not None
+        and obj.material_slots[slot_index].material == material
+    ):
+        # Key selection only changes the Image node. Rebuilding and rewiring
+        # the whole material here used to compile a shader on every stroke and
+        # also exposed the preview graph to accidental self-links.
+        if image is not None:
+            set_preview_image(project, image)
+        project.preview_enabled = True
+        project.material_override_active = True
+        return
     assign_preview_material(project, image)
 
 
@@ -872,11 +1037,14 @@ def _rollback_pending(error: BaseException | None = None) -> None:
             project.diagnostic_message = f"Could not open Studio: {error}"
         except (AttributeError, ReferenceError):
             pass
+    restore_stroke_brush(session=session)
+    _discard_project_paint_snapshot(project)
+    _cancel_stroke_watchdog()
+    _release_project_history(project)
     if window is None:
         return
     failed_workspace = bpy.data.workspaces.get(session.workspace_name)
     scene = bpy.data.scenes.get(session.scene_name)
-    restore_stroke_brush(session=session)
     _restore_projection_settings(scene, session, window)
     previous = bpy.data.workspaces.get(session.previous_workspace_name)
     if previous is not None:
@@ -968,6 +1136,9 @@ def _continue_enter() -> float | None:
             project.warning_message = ""
             _SESSION = session
             _PENDING = None
+            from .operators import arm_undo_fence
+
+            arm_undo_fence(str(getattr(project, "uuid", "")))
             tag_studio_redraw()
             return None
     except Exception as error:
@@ -1089,6 +1260,7 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
         window.workspace = workspace
         _leave_object_mode(context, window, old_obj)
         restore_stroke_brush(session=session)
+        _cancel_stroke_watchdog()
         _restore_preview(old_project)
         try:
             from .runtime import discard_paint_snapshot
@@ -1117,6 +1289,10 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
         )
         _configure_session_target(context, session, project, frame_content=True)
         switched = True
+        _release_project_history(old_project)
+        from .operators import arm_undo_fence
+
+        arm_undo_fence(str(getattr(project, "uuid", "")))
         tag_studio_redraw()
         return session
     except Exception as error:
@@ -1336,6 +1512,9 @@ def exit_studio(
     project = resolve_session_project(session)
     _restore_preview(project)
     restore_stroke_brush(session=session)
+    _discard_project_paint_snapshot(project)
+    _cancel_stroke_watchdog()
+    _release_project_history(project)
     scene = bpy.data.scenes.get(session.scene_name) or getattr(window, "scene", None)
     _restore_projection_settings(scene, session, window)
     try:
@@ -1398,6 +1577,8 @@ def _save_pre(_unused: Any) -> None:
     window = find_window(_SESSION.window_pointer)
     scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
     restore_stroke_brush(session=_SESSION)
+    _discard_project_paint_snapshot(project)
+    _cancel_stroke_watchdog()
     _restore_projection_settings(scene, _SESSION, window)
     if project is not None:
         _SESSION.onion_suspended = bool(getattr(project, "onion_enabled", False))
@@ -1455,7 +1636,10 @@ def _load_pre(_unused: Any) -> None:
     if _SESSION is not None:
         window = find_window(_SESSION.window_pointer)
         scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
+        project = resolve_session_project(_SESSION)
         restore_stroke_brush(session=_SESSION)
+        _discard_project_paint_snapshot(project)
+        _cancel_stroke_watchdog()
         _restore_projection_settings(scene, _SESSION, window)
     try:
         from .preview import restore_all_preview_materials
@@ -1463,6 +1647,7 @@ def _load_pre(_unused: Any) -> None:
         restore_all_preview_materials()
     except (ImportError, ReferenceError, RuntimeError):
         pass
+    _release_project_history()
     _SESSION = None
 
 
@@ -1474,6 +1659,11 @@ def _undo_post(_unused: Any) -> None:
     elif _SESSION is not None:
         try:
             reconcile_view_state(bpy.context)
+            project = resolve_session_project(_SESSION)
+            if project is not None:
+                from .operators import arm_undo_fence
+
+                arm_undo_fence(str(getattr(project, "uuid", "")))
         except (AttributeError, ImportError, ReferenceError, RuntimeError, ValueError):
             pass
 
@@ -1501,6 +1691,7 @@ def unregister_studio() -> None:
         bpy.app.timers.unregister(_continue_switch)
     if bpy.app.timers.is_registered(_continue_enter):
         bpy.app.timers.unregister(_continue_enter)
+    _cancel_stroke_watchdog()
     if _PENDING is not None:
         _rollback_pending()
     try:

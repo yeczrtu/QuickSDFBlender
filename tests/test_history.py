@@ -35,20 +35,26 @@ class HistoryTests(unittest.TestCase):
         np.testing.assert_array_equal(reapplied["side"], side_after)
         self.assertTrue(history.can_undo)
 
-    def test_only_changed_bbox_is_restored(self) -> None:
+    def test_only_changed_pixels_are_restored(self) -> None:
         before = np.zeros((8, 9, 4), dtype=np.float32)
         after = before.copy()
-        after[3, 4, 0] = 1.0
+        after[1, 1, 0] = 1.0
+        after[6, 7, 0] = 1.0
         history = History()
-        history.push("dot", {"image": before}, {"image": after})
+        history.push("dots", {"image": before}, {"image": after})
+        self.assertEqual(history.undo_keys, ("image",))
 
         current = after.copy()
-        current[0, 0] = 0.75  # unrelated change outside the stored 1x1 bbox
+        # This lies inside the old whole-image-sized bounding rectangle but was
+        # not touched by the recorded stroke.
+        current[3, 4] = 0.75
         unchanged_input = current.copy()
         restored = history.undo({"image": current})["image"]
-        np.testing.assert_array_equal(restored[3, 4], before[3, 4])
-        np.testing.assert_array_equal(restored[0, 0], current[0, 0])
+        np.testing.assert_array_equal(restored[1, 1], before[1, 1])
+        np.testing.assert_array_equal(restored[6, 7], before[6, 7])
+        np.testing.assert_array_equal(restored[3, 4], current[3, 4])
         np.testing.assert_array_equal(current, unchanged_input)
+        self.assertEqual(history.redo_keys, ("image",))
 
     def test_push_copies_data_and_ignores_noop(self) -> None:
         before = np.zeros((2, 3, 4), dtype=np.uint16)
@@ -64,6 +70,20 @@ class HistoryTests(unittest.TestCase):
         after[:] = 100
         restored = history.undo({"a": after})["a"]
         np.testing.assert_array_equal(restored[0, 1], expected_before[0, 1])
+
+    def test_sparse_pixels_do_not_store_the_random_bounding_rectangle(self) -> None:
+        rng = np.random.default_rng(42)
+        before = rng.random((256, 256, 4), dtype=np.float32)
+        after = before.copy()
+        after[1, 1] = 0.0
+        after[-2, -2] = 1.0
+
+        history = History(compression_level=1)
+        self.assertTrue(history.push("two islands", {"a": before}, {"a": after}))
+        # A bounding rectangle would retain roughly two MiB of random float
+        # data. Sparse pixel storage needs only two indices and two RGBA pairs.
+        self.assertLess(history.bytes_used, 1024)
+        np.testing.assert_array_equal(history.undo({"a": after})["a"], before)
 
     def test_new_push_clears_redo(self) -> None:
         zero = np.zeros((2, 2, 4), dtype=np.uint8)

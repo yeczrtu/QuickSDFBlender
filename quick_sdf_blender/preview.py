@@ -211,10 +211,21 @@ if bpy is not None:
         # On the first build the existing output link is the copied original
         # shader. On later calls it already points to our mix and is left alone.
         original_socket = None
-        if surface_link is not None and surface_link.from_node is not mix_shader:
+        def same_node(first: Any, second: Any) -> bool:
+            try:
+                return int(first.as_pointer()) == int(second.as_pointer())
+            except (AttributeError, ReferenceError):
+                return first == second
+
+        if surface_link is not None and not same_node(surface_link.from_node, mix_shader):
             original_socket = surface_link.from_socket
         elif mix_shader.inputs[1].is_linked:
-            original_socket = mix_shader.inputs[1].links[0].from_socket
+            candidate = mix_shader.inputs[1].links[0].from_socket
+            # ``bpy`` may return a fresh Python wrapper for the same RNA node.
+            # Identity checks therefore let an existing Mix output become its
+            # own input on the next preview refresh, producing a black cycle.
+            if not same_node(candidate.node, mix_shader):
+                original_socket = candidate
         if original_socket is None:
             base = nodes.get("QSDF Fallback Surface") or nodes.new("ShaderNodeBsdfPrincipled")
             base.name = "QSDF Fallback Surface"

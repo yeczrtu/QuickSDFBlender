@@ -799,6 +799,9 @@ if bpy is not None:
             if hasattr(project, "dirty"):
                 project.dirty = True
             try:
+                from .operators import clear_histories
+
+                clear_histories(str(getattr(project, "uuid", "")))
                 updated = regenerate_boundary_images(project, allow_violations=self.force)
             except ValueError as exc:
                 if self.rollback_point_count >= 0:
@@ -843,6 +846,9 @@ if bpy is not None:
             angle = _angle_value(angle_item)
             for index, key in enumerate(track.keys):
                 if abs(float(key.angle) - angle) <= 1.0e-4:
+                    from .operators import clear_histories
+
+                    clear_histories(str(getattr(project, "uuid", "")))
                     track.keys.remove(index)
                     try:
                         regenerate_boundary_images(project)

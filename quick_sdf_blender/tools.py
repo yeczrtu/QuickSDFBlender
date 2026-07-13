@@ -16,6 +16,7 @@ from bpy.types import WorkSpaceTool
 VIEW_TOOL_ID = "quicksdf.paint_view"
 IMAGE_TOOL_ID = "quicksdf.paint_image"
 _REGISTERED: list[type[WorkSpaceTool]] = []
+_ADDON_KEYMAPS: list[tuple[Any, Any]] = []
 
 
 def _operator_exists(idname: str) -> bool:
@@ -44,11 +45,6 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         session = active_session(context)
     except (ImportError, AttributeError, ReferenceError):
         session = None
-    if session is not None and session.projection_hint:
-        hint_row = layout.row(align=True)
-        hint_row.alert = True
-        hint_row.label(text=session.projection_hint, icon="INFO")
-        hint_row.separator()
     if session is not None and session.view_mode == "PREVIEW":
         preview_row = layout.row(align=True)
         preview_row.label(
@@ -123,7 +119,7 @@ class QSDF_WST_view_paint(WorkSpaceTool):
     bl_context_mode = "PAINT_TEXTURE"
     bl_idname = VIEW_TOOL_ID
     bl_label = "Quick SDF Paint"
-    bl_description = "Paint Light or Shadow and keep all light angles consistent"
+    bl_description = "Paint Light or Shadow on the selected angle; export keeps angles consistent"
     bl_icon = "brush.generic"
     bl_options = {"USE_BRUSHES"}
     bl_widget = None
@@ -136,7 +132,7 @@ class QSDF_WST_image_paint(WorkSpaceTool):
     bl_context_mode = "PAINT"
     bl_idname = IMAGE_TOOL_ID
     bl_label = "Quick SDF Paint"
-    bl_description = "Paint Light or Shadow and keep all light angles consistent"
+    bl_description = "Paint Light or Shadow on the selected angle; export keeps angles consistent"
     bl_icon = "brush.generic"
     bl_options = {"USE_BRUSHES"}
     bl_widget = None
@@ -154,12 +150,40 @@ def register_tools() -> None:
         for tool in TOOLS:
             bpy.utils.register_tool(tool, after={"builtin.brush"}, separator=True)
             _REGISTERED.append(tool)
+        keyconfig = getattr(
+            getattr(bpy.context, "window_manager", None), "keyconfigs", None
+        )
+        addon = getattr(keyconfig, "addon", None)
+        if addon is not None:
+            keymap = addon.keymaps.new(
+                name="Dopesheet",
+                space_type="DOPESHEET_EDITOR",
+                region_type="WINDOW",
+            )
+            for operator, shift in (
+                ("quicksdf.history_undo", False),
+                ("quicksdf.history_redo", True),
+            ):
+                item = keymap.keymap_items.new(
+                    operator,
+                    type="Z",
+                    value="PRESS",
+                    ctrl=True,
+                    shift=shift,
+                )
+                _ADDON_KEYMAPS.append((keymap, item))
     except Exception:
         unregister_tools()
         raise
 
 
 def unregister_tools() -> None:
+    while _ADDON_KEYMAPS:
+        keymap, item = _ADDON_KEYMAPS.pop()
+        try:
+            keymap.keymap_items.remove(item)
+        except (ReferenceError, RuntimeError, ValueError):
+            pass
     while _REGISTERED:
         tool = _REGISTERED.pop()
         try:

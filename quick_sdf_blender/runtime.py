@@ -29,6 +29,7 @@ THRESHOLD_ROLE = "threshold_preview"
 EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
 PALETTE_NAME = "Quick SDF Light Shadow"
 _PAINT_SNAPSHOTS: dict[str, Any] = {}
+_INTERACTIVE_PAINT_SNAPSHOTS: dict[str, tuple[str, str, Any, str, Any | None]] = {}
 _BASE_BAKE_UUIDS: set[str] = set()
 _PENDING_BASE_SIGNATURES: set[str] = set()
 
@@ -337,19 +338,17 @@ def copy_image_pixels(
     destination.update()
 
 
-def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
-    """Write a top-down RGBA array and keep the Blender image opaque."""
+def _write_blender_rows(image: bpy.types.Image, blender_rows: Any) -> None:
+    """Commit a contiguous bottom-up float32 buffer to one Blender image."""
 
     import numpy as np
 
-    values = np.asarray(rgba, dtype=np.float32)
+    pixels = np.ascontiguousarray(blender_rows, dtype=np.float32)
     width, height = image.size[:]
-    if values.shape != (height, width, 4):
+    if pixels.shape != (height, width, 4):
         raise ValueError(
-            f"RGBA shape {values.shape} does not match image {(height, width, 4)}"
+            f"RGBA shape {pixels.shape} does not match image {(height, width, 4)}"
         )
-    opaque = values.copy()
-    opaque[..., 3] = 1.0
     # Blender keeps a separate projection-paint buffer for the active canvas.
     # Python pixel writes to a packed canvas can otherwise be overwritten by
     # that stale buffer. Detach only for the duration of this atomic write.
@@ -360,7 +359,7 @@ def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
             detached.append(image_paint)
             image_paint.canvas = None
     try:
-        image.pixels.foreach_set(np.flip(opaque, axis=0).ravel())
+        image.pixels.foreach_set(pixels.ravel())
         image[IMAGE_REVISION_KEY] = int(image.get(IMAGE_REVISION_KEY, 0)) + 1
         make_image_opaque(image)
         image.update()
@@ -372,6 +371,41 @@ def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
     finally:
         for image_paint in detached:
             image_paint.canvas = image
+
+
+def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
+    """Write a top-down float RGBA array and keep the Blender image opaque."""
+
+    import numpy as np
+
+    values = np.asarray(rgba, dtype=np.float32)
+    width, height = image.size[:]
+    if values.shape != (height, width, 4):
+        raise ValueError(
+            f"RGBA shape {values.shape} does not match image {(height, width, 4)}"
+        )
+    blender_rows = np.flip(values, axis=0).copy()
+    blender_rows[..., 3] = 1.0
+    _write_blender_rows(image, blender_rows)
+
+
+def write_image_rgba8(image: bpy.types.Image, rgba: Any) -> None:
+    """Write a top-down RGBA8 array without retaining a float32 copy."""
+
+    import numpy as np
+
+    values = np.asarray(rgba)
+    width, height = image.size[:]
+    if values.shape != (height, width, 4):
+        raise ValueError(
+            f"RGBA shape {values.shape} does not match image {(height, width, 4)}"
+        )
+    if values.dtype != np.uint8:
+        raise TypeError("RGBA8 image data must use uint8")
+    blender_rows = np.flip(values, axis=0).astype(np.float32)
+    blender_rows *= 1.0 / 255.0
+    blender_rows[..., 3] = 1.0
+    _write_blender_rows(image, blender_rows)
 
 
 def initialize_normal_sweep(project: Any) -> None:
@@ -565,12 +599,82 @@ def image_rgba(image: bpy.types.Image) -> Any:
     return np.flip(flat.reshape(height, width, 4), axis=0).copy()
 
 
+def rgba_to_u8(rgba: Any) -> Any:
+    """Quantize normalized RGBA values to the schema's RGBA8 storage."""
+
+    import numpy as np
+
+    values = np.asarray(rgba)
+    if values.ndim != 3 or values.shape[2] != 4:
+        raise ValueError(f"RGBA data must have shape (height, width, 4), got {values.shape}")
+    if values.dtype == np.uint8:
+        return np.array(values, copy=True, order="C")
+    return np.rint(np.clip(values, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def image_rgba8(image: bpy.types.Image) -> Any:
+    """Return a compact top-down RGBA8 copy with bounded conversion memory."""
+
+    import numpy as np
+
+    from .pixel_buffer import blender_float_rgba_to_top_down_u8
+
+    width, height = image.size[:]
+    flat = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(flat)
+    return blender_float_rgba_to_top_down_u8(flat, width, height)
+
+
 def capture_paint_snapshot(project: Any) -> None:
     angle_item = active_angle(project)
     image = resolve_angle_image(project, angle_item) if angle_item is not None else None
     if image is None:
         raise ValueError("The active angle image is missing")
     _PAINT_SNAPSHOTS[str(project.uuid)] = image_rgba(image)
+
+
+def capture_interactive_paint_snapshot(
+    project: Any,
+    *,
+    include_coverage: bool = False,
+) -> None:
+    """Capture one active key for sparse Studio undo and optional coverage.
+
+    Only the selected display image is read on the normal path. Boundary
+    projects additionally capture coverage so their generated layer remains
+    separate from hand paint. No other angle is touched.
+    """
+
+    angle_item = active_angle(project)
+    display = resolve_display_image(project, angle_item) if angle_item is not None else None
+    coverage = (
+        resolve_coverage_image(project, angle_item)
+        if include_coverage and angle_item is not None
+        else None
+    )
+    if angle_item is None or display is None or (include_coverage and coverage is None):
+        raise ValueError("The active angle paint layers are incomplete")
+    _INTERACTIVE_PAINT_SNAPSHOTS[str(project.uuid)] = (
+        str(angle_item.uuid),
+        str(display.name),
+        image_rgba8(display),
+        str(coverage.name) if coverage is not None else "",
+        image_rgba8(coverage) if coverage is not None else None,
+    )
+
+
+def consume_interactive_paint_snapshot(project: Any) -> tuple[str, str, Any, str, Any | None] | None:
+    return _INTERACTIVE_PAINT_SNAPSHOTS.pop(str(getattr(project, "uuid", "")), None)
+
+
+def discard_interactive_paint_snapshot(project: Any) -> None:
+    _INTERACTIVE_PAINT_SNAPSHOTS.pop(str(getattr(project, "uuid", "")), None)
+
+
+def has_paint_snapshot(project: Any) -> bool:
+    """Return whether an explicit legacy propagation snapshot is pending."""
+
+    return str(getattr(project, "uuid", "")) in _PAINT_SNAPSHOTS
 
 
 def consume_paint_snapshot(project: Any) -> Any | None:
@@ -599,8 +703,10 @@ def consume_paint_snapshot(project: Any) -> Any | None:
 def discard_paint_snapshot(project: Any | None = None) -> None:
     if project is None:
         _PAINT_SNAPSHOTS.clear()
+        _INTERACTIVE_PAINT_SNAPSHOTS.clear()
     else:
         _PAINT_SNAPSHOTS.pop(str(project.uuid), None)
+        _INTERACTIVE_PAINT_SNAPSHOTS.pop(str(project.uuid), None)
 
 
 def _project_angle_for_image(image: bpy.types.Image) -> tuple[Any | None, Any | None]:
@@ -647,6 +753,46 @@ def coverage_mask(image_or_display: bpy.types.Image) -> Any:
         width, height = image_or_display.size[:]
         return np.zeros((height, width), dtype=np.bool_)
     return image_mask(coverage)
+
+
+def materialize_effective_coverage(
+    project: Any,
+    angle_items: Iterable[Any] | None = None,
+) -> int:
+    """Persist visible paint/base differences before an explicit rebuild.
+
+    Everyday Studio strokes stay entirely on Blender's native canvas so they
+    do not read and rewrite every angle image on pen release. Before Rebake or
+    enabling the optional Boundary layer, this function converts those visible
+    corrections into the persistent coverage layer in one deliberate batch.
+    """
+
+    import numpy as np
+
+    added = 0
+    for angle_item in tuple(angle_items if angle_items is not None else project.angles):
+        display = resolve_display_image(project, angle_item)
+        base = resolve_base_image(project, angle_item)
+        coverage = resolve_coverage_image(project, angle_item)
+        if display is None or base is None or coverage is None:
+            raise ValueError("An angle paint layer is missing")
+        display_rgba = image_rgba(display)
+        base_rgba = image_rgba(base)
+        coverage_rgba = image_rgba(coverage)
+        stored = coverage_rgba[..., 0] >= 0.5
+        visible_delta = np.any(
+            np.abs(display_rgba[..., :3] - base_rgba[..., :3]) > (0.5 / 255.0),
+            axis=2,
+        )
+        effective = stored | visible_delta
+        newly_added = effective & ~stored
+        if not np.any(newly_added):
+            continue
+        coverage_rgba[..., :3][newly_added] = 1.0
+        coverage_rgba[..., 3] = 1.0
+        write_image_rgba(coverage, coverage_rgba)
+        added += int(np.count_nonzero(newly_added))
+    return added
 
 
 def _mark_coverage(coverage: bpy.types.Image, region: Any, value: bool) -> None:
@@ -1121,6 +1267,13 @@ def cleanup_export_adjustment_previews() -> None:
 @persistent
 def _load_or_undo_post(_unused: Any) -> None:
     _PAINT_SNAPSHOTS.clear()
+    _INTERACTIVE_PAINT_SNAPSHOTS.clear()
+    try:
+        from .operators import clear_histories
+
+        clear_histories()
+    except ImportError:
+        pass
     cleanup_export_adjustment_previews()
     try:
         from .live_preview import invalidate
@@ -1263,6 +1416,13 @@ def register_runtime() -> None:
 def unregister_runtime() -> None:
     cleanup_export_adjustment_previews()
     _PAINT_SNAPSHOTS.clear()
+    _INTERACTIVE_PAINT_SNAPSHOTS.clear()
+    try:
+        from .operators import clear_histories
+
+        clear_histories()
+    except ImportError:
+        pass
     _BASE_BAKE_UUIDS.clear()
     _PENDING_BASE_SIGNATURES.clear()
     if bpy.app.timers.is_registered(_deferred_migrate):
