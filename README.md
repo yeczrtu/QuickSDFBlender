@@ -24,10 +24,11 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 対応環境はBlender 5.1、Windows x64です。
 
-1. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
-2. 右上メニューから `ディスクからインストール` を選ぶ
-3. `quick_sdf_blender-0.3.2-windows-x64.zip` を選択する（展開不要）
-4. 3D Viewで `N` を押し、`Quick SDF` タブを開く
+1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.3.2-windows-x64.zip` を取得する
+2. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
+3. 右上メニューから `ディスクからインストール` を選ぶ
+4. 取得したZIPを展開せずに選択する
+5. 3D Viewで `N` を押し、`Quick SDF` タブを開く
 
 対象Meshにはローカルの0–1 UV Mapが必要です。初期解像度は1024です。
 
@@ -56,3 +57,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_extension.ps
 ```
 
 このリリースゲートはunit test、Blender背景／実ウィンドウsmoke、保存再読込、Extension validation、ZIPのbyte検証、隔離ユーザー領域への実インストールを順に実行します。
+
+## License
+
+Quick SDF Studioは[GNU General Public License v3.0 or later](LICENSE)で公開されています。同梱native coreも同じライセンスです。実行時に使用するNumPyはBlender 5.1同梱版で、BSD-3-Clauseライセンスです。
