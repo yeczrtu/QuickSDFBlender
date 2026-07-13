@@ -54,6 +54,13 @@ class StudioSession:
     paint_key_uuid: str = ""
     paint_key_angle: float = 0.0
     seek_angle: float = 0.0
+    previous_normal_falloff: bool | None = None
+    previous_clip_starts: tuple[tuple[int, float], ...] = ()
+    projection_settings_suspended: bool = False
+    stroke_brush_name: str = ""
+    stroke_brush_color: tuple[float, float, float] | None = None
+    stroke_from_view3d: bool = False
+    projection_hint: str = ""
 
 
 @dataclass(slots=True)
@@ -235,6 +242,60 @@ def reconcile_view_state(context: Any | None = None) -> bool:
         seek_preview(context, project, session.seek_angle)
         return True
     return select_paint_key(context, project, key_uuid=session.paint_key_uuid)
+
+
+def prepare_stroke_brush(context: Any, project: Any) -> None:
+    """Temporarily apply the selected binary color to the active Brush Asset."""
+
+    session = active_session(context)
+    if session is None:
+        return
+    restore_stroke_brush(context)
+    image_paint = context.scene.tool_settings.image_paint
+    brush = getattr(image_paint, "brush", None)
+    session.stroke_from_view3d = getattr(getattr(context, "area", None), "type", "") == "VIEW_3D"
+    session.projection_hint = ""
+    if brush is None:
+        return
+    session.stroke_brush_name = str(getattr(brush, "name", ""))
+    session.stroke_brush_color = tuple(float(channel) for channel in brush.color[:3])
+    value = 1.0 if int(getattr(project, "paint_value", 0)) else 0.0
+    try:
+        brush.color = (value, value, value)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        session.stroke_brush_name = ""
+        session.stroke_brush_color = None
+
+
+def restore_stroke_brush(
+    context: Any | None = None,
+    *,
+    session: StudioSession | None = None,
+) -> None:
+    """Restore a Brush Asset after the native stroke, cancel, save, or exit."""
+
+    session = session or _SESSION
+    if session is None or not session.stroke_brush_name or session.stroke_brush_color is None:
+        return
+    brush = bpy.data.brushes.get(session.stroke_brush_name)
+    if brush is not None:
+        try:
+            brush.color = session.stroke_brush_color
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+    session.stroke_brush_name = ""
+    session.stroke_brush_color = None
+
+
+def set_projection_hint(context: Any | None, *, no_change: bool) -> None:
+    session = active_session(context or bpy.context)
+    if session is None:
+        return
+    if no_change and session.stroke_from_view3d:
+        session.projection_hint = "No paint reached the mesh · move back a little or press Numpad 5"
+    else:
+        session.projection_hint = ""
+    tag_studio_redraw()
 
 
 def studio_areas(window: Any) -> tuple[Any | None, Any | None, Any | None]:
@@ -427,6 +488,53 @@ def _restore_paint_settings(scene: Any, session: StudioSession) -> None:
     image_paint.canvas = bpy.data.images.get(session.previous_canvas_name) if session.previous_canvas_name else None
 
 
+def _studio_view_spaces(window: Any | None) -> tuple[Any, ...]:
+    if window is None or getattr(window, "screen", None) is None:
+        return ()
+    return tuple(
+        area.spaces.active
+        for area in window.screen.areas
+        if area.type == "VIEW_3D" and hasattr(area.spaces.active, "clip_start")
+    )
+
+
+def _adaptive_clip_start(obj: Any | None) -> float:
+    dimensions = tuple(abs(float(value)) for value in getattr(obj, "dimensions", (1.0, 1.0, 1.0)))
+    extent = max(dimensions or (1.0,))
+    return max(1.0e-6, extent * 1.0e-4)
+
+
+def _apply_projection_settings(scene: Any, session: StudioSession, window: Any, obj: Any | None) -> None:
+    image_paint = scene.tool_settings.image_paint
+    if session.previous_normal_falloff is None and hasattr(image_paint, "use_normal_falloff"):
+        session.previous_normal_falloff = bool(image_paint.use_normal_falloff)
+    if hasattr(image_paint, "use_normal_falloff"):
+        image_paint.use_normal_falloff = False
+
+    spaces = _studio_view_spaces(window)
+    if not session.previous_clip_starts:
+        session.previous_clip_starts = tuple(
+            (int(space.as_pointer()), float(space.clip_start)) for space in spaces
+        )
+    clip_start = _adaptive_clip_start(obj)
+    for space in spaces:
+        space.clip_start = min(float(space.clip_start), clip_start)
+    session.projection_settings_suspended = False
+
+
+def _restore_projection_settings(scene: Any | None, session: StudioSession, window: Any | None) -> None:
+    if scene is not None and session.previous_normal_falloff is not None:
+        image_paint = scene.tool_settings.image_paint
+        if hasattr(image_paint, "use_normal_falloff"):
+            image_paint.use_normal_falloff = session.previous_normal_falloff
+    previous = dict(session.previous_clip_starts)
+    for space in _studio_view_spaces(window):
+        value = previous.get(int(space.as_pointer()))
+        if value is not None:
+            space.clip_start = value
+    session.projection_settings_suspended = True
+
+
 def _restore_preview(project: Any | None) -> None:
     try:
         from .preview import restore_preview_materials
@@ -591,10 +699,12 @@ def _rollback_pending(error: BaseException | None = None) -> None:
     if window is None:
         return
     failed_workspace = bpy.data.workspaces.get(session.workspace_name)
+    scene = bpy.data.scenes.get(session.scene_name)
+    restore_stroke_brush(session=session)
+    _restore_projection_settings(scene, session, window)
     previous = bpy.data.workspaces.get(session.previous_workspace_name)
     if previous is not None:
         window.workspace = previous
-    scene = bpy.data.scenes.get(session.scene_name)
     if scene is not None:
         _restore_paint_settings(scene, session)
     try:
@@ -669,13 +779,7 @@ def _continue_enter() -> float | None:
 
             activate_tools(context, window=window)
             _frame_studio_content(context, window, view_area, image_area)
-            brush = getattr(scene.tool_settings.image_paint, "brush", None)
-            if brush is not None:
-                value = 1.0 if int(getattr(project, "paint_value", 0)) else 0.0
-                try:
-                    brush.color = (value, value, value)
-                except (AttributeError, TypeError):
-                    pass
+            _apply_projection_settings(scene, session, window, obj)
             if pending.manage_preview:
                 _assign_preview(project, image)
             project.warning_message = ""
@@ -783,6 +887,9 @@ def exit_studio(
     window = find_window(session.window_pointer)
     project = resolve_session_project(session)
     _restore_preview(project)
+    restore_stroke_brush(session=session)
+    scene = bpy.data.scenes.get(session.scene_name) or getattr(window, "scene", None)
+    _restore_projection_settings(scene, session, window)
     try:
         from .live_preview import release_project
 
@@ -792,7 +899,6 @@ def exit_studio(
     if window is None:
         _SESSION = None
         return True
-    scene = bpy.data.scenes.get(session.scene_name) or getattr(window, "scene", None)
     studio_workspace = bpy.data.workspaces.get(session.workspace_name)
     try:
         target = getattr(project, "target_object", None) if project else None
@@ -841,6 +947,10 @@ def _save_pre(_unused: Any) -> None:
         return
     project = resolve_session_project()
     _restore_preview(project)
+    window = find_window(_SESSION.window_pointer)
+    scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
+    restore_stroke_brush(session=_SESSION)
+    _restore_projection_settings(scene, _SESSION, window)
     if project is not None:
         _SESSION.onion_suspended = bool(getattr(project, "onion_enabled", False))
         if _SESSION.onion_suspended:
@@ -861,6 +971,10 @@ def _save_post(_unused: Any) -> None:
     project = resolve_session_project()
     if project is not None:
         try:
+            window = find_window(_SESSION.window_pointer)
+            scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
+            if window is not None and scene is not None:
+                _apply_projection_settings(scene, _SESSION, window, getattr(project, "target_object", None))
             from .runtime import active_angle, resolve_angle_image
 
             item = active_angle(project)
@@ -889,6 +1003,11 @@ def _load_pre(_unused: Any) -> None:
         pass
     if _PENDING is not None:
         _rollback_pending()
+    if _SESSION is not None:
+        window = find_window(_SESSION.window_pointer)
+        scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
+        restore_stroke_brush(session=_SESSION)
+        _restore_projection_settings(scene, _SESSION, window)
     try:
         from .preview import restore_all_preview_materials
 
@@ -956,6 +1075,7 @@ __all__ = [
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
     "back_to_paint", "dismiss_first_stroke_hint", "enter_studio", "exit_studio",
     "find_studio_workspace", "is_studio_active", "reconcile_view_state", "register_studio",
-    "resolve_session_project", "seek_preview", "select_paint_key", "studio_areas",
-    "tag_studio_redraw", "unregister_studio",
+    "prepare_stroke_brush", "resolve_session_project", "restore_stroke_brush", "seek_preview",
+    "select_paint_key", "set_projection_hint", "studio_areas", "tag_studio_redraw",
+    "unregister_studio",
 ]

@@ -44,6 +44,11 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         session = active_session(context)
     except (ImportError, AttributeError, ReferenceError):
         session = None
+    if session is not None and session.projection_hint:
+        hint_row = layout.row(align=True)
+        hint_row.alert = True
+        hint_row.label(text=session.projection_hint, icon="INFO")
+        hint_row.separator()
     if session is not None and session.view_mode == "PREVIEW":
         preview_row = layout.row(align=True)
         preview_row.label(
@@ -120,6 +125,7 @@ class QSDF_WST_view_paint(WorkSpaceTool):
     bl_label = "Quick SDF Paint"
     bl_description = "Paint Light or Shadow and keep all light angles consistent"
     bl_icon = "brush.generic"
+    bl_options = {"USE_BRUSHES"}
     bl_widget = None
     bl_keymap = _PAINT_KEYMAP
     draw_settings = staticmethod(_draw_tool_settings)
@@ -132,6 +138,7 @@ class QSDF_WST_image_paint(WorkSpaceTool):
     bl_label = "Quick SDF Paint"
     bl_description = "Paint Light or Shadow and keep all light angles consistent"
     bl_icon = "brush.generic"
+    bl_options = {"USE_BRUSHES"}
     bl_widget = None
     bl_keymap = _PAINT_KEYMAP
     draw_settings = staticmethod(_draw_tool_settings)

@@ -72,6 +72,15 @@ def check() -> float | None:
             )
             assert obj.material_slots[0].material == STATE["original_material"]
             assert obj.mode == "OBJECT"
+            assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is True
+            for screen in bpy.data.screens:
+                for area in screen.areas:
+                    if area.type != "VIEW_3D":
+                        continue
+                    space = area.spaces.active
+                    expected = STATE["studio_clip_starts"].get(int(space.as_pointer()))
+                    if expected is not None:
+                        assert float(space.clip_start) == expected
             assert not STATE["project"].job_running
             assert not bpy.app.timers.is_registered(operators._poll_export_job)
             temporary_images = [
@@ -105,6 +114,25 @@ def check() -> float | None:
             "VIEW_3D", "IMAGE_EDITOR", "DOPESHEET_EDITOR"
         }
         assert obj.mode == "TEXTURE_PAINT"
+        assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is False
+        session = studio.current_session()
+        assert session is not None
+        STATE["studio_clip_starts"] = dict(session.previous_clip_starts)
+        view_area = next(area for area in bpy.context.window.screen.areas if area.type == "VIEW_3D")
+        view_space = view_area.spaces.active
+        assert float(view_space.clip_start) <= max(float(value) for value in obj.dimensions) * 1.0e-4 + 1.0e-8
+        from quick_sdf_blender.tools import QSDF_WST_image_paint, QSDF_WST_view_paint
+
+        assert "USE_BRUSHES" in QSDF_WST_view_paint.bl_options
+        assert "USE_BRUSHES" in QSDF_WST_image_paint.bl_options
+        brush = bpy.context.scene.tool_settings.image_paint.brush
+        if brush is not None:
+            original_color = tuple(float(value) for value in brush.color[:3])
+            project.paint_value = 1
+            studio.prepare_stroke_brush(bpy.context, project)
+            assert tuple(float(value) for value in brush.color[:3]) == (1.0, 1.0, 1.0)
+            studio.restore_stroke_brush(bpy.context)
+            assert tuple(float(value) for value in brush.color[:3]) == original_color
         assert not project.base_needs_update
         canvas = runtime.resolve_angle_image(
             project, runtime.active_angle(project)
@@ -133,6 +161,8 @@ def check() -> float | None:
         assert bpy.ops.wm.save_as_mainfile(filepath=str(save_path)) == {"FINISHED"}
         assert studio.is_studio_active(bpy.context, str(project.uuid))
         assert obj.material_slots[0].material != STATE["original_material"]
+        assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is False
+        assert float(view_space.clip_start) <= max(float(value) for value in obj.dimensions) * 1.0e-4 + 1.0e-8
         assert project.onion_enabled
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
         assert image_area.spaces.active.image.get(runtime.ROLE_KEY) == ONION_PREVIEW_ROLE
@@ -182,6 +212,7 @@ def run() -> None:
         original_material = obj.material_slots[0].material
         bpy.context.scene.quick_sdf_settings.resolution = 512
         bpy.context.scene.quick_sdf_settings.initialization = "NORMAL_SWEEP"
+        bpy.context.scene.tool_settings.image_paint.use_normal_falloff = True
         assert bpy.ops.quicksdf.project_create() == {"FINISHED"}
         project = runtime.active_project()
         assert bpy.ops.quicksdf.studio_enter() == {"FINISHED"}

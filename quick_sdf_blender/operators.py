@@ -856,13 +856,6 @@ class QUICKSDF_OT_paint_value_toggle(bpy.types.Operator):
         if project is None:
             return {"CANCELLED"}
         project.paint_value = 1 - int(project.paint_value)
-        color = (1.0, 1.0, 1.0) if project.paint_value else (0.0, 0.0, 0.0)
-        brush = getattr(context.scene.tool_settings.image_paint, "brush", None)
-        if brush is not None:
-            try:
-                brush.color = color
-            except (AttributeError, TypeError):
-                pass
         return {"FINISHED"}
 
 
@@ -878,13 +871,6 @@ class QUICKSDF_OT_paint_value_set(bpy.types.Operator):
         if project is None:
             return {"CANCELLED"}
         project.paint_value = int(self.value)
-        color = (1.0, 1.0, 1.0) if project.paint_value else (0.0, 0.0, 0.0)
-        brush = getattr(context.scene.tool_settings.image_paint, "brush", None)
-        if brush is not None:
-            try:
-                brush.color = color
-            except (AttributeError, TypeError):
-                pass
         return {"FINISHED"}
 
 
@@ -1297,22 +1283,35 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+
+        def finish_stroke(*, no_change: bool = False) -> None:
+            try:
+                from .studio import restore_stroke_brush, set_projection_hint
+
+                set_projection_hint(context, no_change=no_change)
+                restore_stroke_brush(context)
+            except (ImportError, AttributeError, ReferenceError, RuntimeError):
+                pass
+
         active_item = runtime.active_angle(project)
         source_image = runtime.resolve_display_image(project, active_item)
         if source_image is None:
+            finish_stroke()
             self.report({"ERROR"}, "The active angle image is missing")
             return {"CANCELLED"}
         source_rgba = runtime.image_rgba(source_image)
         snapshot = runtime.consume_paint_snapshot(project)
         if snapshot is None or snapshot.shape != source_rgba.shape:
+            finish_stroke()
             return {"CANCELLED"}
-        footprint = np.any(
+        touched = np.any(
             np.abs(source_rgba[..., :3] - snapshot[..., :3]) > (0.5 / 255.0), axis=2
         )
-        if not np.any(footprint):
+        if not np.any(touched):
+            finish_stroke(no_change=True)
             return {"CANCELLED"}
         try:
-            from .smart_paint import apply_smart_stroke
+            from .smart_paint import apply_smart_transitions
 
             side = str(active_item.side)
             items = sorted(
@@ -1334,16 +1333,18 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 [runtime.coverage_mask(runtime.resolve_coverage_image(project, item)) for item in items],
                 axis=0,
             )
-            paint_light = bool(int(project.paint_value))
-            if self.invert:
-                paint_light = not paint_light
-            result = apply_smart_stroke(
+            before_mask = snapshot[..., 0] >= 0.5
+            after_mask = source_rgba[..., 0] >= 0.5
+            became_light = touched & ~before_mask & after_mask
+            became_shadow = touched & before_mask & ~after_mask
+            result = apply_smart_transitions(
                 masks,
                 coverage,
                 angles,
                 active_index,
-                footprint,
-                paint_light=paint_light,
+                touched,
+                became_light,
+                became_shadow,
             )
             before_history: dict[str, np.ndarray] = {}
             for index in result.affected_indices:
@@ -1352,15 +1353,16 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 coverage_image = runtime.resolve_coverage_image(project, item)
                 before_history[display.name] = snapshot.copy() if item.uuid == active_item.uuid else runtime.image_rgba(display)
                 before_history[coverage_image.name] = runtime.image_rgba(coverage_image)
+                key_footprint = result.footprints[index]
                 runtime.write_mask_overrides(
                     display,
                     result.masks[index],
-                    footprint,
+                    key_footprint,
                     coverage_image=coverage_image,
                 )
                 if item.uuid == active_item.uuid:
                     antialiased = runtime.image_rgba(display)
-                    antialiased[..., :3][footprint] = source_rgba[..., :3][footprint]
+                    antialiased[..., :3][touched] = source_rgba[..., :3][touched]
                     runtime.write_image_rgba(display, antialiased)
                 item.is_manual = True
                 item.dirty = True
@@ -1382,12 +1384,13 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 dismiss_first_stroke_hint()
             except (ImportError, RuntimeError):
                 pass
-            project.has_violations = False
             project.dirty = True
         except (RuntimeError, ValueError) as exc:
             runtime.write_image_rgba(source_image, snapshot)
+            finish_stroke()
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finish_stroke()
         runtime.sync_canvas(context, project)
         return {"FINISHED"}
 
@@ -1408,12 +1411,24 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
                 return {"CANCELLED"}
         except (ImportError, AttributeError, ReferenceError, RuntimeError):
             pass
+        try:
+            from .studio import prepare_stroke_brush
+
+            prepare_stroke_brush(context, project)
+        except (ImportError, AttributeError, ReferenceError, RuntimeError):
+            pass
         if bool(getattr(project, "onion_enabled", False)):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
         try:
             runtime.capture_paint_snapshot(project)
         except (RuntimeError, ValueError) as exc:
+            try:
+                from .studio import restore_stroke_brush
+
+                restore_stroke_brush(context)
+            except (ImportError, AttributeError, ReferenceError, RuntimeError):
+                pass
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         return {"FINISHED"}

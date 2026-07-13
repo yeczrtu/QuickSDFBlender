@@ -5,7 +5,11 @@ import unittest
 import numpy as np
 
 from quick_sdf_blender.core import generate_threshold_pair, validate_side_monotonic
-from quick_sdf_blender.smart_paint import affected_key_indices, apply_smart_stroke
+from quick_sdf_blender.smart_paint import (
+    affected_key_indices,
+    apply_smart_stroke,
+    apply_smart_transitions,
+)
 
 
 ANGLES = np.arange(0.0, 91.0, 15.0)
@@ -41,6 +45,49 @@ class SmartPaintTests(unittest.TestCase):
         self.assertEqual(result.affected_indices, (4, 5, 6))
         self.assertTrue(np.all(result.coverage[4:, 1:3, 2]))
         self.assertFalse(np.any(result.coverage[:4]))
+
+    def test_soft_native_stroke_propagates_only_threshold_crossings(self):
+        masks = np.zeros((len(ANGLES), 2, 3), dtype=np.bool_)
+        masks[:, 0, 1] = True
+        coverage = np.zeros_like(masks)
+        touched = np.zeros((2, 3), dtype=np.bool_)
+        touched[0, :] = True
+        became_light = np.zeros_like(touched)
+        became_light[0, 0] = True
+        became_shadow = np.zeros_like(touched)
+        became_shadow[0, 1] = True
+
+        result = apply_smart_transitions(
+            masks,
+            coverage,
+            ANGLES,
+            3,
+            touched,
+            became_light,
+            became_shadow,
+        )
+
+        self.assertTrue(np.all(result.masks[3:, 0, 0]))
+        self.assertFalse(np.any(result.masks[:4, 0, 1]))
+        self.assertFalse(np.any(result.footprints[:3, 0, 0]))
+        self.assertFalse(np.any(result.footprints[4:, 0, 1]))
+        self.assertTrue(result.coverage[3, 0, 2])
+        self.assertFalse(np.any(result.coverage[np.arange(len(ANGLES)) != 3, 0, 2]))
+        self.assertTrue(validate_side_monotonic(result.masks, ANGLES).is_valid)
+
+    def test_transition_pixels_must_have_been_touched(self):
+        masks = np.zeros((len(ANGLES), 1, 1), dtype=np.bool_)
+        coverage = np.zeros_like(masks)
+        with self.assertRaisesRegex(ValueError, "part of the touched area"):
+            apply_smart_transitions(
+                masks,
+                coverage,
+                ANGLES,
+                2,
+                np.zeros((1, 1), dtype=np.bool_),
+                np.ones((1, 1), dtype=np.bool_),
+                np.zeros((1, 1), dtype=np.bool_),
+            )
 
 
 class ThresholdPairTests(unittest.TestCase):
