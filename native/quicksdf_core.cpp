@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -91,31 +92,42 @@ void dt_1d(const double* f, double* d, int n, std::vector<int>& v,
     }
 }
 
-void dt_2d(std::vector<double>& grid, int width, int height) {
+bool dt_2d(std::vector<double>& grid, int width, int height,
+           const int* cancel_requested = nullptr) {
     const int max_dim = std::max(width, height);
     std::vector<double> f(max_dim), d(max_dim), z(max_dim + 1);
     std::vector<int> v(max_dim);
     for (int y = 0; y < height; ++y) {
+        if (cancel_requested && *cancel_requested) return false;
         for (int x = 0; x < width; ++x) f[x] = grid[size_t(y) * width + x];
         dt_1d(f.data(), d.data(), width, v, z);
         for (int x = 0; x < width; ++x) grid[size_t(y) * width + x] = d[x];
     }
     for (int x = 0; x < width; ++x) {
+        if (cancel_requested && *cancel_requested) return false;
         for (int y = 0; y < height; ++y) f[y] = grid[size_t(y) * width + x];
         dt_1d(f.data(), d.data(), height, v, z);
         for (int y = 0; y < height; ++y) grid[size_t(y) * width + x] = d[y];
     }
-    for (double& value : grid) value = std::sqrt(std::max(0.0, value));
+    for (size_t index = 0; index < grid.size(); ++index) {
+        if ((index & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
+        grid[index] = std::sqrt(std::max(0.0, grid[index]));
+    }
+    return true;
 }
 
-void signed_distance(const uint8_t* light_mask, int width, int height,
-                     std::vector<float>& output) {
+bool signed_distance(const uint8_t* light_mask, int width, int height,
+                     std::vector<float>& output,
+                     const int* cancel_requested = nullptr) {
     const size_t pixels = size_t(width) * height;
     const double far_sq = double(width) * width + double(height) * height + 100.0;
     std::vector<double> to_shadow(pixels), to_light(pixels);
     bool has_light = false;
     bool has_shadow = false;
     for (size_t p = 0; p < pixels; ++p) {
+        if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
         const bool light = light_mask[p] != 0;
         has_light |= light;
         has_shadow |= !light;
@@ -125,18 +137,22 @@ void signed_distance(const uint8_t* light_mask, int width, int height,
     output.resize(pixels);
     if (!has_shadow) {
         std::fill(output.begin(), output.end(), -std::numeric_limits<float>::infinity());
-        return;
+        return true;
     }
     if (!has_light) {
         std::fill(output.begin(), output.end(), std::numeric_limits<float>::infinity());
-        return;
+        return true;
     }
-    dt_2d(to_shadow, width, height);
-    dt_2d(to_light, width, height);
+    if (!dt_2d(to_shadow, width, height, cancel_requested) ||
+        !dt_2d(to_light, width, height, cancel_requested))
+        return false;
     for (size_t p = 0; p < pixels; ++p) {
+        if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
         // Positive is shadow, negative is light, matching QuickSDF's convention.
         output[p] = float(to_light[p] - to_shadow[p]);
     }
+    return true;
 }
 
 uint16_t encode_transition(float normalized_angle) {
@@ -145,9 +161,11 @@ uint16_t encode_transition(float normalized_angle) {
 }
 
 int validate_sequence(const uint8_t* masks, const std::vector<int>& sequence,
-                      size_t pixels) {
+                      size_t pixels, const int* cancel_requested = nullptr) {
     int violations = 0;
     for (size_t p = 0; p < pixels; ++p) {
+        if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return -1;
         bool was_light = masks[size_t(sequence.front()) * pixels + p] != 0;
         for (size_t i = 1; i < sequence.size(); ++i) {
             const bool light = masks[size_t(sequence[i]) * pixels + p] != 0;
@@ -161,24 +179,30 @@ int validate_sequence(const uint8_t* masks, const std::vector<int>& sequence,
     return violations;
 }
 
-void generate_channel(const uint8_t* masks, const float* angles,
+bool generate_channel(const uint8_t* masks, const float* angles,
                       const std::vector<int>& sequence, int width, int height,
-                      uint16_t* output, int stride) {
+                      uint16_t* output, int stride,
+                      const int* cancel_requested = nullptr) {
     const size_t pixels = size_t(width) * height;
     const uint8_t* first = masks + size_t(sequence.front()) * pixels;
     for (size_t p = 0; p < pixels; ++p) {
+        if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
         output[p * stride] = first[p] ? 0 : 65535;
     }
-    if (sequence.size() < 2) return;
+    if (sequence.size() < 2) return true;
 
     std::vector<float> previous_sdf, current_sdf;
-    signed_distance(first, width, height, previous_sdf);
+    if (!signed_distance(first, width, height, previous_sdf, cancel_requested))
+        return false;
     for (size_t i = 1; i < sequence.size(); ++i) {
+        if (cancel_requested && *cancel_requested) return false;
         const int previous_index = sequence[i - 1];
         const int current_index = sequence[i];
         const uint8_t* previous = masks + size_t(previous_index) * pixels;
         const uint8_t* current = masks + size_t(current_index) * pixels;
-        signed_distance(current, width, height, current_sdf);
+        if (!signed_distance(current, width, height, current_sdf, cancel_requested))
+            return false;
         const float a0 = std::abs(angles[previous_index]) / 90.0f;
         const float a1 = std::abs(angles[current_index]) / 90.0f;
         for (size_t p = 0; p < pixels; ++p) {
@@ -194,6 +218,7 @@ void generate_channel(const uint8_t* masks, const float* angles,
         }
         previous_sdf.swap(current_sdf);
     }
+    return true;
 }
 
 bool build_side_sequence(const float* angles, int count,
@@ -499,6 +524,131 @@ QSDF_API int qsdf_bake_face_shadow_guide(
     }
 }
 
+QSDF_API int qsdf_repair_side_monotonic(
+    const uint8_t* masks, const uint8_t* base_masks,
+    const uint8_t* coverage_masks, int count, int width, int height,
+    uint8_t* output_masks, uint8_t* output_changed, int32_t* output_transition,
+    int* changed_samples, int* changed_pixels,
+    int* protected_changed_samples, int* protected_changed_pixels,
+    const int* cancel_requested) {
+    if (!masks || !base_masks || !coverage_masks || !output_masks ||
+        !output_changed || !output_transition || !changed_samples ||
+        !changed_pixels || !protected_changed_samples ||
+        !protected_changed_pixels || count < 1 || width < 1 || height < 1)
+        return QSDF_INVALID_ARGUMENT;
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    const size_t pixels = size_t(width) * size_t(height);
+    struct RepairCounts {
+        int changed_samples = 0;
+        int changed_pixels = 0;
+        int protected_changed_samples = 0;
+        int protected_changed_pixels = 0;
+    };
+    auto repair_range = [&](size_t begin, size_t end, RepairCounts& counts) {
+      for (size_t pixel = begin; pixel < end; ++pixel) {
+        if ((pixel & size_t(4095)) == 0 && cancel_requested && *cancel_requested)
+            return;
+        int protected_cost = 0;
+        int display_cost = 0;
+        int base_cost = 0;
+        for (int sample = 0; sample < count; ++sample) {
+            const size_t offset = size_t(sample) * pixels + pixel;
+            const bool display = masks[offset] != 0;
+            const bool base = base_masks[offset] != 0;
+            const bool protected_value = coverage_masks[offset] != 0 || display != base;
+            if (!display) {
+                ++display_cost;
+                if (protected_value) ++protected_cost;
+            }
+            if (!base) ++base_cost;
+        }
+        int best_protected = protected_cost;
+        int best_display = display_cost;
+        int best_base = base_cost;
+        int best_transition = 0;
+        for (int transition = 1; transition <= count; ++transition) {
+            const int sample = transition - 1;
+            const size_t offset = size_t(sample) * pixels + pixel;
+            const bool display = masks[offset] != 0;
+            const bool base = base_masks[offset] != 0;
+            const bool protected_value = coverage_masks[offset] != 0 || display != base;
+            const int display_delta = display ? 1 : -1;
+            protected_cost += protected_value ? display_delta : 0;
+            display_cost += display_delta;
+            base_cost += base ? 1 : -1;
+            if (protected_cost < best_protected ||
+                (protected_cost == best_protected &&
+                 (display_cost < best_display ||
+                  (display_cost == best_display && base_cost < best_base)))) {
+                best_protected = protected_cost;
+                best_display = display_cost;
+                best_base = base_cost;
+                best_transition = transition;
+            }
+        }
+        output_transition[pixel] = best_transition;
+        bool pixel_changed = false;
+        bool protected_pixel_changed = false;
+        for (int sample = 0; sample < count; ++sample) {
+            const size_t offset = size_t(sample) * pixels + pixel;
+            const bool display = masks[offset] != 0;
+            const bool base = base_masks[offset] != 0;
+            const bool repaired = sample >= best_transition;
+            const bool changed = repaired != display;
+            const bool protected_value = coverage_masks[offset] != 0 || display != base;
+            output_masks[offset] = repaired ? 1 : 0;
+            output_changed[offset] = changed ? 1 : 0;
+            if (changed) {
+                ++counts.changed_samples;
+                pixel_changed = true;
+                if (protected_value) {
+                    ++counts.protected_changed_samples;
+                    protected_pixel_changed = true;
+                }
+            }
+        }
+        if (pixel_changed) ++counts.changed_pixels;
+        if (protected_pixel_changed) ++counts.protected_changed_pixels;
+      }
+    };
+
+    const size_t minimum_pixels_per_worker = 65536;
+    const size_t useful_workers =
+        (pixels + minimum_pixels_per_worker - 1) / minimum_pixels_per_worker;
+    const size_t worker_count = std::max<size_t>(
+        1, std::min<size_t>({size_t(16), useful_workers,
+                            size_t(std::max(1u, std::thread::hardware_concurrency()))}));
+    std::vector<RepairCounts> counts(worker_count);
+    std::vector<std::thread> threads;
+    try {
+        threads.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker = 1; worker < worker_count; ++worker) {
+            const size_t begin = pixels * worker / worker_count;
+            const size_t end = pixels * (worker + 1) / worker_count;
+            threads.emplace_back(repair_range, begin, end, std::ref(counts[worker]));
+        }
+        repair_range(0, pixels / worker_count, counts[0]);
+        for (auto& thread : threads) thread.join();
+    } catch (...) {
+        for (auto& thread : threads) {
+            if (thread.joinable()) thread.join();
+        }
+        return QSDF_OUT_OF_MEMORY;
+    }
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    *changed_samples = 0;
+    *changed_pixels = 0;
+    *protected_changed_samples = 0;
+    *protected_changed_pixels = 0;
+    for (const auto& value : counts) {
+        *changed_samples += value.changed_samples;
+        *changed_pixels += value.changed_pixels;
+        *protected_changed_samples += value.protected_changed_samples;
+        *protected_changed_pixels += value.protected_changed_pixels;
+    }
+    return QSDF_OK;
+}
+
 QSDF_API int qsdf_validate_monotonic(const uint8_t* masks, const float* angles,
                                      int count, int width, int height,
                                      int* violation_pixels) {
@@ -531,8 +681,45 @@ QSDF_API int qsdf_generate_threshold(const uint8_t* masks, const float* angles,
         std::vector<int> positive{zero}, negative{zero};
         for (int i = zero + 1; i < count; ++i) if (angles[i] > angles[zero]) positive.push_back(i);
         for (int i = zero - 1; i >= 0; --i) if (angles[i] < angles[zero]) negative.push_back(i);
-        generate_channel(masks, angles, positive, width, height, output_rg, 2);
-        generate_channel(masks, angles, negative, width, height, output_rg + 1, 2);
+        if (!generate_channel(masks, angles, positive, width, height, output_rg, 2) ||
+            !generate_channel(masks, angles, negative, width, height, output_rg + 1, 2))
+            return QSDF_CANCELLED;
+        return QSDF_OK;
+    } catch (const std::bad_alloc&) {
+        return QSDF_OUT_OF_MEMORY;
+    }
+}
+
+QSDF_API int qsdf_generate_threshold_pair_cancelable(
+    const uint8_t* right_masks, const float* right_angles, int right_count,
+    const uint8_t* left_masks, const float* left_angles, int left_count,
+    int width, int height, uint16_t* output_rg,
+    int* right_violation_pixels, int* left_violation_pixels,
+    const int* cancel_requested) {
+    if (!right_masks || !right_angles || !left_masks || !left_angles ||
+        !output_rg || !right_violation_pixels || !left_violation_pixels ||
+        right_count < 2 || left_count < 2 || width < 1 || height < 1)
+        return QSDF_INVALID_ARGUMENT;
+    try {
+        if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+        std::vector<int> right_sequence, left_sequence;
+        if (!build_side_sequence(right_angles, right_count, right_sequence) ||
+            !build_side_sequence(left_angles, left_count, left_sequence))
+            return QSDF_INVALID_ARGUMENT;
+        const size_t pixels = size_t(width) * height;
+        *right_violation_pixels =
+            validate_sequence(right_masks, right_sequence, pixels, cancel_requested);
+        if (*right_violation_pixels < 0) return QSDF_CANCELLED;
+        *left_violation_pixels =
+            validate_sequence(left_masks, left_sequence, pixels, cancel_requested);
+        if (*left_violation_pixels < 0) return QSDF_CANCELLED;
+        if (*right_violation_pixels || *left_violation_pixels)
+            return QSDF_NON_MONOTONIC;
+        if (!generate_channel(right_masks, right_angles, right_sequence, width, height,
+                              output_rg, 2, cancel_requested) ||
+            !generate_channel(left_masks, left_angles, left_sequence, width, height,
+                              output_rg + 1, 2, cancel_requested))
+            return QSDF_CANCELLED;
         return QSDF_OK;
     } catch (const std::bad_alloc&) {
         return QSDF_OUT_OF_MEMORY;
@@ -544,28 +731,9 @@ QSDF_API int qsdf_generate_threshold_pair(
     const uint8_t* left_masks, const float* left_angles, int left_count,
     int width, int height, uint16_t* output_rg,
     int* right_violation_pixels, int* left_violation_pixels) {
-    if (!right_masks || !right_angles || !left_masks || !left_angles ||
-        !output_rg || !right_violation_pixels || !left_violation_pixels ||
-        right_count < 2 || left_count < 2 || width < 1 || height < 1)
-        return QSDF_INVALID_ARGUMENT;
-    try {
-        std::vector<int> right_sequence, left_sequence;
-        if (!build_side_sequence(right_angles, right_count, right_sequence) ||
-            !build_side_sequence(left_angles, left_count, left_sequence))
-            return QSDF_INVALID_ARGUMENT;
-        const size_t pixels = size_t(width) * height;
-        *right_violation_pixels =
-            validate_sequence(right_masks, right_sequence, pixels);
-        *left_violation_pixels =
-            validate_sequence(left_masks, left_sequence, pixels);
-        if (*right_violation_pixels || *left_violation_pixels)
-            return QSDF_NON_MONOTONIC;
-        generate_channel(right_masks, right_angles, right_sequence, width, height,
-                         output_rg, 2);
-        generate_channel(left_masks, left_angles, left_sequence, width, height,
-                         output_rg + 1, 2);
-        return QSDF_OK;
-    } catch (const std::bad_alloc&) {
-        return QSDF_OUT_OF_MEMORY;
-    }
+    return qsdf_generate_threshold_pair_cancelable(
+        right_masks, right_angles, right_count,
+        left_masks, left_angles, left_count,
+        width, height, output_rg,
+        right_violation_pixels, left_violation_pixels, nullptr);
 }

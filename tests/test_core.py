@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+import hashlib
 from pathlib import Path
 import struct
 import tempfile
@@ -15,15 +16,19 @@ from quick_sdf_blender.core import (
     RangeScope,
     exact_edt,
     exact_signed_edt,
+    generate_threshold_pair,
     generate_threshold_rgba16,
     guard_clip_proposal,
     range_target_indices,
+    repair_side_monotonic,
     validate_monotonic,
+    validate_side_monotonic,
 )
 from quick_sdf_blender.png16 import PNG_SIGNATURE, encode_png_rgba16, write_png_rgba16
 
 
 ANGLES = np.arange(-90.0, 91.0, 15.0)
+SIDE_ANGLES = np.arange(0.0, 91.0, 15.0)
 
 
 def brute_distance(features: np.ndarray) -> np.ndarray:
@@ -68,6 +73,112 @@ def decode_png(data: bytes) -> tuple[dict[str, int], np.ndarray]:
         "filter": filtering,
         "interlace": interlace,
     }, pixels.astype(np.uint16)
+
+
+class MonotonicRepairTests(unittest.TestCase):
+    def test_valid_stack_is_bit_identical_and_idempotent(self) -> None:
+        rng = np.random.default_rng(303)
+        transitions = rng.integers(0, len(SIDE_ANGLES) + 1, size=(9, 11))
+        masks = np.arange(len(SIDE_ANGLES))[:, None, None] >= transitions[None, ...]
+        base = masks.copy()
+        coverage = rng.random(masks.shape) > 0.95
+        result = repair_side_monotonic(masks, base, coverage)
+        np.testing.assert_array_equal(result.masks, masks)
+        self.assertEqual(result.changed_sample_count, 0)
+        second = repair_side_monotonic(result.masks, base, coverage)
+        np.testing.assert_array_equal(second.masks, result.masks)
+        self.assertEqual(second.changed_sample_count, 0)
+
+    def test_valid_display_wins_even_when_base_and_coverage_are_unrelated(self) -> None:
+        rng = np.random.default_rng(3303)
+        transitions = rng.integers(0, len(SIDE_ANGLES) + 1, size=(8, 10))
+        masks = np.arange(len(SIDE_ANGLES))[:, None, None] >= transitions[None, ...]
+        base = rng.random(masks.shape) > 0.5
+        coverage = rng.random(masks.shape) > 0.5
+        result = repair_side_monotonic(masks, base, coverage)
+        np.testing.assert_array_equal(result.masks, masks)
+        self.assertEqual(result.changed_sample_count, 0)
+
+    def test_complete_tie_chooses_the_lower_transition_index(self) -> None:
+        masks = np.asarray([True, False], dtype=np.bool_)[:, None, None]
+        result = repair_side_monotonic(masks, masks, np.zeros_like(masks))
+        np.testing.assert_array_equal(result.masks[:, 0, 0], [True, True])
+        self.assertEqual(int(result.transition_indices[0, 0]), 0)
+        self.assertEqual(result.transition_indices.dtype, np.int32)
+
+    def test_repair_enabled_export_matches_020_png_golden(self) -> None:
+        angles = np.asarray([0.0, 20.0, 55.0, 90.0], dtype=np.float64)
+        right_transitions = np.asarray([[0, 1, 2, 4], [4, 3, 1, 0]])
+        left_transitions = np.asarray([[4, 2, 3, 0], [1, 4, 0, 2]])
+        right = np.arange(4)[:, None, None] >= right_transitions[None, ...]
+        left = np.arange(4)[:, None, None] >= left_transitions[None, ...]
+        coverage = np.indices(right.shape).sum(axis=0) % 3 == 0
+        repaired_right = repair_side_monotonic(
+            right, ~right, coverage
+        ).masks
+        repaired_left = repair_side_monotonic(
+            left, np.roll(left, 1, axis=0), ~coverage
+        ).masks
+        rgba = generate_threshold_pair(
+            repaired_right, angles, repaired_left, angles
+        )
+        np.testing.assert_array_equal(repaired_right, right)
+        np.testing.assert_array_equal(repaired_left, left)
+        self.assertEqual(
+            hashlib.sha256(encode_png_rgba16(rgba)).hexdigest(),
+            "3d1c5076504f2ab25d239fbb2a886d6a6dde23a51e7cde134d6d44be5946fd22",
+        )
+
+    def test_coverage_protection_wins_before_total_and_base_cost(self) -> None:
+        masks = np.asarray([True, False, True], dtype=np.bool_)[:, None, None]
+        base = np.asarray([False, False, True], dtype=np.bool_)[:, None, None]
+        coverage = np.zeros_like(masks)
+        coverage[0, 0, 0] = True
+        result = repair_side_monotonic(masks, base, coverage)
+        np.testing.assert_array_equal(result.masks[:, 0, 0], [True, True, True])
+        self.assertEqual(result.protected_changed_sample_count, 0)
+        self.assertEqual(result.changed_sample_count, 1)
+
+    def test_display_difference_is_protected_without_coverage(self) -> None:
+        masks = np.asarray([True, False, True], dtype=np.bool_)[:, None, None]
+        base = np.asarray([False, False, True], dtype=np.bool_)[:, None, None]
+        result = repair_side_monotonic(masks, base, np.zeros_like(masks))
+        np.testing.assert_array_equal(result.masks[:, 0, 0], [True, True, True])
+        self.assertEqual(result.protected_changed_sample_count, 0)
+
+    def test_base_breaks_equal_display_cost(self) -> None:
+        masks = np.asarray([True, False], dtype=np.bool_)[:, None, None]
+        shadow_coverage = np.asarray([False, True], dtype=np.bool_)[:, None, None]
+        light_coverage = np.asarray([True, False], dtype=np.bool_)[:, None, None]
+        result_light = repair_side_monotonic(
+            masks, np.ones_like(masks), light_coverage
+        )
+        result_shadow = repair_side_monotonic(
+            masks, np.zeros_like(masks), shadow_coverage
+        )
+        np.testing.assert_array_equal(result_light.masks[:, 0, 0], [True, True])
+        np.testing.assert_array_equal(result_shadow.masks[:, 0, 0], [False, False])
+
+    def test_random_invalid_stacks_are_repaired_without_mutating_inputs(self) -> None:
+        rng = np.random.default_rng(9917)
+        masks = rng.random((len(SIDE_ANGLES), 17, 13)) > 0.5
+        base = rng.random(masks.shape) > 0.5
+        coverage = rng.random(masks.shape) > 0.85
+        originals = (masks.copy(), base.copy(), coverage.copy())
+        result = repair_side_monotonic(masks, base, coverage)
+        self.assertTrue(validate_side_monotonic(result.masks, SIDE_ANGLES).is_valid)
+        np.testing.assert_array_equal(masks, originals[0])
+        np.testing.assert_array_equal(base, originals[1])
+        np.testing.assert_array_equal(coverage, originals[2])
+        self.assertEqual(
+            result.changed_pixel_count,
+            int(np.count_nonzero(np.any(result.changed_mask, axis=0))),
+        )
+
+    def test_shape_validation(self) -> None:
+        masks = np.zeros((3, 2, 2), dtype=np.bool_)
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            repair_side_monotonic(masks, masks[:, :, :1], masks)
 
 
 class ExactEdtTests(unittest.TestCase):

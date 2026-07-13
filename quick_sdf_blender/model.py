@@ -260,6 +260,32 @@ class QSDFProject(PropertyGroup):
     output_path: StringProperty(name="Output", subtype="FILE_PATH", default="")
     overwrite: BoolProperty(name="Overwrite", default=False)
     generated_image: PointerProperty(name="Generated Threshold", type=bpy.types.Image)
+    export_adjustment_image: PointerProperty(
+        name="Export Adjustment Heatmap",
+        type=bpy.types.Image,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    export_adjustment_pixel_count: IntProperty(
+        name="Adjusted Authored Pixels",
+        default=0,
+        min=0,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    export_adjustment_sample_count: IntProperty(
+        name="Adjusted Angle Samples",
+        default=0,
+        min=0,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    export_adjustment_protected_pixel_count: IntProperty(
+        name="Adjusted Edited Pixels",
+        default=0,
+        min=0,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    export_failed: BoolProperty(
+        name="Export Failed", default=False, options={"HIDDEN"}
+    )
     has_violations: BoolProperty(name="Has Violations", default=False)
     validation_message: StringProperty(name="Validation", default="Not validated")
     warning_message: StringProperty(name="Warnings", default="")

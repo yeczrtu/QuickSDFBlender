@@ -62,6 +62,7 @@ class StudioSession:
     stroke_brush_color: tuple[float, float, float] | None = None
     stroke_from_view3d: bool = False
     projection_hint: str = ""
+    export_review_active: bool = False
 
 
 @dataclass(slots=True)
@@ -171,6 +172,7 @@ def select_paint_key(
 
     session = active_session(context)
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        leave_export_adjustment_review(project, session=session)
         session.view_mode = "EDIT"
         session.paint_key_uuid = str(getattr(item, "uuid", ""))
         session.paint_key_angle = angle
@@ -184,6 +186,70 @@ def select_paint_key(
             _assign_preview(project, image)
         except (ReferenceError, RuntimeError, ValueError):
             pass
+    tag_studio_redraw()
+    return True
+
+
+def show_export_adjustment_review(context: Any, project: Any, image: Any) -> bool:
+    """Show an export-only heatmap without leaving a paint surface armed."""
+
+    session = active_session(context)
+    if session is None or session.project_uuid != str(getattr(project, "uuid", "")):
+        return False
+    window = find_window(session.window_pointer)
+    if window is None:
+        return False
+    shown = False
+    for area in window.screen.areas:
+        if area.type != "IMAGE_EDITOR":
+            continue
+        space = area.spaces.active
+        if hasattr(space, "ui_mode"):
+            space.ui_mode = "VIEW"
+        elif hasattr(space, "mode"):
+            space.mode = "VIEW"
+        space.image = image
+        area.tag_redraw()
+        shown = True
+    session.export_review_active = shown
+    tag_studio_redraw()
+    return shown
+
+
+def leave_export_adjustment_review(
+    project: Any | None = None,
+    *,
+    session: StudioSession | None = None,
+) -> bool:
+    """Restore the authoring canvas after the read-only export review."""
+
+    session = session or _SESSION
+    if session is None or not session.export_review_active:
+        return False
+    project = project or resolve_session_project(session)
+    image = None
+    if project is not None:
+        try:
+            from .runtime import active_angle, resolve_display_image
+
+            item = active_angle(project)
+            image = resolve_display_image(project, item) if item is not None else None
+        except (AttributeError, ImportError, ReferenceError, RuntimeError):
+            image = None
+    window = find_window(session.window_pointer)
+    if window is not None:
+        for area in window.screen.areas:
+            if area.type != "IMAGE_EDITOR":
+                continue
+            space = area.spaces.active
+            if hasattr(space, "ui_mode"):
+                space.ui_mode = "PAINT"
+            elif hasattr(space, "mode"):
+                space.mode = "PAINT"
+            if image is not None:
+                space.image = image
+            area.tag_redraw()
+    session.export_review_active = False
     tag_studio_redraw()
     return True
 
@@ -1082,7 +1148,8 @@ __all__ = [
     "CLASSES", "StudioBusyError", "StudioError", "StudioSession", "StudioUnavailableError",
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
     "back_to_paint", "dismiss_first_stroke_hint", "enter_studio", "exit_studio",
-    "find_studio_workspace", "is_studio_active", "reconcile_view_state", "register_studio",
+    "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
+    "reconcile_view_state", "register_studio", "show_export_adjustment_review",
     "prepare_stroke_brush", "resolve_session_project", "restore_stroke_brush", "seek_preview",
     "select_paint_key", "set_projection_hint", "studio_areas", "tag_studio_redraw",
     "unregister_studio",

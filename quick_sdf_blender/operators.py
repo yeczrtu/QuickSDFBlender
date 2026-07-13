@@ -1472,16 +1472,27 @@ class _QuickSDFPaintMacroMixin:
         if project is None:
             return False
         try:
-            from .studio import is_studio_active
+            from .studio import active_session, is_studio_active
 
             active = is_studio_active(context, str(project.uuid))
+            session = active_session(context)
+            export_review_active = bool(
+                session is not None and getattr(session, "export_review_active", False)
+            )
         except (ImportError, ReferenceError, RuntimeError):
             active = False
+            export_review_active = False
         editor_paint = getattr(context, "mode", "") == "PAINT_TEXTURE" or (
             getattr(getattr(context, "area", None), "type", "") == "IMAGE_EDITOR"
             and getattr(getattr(context, "space_data", None), "mode", "") == "PAINT"
         )
-        return bool(active and editor_paint and getattr(project, "author_tool", "PAINT") == "PAINT")
+        return bool(
+            active
+            and not export_review_active
+            and editor_paint
+            and getattr(project, "author_tool", "PAINT") == "PAINT"
+            and not bool(getattr(project, "job_running", False))
+        )
 
 
 class QUICKSDF_OT_range_paint(_QuickSDFPaintMacroMixin, bpy.types.Macro):
@@ -1530,7 +1541,11 @@ class QUICKSDF_OT_history_undo(bpy.types.Operator):
     def poll(cls, context):
         project = runtime.active_project(getattr(context, "scene", None))
         history = _HISTORIES.get(str(getattr(project, "uuid", "")))
-        return bool(history and history.can_undo)
+        return bool(
+            history
+            and history.can_undo
+            and not bool(getattr(project, "job_running", False))
+        )
 
     def execute(self, context):
         project = _require_project(self, context)
@@ -1557,7 +1572,11 @@ class QUICKSDF_OT_history_redo(bpy.types.Operator):
     def poll(cls, context):
         project = runtime.active_project(getattr(context, "scene", None))
         history = _HISTORIES.get(str(getattr(project, "uuid", "")))
-        return bool(history and history.can_redo)
+        return bool(
+            history
+            and history.can_redo
+            and not bool(getattr(project, "job_running", False))
+        )
 
     def execute(self, context):
         project = _require_project(self, context)
@@ -1599,7 +1618,114 @@ class QUICKSDF_OT_validate(bpy.types.Operator):
 
 
 def _prepare_threshold_inputs(project):
-    """Copy every bpy-backed mask before work moves to a native worker."""
+    """Copy every bpy-backed export layer before work moves to a worker."""
+
+    previous_status = (
+        str(getattr(project, "validation_message", "")),
+        str(getattr(project, "warning_message", "")),
+        str(getattr(project, "diagnostic_message", "")),
+        bool(getattr(project, "has_violations", False)),
+    )
+    try:
+        errors, _warnings, _report = runtime.validate_project(
+            project, include_monotonic=False
+        )
+    finally:
+        (
+            project.validation_message,
+            project.warning_message,
+            project.diagnostic_message,
+            project.has_violations,
+        ) = previous_status
+    if errors:
+        raise ValueError(errors[0])
+    mirror_mode = str(getattr(project, "symmetry_mode", "AUTO"))
+    if mirror_mode == "AUTO":
+        mirror_mode = str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR"))
+    linked = bool(getattr(project, "mirror_enabled", True)) and mirror_mode != "INDEPENDENT"
+    if not linked:
+        return {
+            "linked": False,
+            "right": runtime.project_side_export_layers(project, "RIGHT"),
+            "left": runtime.project_side_export_layers(project, "LEFT"),
+        }
+
+    available = {
+        str(getattr(item, "side", "RIGHT")) for item in getattr(project, "angles", ())
+    }
+    author_side = str(getattr(project, "authoring_side", "RIGHT"))
+    if author_side not in available:
+        author_side = "RIGHT" if "RIGHT" in available else "LEFT"
+    source = runtime.project_side_export_layers(project, author_side)
+    pairs = None
+    if mirror_mode == "ISLAND_PAIR":
+        pairs = _symmetry_island_pairs(project, source[0].shape[1:])
+    mode_map = {
+        "OVERLAPPED_UV": "OVERLAPPED",
+        "TEXTURE_MIRROR": "TEXTURE_MIRROR",
+        "ISLAND_PAIR": "ISLAND_PAIR",
+    }
+    return {
+        "linked": True,
+        "author_side": author_side,
+        "source": source,
+        "mirror_mode": mode_map.get(mirror_mode, "TEXTURE_MIRROR"),
+        "island_pairs": pairs,
+    }
+
+
+def _export_revision_token(project):
+    """Fingerprint every export-relevant setting and image revision."""
+
+    entries = []
+    for item in sorted(
+        getattr(project, "angles", ()),
+        key=lambda value: (
+            str(getattr(value, "side", "RIGHT")),
+            float(getattr(value, "angle", 0.0)),
+            str(getattr(value, "uuid", "")),
+        ),
+    ):
+        layers = []
+        for resolver in (
+            runtime.resolve_display_image,
+            runtime.resolve_base_image,
+            runtime.resolve_coverage_image,
+        ):
+            image = resolver(project, item)
+            layers.append(
+                None
+                if image is None
+                else (
+                    str(image.name),
+                    tuple(int(value) for value in image.size[:]),
+                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                )
+            )
+        entries.append(
+            (
+                str(getattr(item, "uuid", "")),
+                str(getattr(item, "side", "RIGHT")),
+                float(getattr(item, "angle", 0.0)),
+                tuple(layers),
+            )
+        )
+    return (
+        str(getattr(project, "uuid", "")),
+        str(getattr(getattr(project, "target_object", None), "name_full", "")),
+        int(getattr(project, "material_slot_index", 0)),
+        str(getattr(project, "uv_map_name", "")),
+        int(getattr(project, "resolution", 0)),
+        bool(getattr(project, "mirror_enabled", True)),
+        str(getattr(project, "symmetry_mode", "AUTO")),
+        str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR")),
+        str(getattr(project, "authoring_side", "RIGHT")),
+        tuple(entries),
+    )
+
+
+def _prepare_strict_threshold_inputs(project):
+    """Preserve the public ``quicksdf.generate`` strict validation contract."""
 
     from .core import validate_side_monotonic
 
@@ -1612,7 +1738,11 @@ def _prepare_threshold_inputs(project):
         mirror_mode = str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR"))
     if bool(getattr(project, "mirror_enabled", True)) and mirror_mode == "ISLAND_PAIR":
         sample_item = next(iter(project.angles), None)
-        sample = runtime.resolve_display_image(project, sample_item) if sample_item is not None else None
+        sample = (
+            runtime.resolve_display_image(project, sample_item)
+            if sample_item is not None
+            else None
+        )
         if sample is not None:
             pairs = _symmetry_island_pairs(project, (sample.size[1], sample.size[0]))
     right, right_angles, left, left_angles = runtime.project_side_stacks(
@@ -1625,11 +1755,13 @@ def _prepare_threshold_inputs(project):
     project.has_violations = any(not report.is_valid for report in reports)
     if project.has_violations:
         count = sum(report.violation_pixel_count for report in reports)
-        raise ValueError(f"Some imported pixels change in the wrong direction ({count} pixels)")
+        raise ValueError(
+            f"Some imported pixels change in the wrong direction ({count} pixels)"
+        )
     return right, right_angles, left, left_angles
 
 
-def _compute_threshold_rgba(inputs):
+def _compute_threshold_rgba(inputs, cancel_flag=None):
     """Blender-free worker entry point; ctypes releases the GIL in native EDT."""
 
     import numpy as np
@@ -1642,7 +1774,7 @@ def _compute_threshold_rgba(inputs):
 
         if native.available() and native.version() >= 2:
             channels = native.generate_threshold_pair(
-                right, right_angles, left, left_angles
+                right, right_angles, left, left_angles, cancel_flag=cancel_flag
             )
             rgba = np.zeros((*channels.shape[:2], 4), dtype=np.uint16)
             rgba[..., :2] = channels
@@ -1650,9 +1782,124 @@ def _compute_threshold_rgba(inputs):
             return rgba
     except (ImportError, OSError, AttributeError):
         pass
-    return generate_threshold_pair(
-        right, right_angles, left, left_angles, validate=False
+    return generate_threshold_pair(right, right_angles, left, left_angles, validate=True)
+
+
+def _repair_export_lane(lane, cancel_flag=None):
+    """Repair one copied lane and verify the derived result strictly."""
+
+    display, angles, base, coverage = lane
+    try:
+        from . import native
+
+        repair = native.repair_side_monotonic(
+            display, base, coverage, cancel_flag=cancel_flag
+        )
+    except (ImportError, OSError, AttributeError):
+        from .core import repair_side_monotonic
+
+        repair = repair_side_monotonic(display, base, coverage)
+    from .core import validate_side_monotonic
+
+    report = validate_side_monotonic(repair.masks, angles)
+    if not report.is_valid:
+        raise RuntimeError("Automatic angle repair did not produce a valid export stack")
+    return repair
+
+
+def _change_heatmap(changed_mask):
+    import numpy as np
+
+    changed = np.asarray(changed_mask, dtype=np.bool_)
+    return np.count_nonzero(changed, axis=0).astype(np.float32) / float(changed.shape[0])
+
+
+def _compute_export_result(inputs, cancel_flag=None):
+    """Repair copied stacks, then generate a byte-compatible threshold image."""
+
+    import numpy as np
+
+    from .symmetry import mirror_side_layer, mirror_side_stack
+
+    def cancelled():
+        return bool(cancel_flag is not None and int(getattr(cancel_flag, "value", 0)))
+
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+
+    if bool(inputs["linked"]):
+        source = inputs["source"]
+        repair = _repair_export_lane(source, cancel_flag)
+        if cancelled():
+            raise RuntimeError("Export cancelled")
+        mode = inputs["mirror_mode"]
+        pairs = inputs.get("island_pairs")
+        mirrored = mirror_side_stack(repair.masks, mode, island_pairs=pairs)
+        angles = np.array(source[1], copy=True)
+        if inputs["author_side"] == "RIGHT":
+            threshold_inputs = (repair.masks, angles, mirrored, angles)
+        else:
+            threshold_inputs = (mirrored, angles, repair.masks, angles)
+        source_heatmap = _change_heatmap(repair.changed_mask)
+        heatmap = np.maximum(
+            source_heatmap,
+            mirror_side_layer(source_heatmap, mode, island_pairs=pairs),
+        )
+        repairs = (repair,)
+    else:
+        right = _repair_export_lane(inputs["right"], cancel_flag)
+        if cancelled():
+            raise RuntimeError("Export cancelled")
+        left = _repair_export_lane(inputs["left"], cancel_flag)
+        threshold_inputs = (
+            right.masks,
+            inputs["right"][1],
+            left.masks,
+            inputs["left"][1],
+        )
+        heatmap = np.maximum(
+            _change_heatmap(right.changed_mask),
+            _change_heatmap(left.changed_mask),
+        )
+        repairs = (right, left)
+
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    rgba = _compute_threshold_rgba(threshold_inputs, cancel_flag)
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    return {
+        "rgba": rgba,
+        "heatmap": np.ascontiguousarray(heatmap, dtype=np.float32),
+        "changed_sample_count": sum(item.changed_sample_count for item in repairs),
+        "changed_pixel_count": sum(item.changed_pixel_count for item in repairs),
+        "protected_changed_sample_count": sum(
+            item.protected_changed_sample_count for item in repairs
+        ),
+        "protected_changed_pixel_count": sum(
+            item.protected_changed_pixel_count for item in repairs
+        ),
+    }
+
+
+def _publish_export_result(project, result) -> None:
+    rgba = result["rgba"]
+    runtime.update_threshold_preview(project, rgba)
+    changed_pixels = int(result["changed_pixel_count"])
+    project.export_adjustment_pixel_count = changed_pixels
+    project.export_adjustment_sample_count = int(result["changed_sample_count"])
+    project.export_adjustment_protected_pixel_count = int(
+        result["protected_changed_pixel_count"]
     )
+    project.has_violations = changed_pixels > 0
+    if changed_pixels:
+        runtime.update_export_adjustment_preview(project, result["heatmap"])
+        project.validation_message = "Adjusted for export"
+    else:
+        runtime.clear_export_adjustment_preview(project)
+        project.validation_message = "Generated"
+    project.diagnostic_message = ""
+    project.export_failed = False
 
 
 def _project_by_uuid(uuid: str):
@@ -1679,6 +1926,7 @@ def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) 
         project.job_message = message
         if error:
             project.diagnostic_message = message
+            project.export_failed = True
     # Release executor/thread objects before Blender can immediately close or
     # disable the extension on the following UI event.
     job.clear()
@@ -1700,9 +1948,8 @@ def _poll_export_job() -> float | None:
     manager = job["manager"]
     project = _project_by_uuid(str(job["project_uuid"]))
     if project is None:
-        manager.cancel()
-        _finish_export_job(
-            "Export cancelled because the project was removed", error=True, wait=False
+        shutdown_export_job(
+            message="Export cancelled because the project was removed", wait=True
         )
         return None
     state = manager.poll()
@@ -1711,26 +1958,40 @@ def _poll_export_job() -> float | None:
         project.job_message = "Generating face shadow texture…"
         return 0.1
     try:
-        rgba = manager.take_result()
+        result = manager.take_result()
         project.job_progress = 0.95
-        runtime.update_threshold_preview(project, rgba)
+        if _export_revision_token(project) != job.get("revision_token"):
+            _finish_export_job(
+                "Export paused because the project changed; retry to save the latest paint",
+                error=True,
+            )
+            return None
         from .png16 import write_png_rgba16
 
         written = write_png_rgba16(
-            job["path"], rgba, overwrite=bool(job["overwrite"])
+            job["path"], result["rgba"], overwrite=bool(job["overwrite"])
         )
         project.output_path = str(written)
-        project.dirty = False
-        project.validation_message = "Generated"
     except Exception as exc:
         _finish_export_job(f"Export failed: {exc}", error=True)
         return None
+    try:
+        _publish_export_result(project, result)
+    except Exception as exc:
+        # The atomic PNG is already safely on disk. Review imagery is helpful
+        # but must never turn a successful file write into a failed Export.
+        project.warning_message = f"Exported, but could not update review preview: {exc}"
+        project.export_failed = False
+    project.dirty = False
     # End and collect the worker before publishing completion. Blender's image
     # and GPU caches then receive one event-loop interval before an immediate
     # Exit/Save/quit can tear down the Studio.
     manager.shutdown(wait=True)
     job["manager"] = None
-    job["settled_message"] = f"Exported {written}"
+    if int(result["changed_pixel_count"]):
+        job["settled_message"] = "Adjusted angle continuity and exported"
+    else:
+        job["settled_message"] = f"Exported {written}"
     project.job_progress = 1.0
     project.job_message = "Finalizing export…"
     import gc
@@ -1744,14 +2005,19 @@ def _start_export_job(project, inputs, path: Path, overwrite: bool) -> None:
     if _EXPORT_JOB is not None:
         raise RuntimeError("Another Quick SDF export is already running")
     from .jobs import GenerationJobManager
+    import ctypes
 
+    revision_token = _export_revision_token(project)
     manager = GenerationJobManager()
-    manager.submit(_compute_threshold_rgba, inputs)
+    cancel_flag = ctypes.c_int(0)
+    manager.submit(_compute_export_result, inputs, cancel_flag)
     _EXPORT_JOB = {
         "manager": manager,
         "project_uuid": str(project.uuid),
         "path": Path(path),
         "overwrite": bool(overwrite),
+        "cancel_flag": cancel_flag,
+        "revision_token": revision_token,
     }
     project.job_running = True
     project.job_progress = 0.01
@@ -1768,6 +2034,9 @@ def shutdown_export_job(
     if job is None or (project_uuid and str(job.get("project_uuid", "")) != str(project_uuid)):
         return False
     manager = job.get("manager")
+    cancel_flag = job.get("cancel_flag")
+    if cancel_flag is not None:
+        cancel_flag.value = 1
     if manager is not None:
         manager.cancel()
     _finish_export_job(message, error=True, wait=wait)
@@ -1777,7 +2046,7 @@ def shutdown_export_job(
 
 
 def _generate(project, context):
-    inputs = _prepare_threshold_inputs(project)
+    inputs = _prepare_strict_threshold_inputs(project)
     window_manager = context.window_manager
     window_manager.progress_begin(0, 2)
     try:
@@ -1790,6 +2059,19 @@ def _generate(project, context):
     project.dirty = False
     project.validation_message = "Generated"
     return rgba
+
+
+def _generate_export(project, context):
+    inputs = _prepare_threshold_inputs(project)
+    window_manager = context.window_manager
+    window_manager.progress_begin(0, 2)
+    try:
+        window_manager.progress_update(1)
+        result = _compute_export_result(inputs)
+        window_manager.progress_update(2)
+    finally:
+        window_manager.progress_end()
+    return result
 
 
 class QUICKSDF_OT_generate(bpy.types.Operator):
@@ -1851,6 +2133,10 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
         path = Path(bpy.path.abspath(path_text))
         if path.suffix.lower() != ".png":
             path = path.with_suffix(".png")
+        # Keep the chosen destination even when validation, generation or I/O
+        # fails so the artist can retry without navigating the file browser.
+        project.output_path = str(path)
+        project.export_failed = False
         # Blender's file browser performs its own existing-file confirmation.
         # Once it returns to execute, that explicit confirmation is sufficient;
         # script calls still need overwrite=True.
@@ -1858,6 +2144,9 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
             self.overwrite or self.confirmed or self.from_file_selector or project.overwrite
         )
         if path.exists() and not allow_overwrite:
+            project.export_failed = True
+            project.job_message = f"Export failed: File already exists: {path}"
+            project.diagnostic_message = project.job_message
             self.report({"ERROR"}, f"File already exists: {path}")
             return {"CANCELLED"}
         if not bpy.app.background and getattr(context, "window", None) is not None:
@@ -1867,19 +2156,94 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
                 self.report({"INFO"}, "Generating face shadow texture")
                 return {"FINISHED"}
             except (OSError, ValueError, RuntimeError) as exc:
+                project.export_failed = True
+                project.job_message = f"Export failed: {exc}"
+                project.diagnostic_message = project.job_message
                 self.report({"ERROR"}, str(exc))
                 return {"CANCELLED"}
         from .png16 import write_png_rgba16
 
         try:
-            rgba = _generate(project, context)
-            written = write_png_rgba16(path, rgba, overwrite=allow_overwrite)
+            result = _generate_export(project, context)
+            written = write_png_rgba16(path, result["rgba"], overwrite=allow_overwrite)
         except (FileExistsError, OSError, ValueError, RuntimeError) as exc:
+            project.export_failed = True
+            project.job_message = f"Export failed: {exc}"
+            project.diagnostic_message = project.job_message
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         project.output_path = str(written)
-        self.report({"INFO"}, f"Exported {written}")
+        try:
+            _publish_export_result(project, result)
+        except Exception as exc:
+            project.warning_message = f"Exported, but could not update review preview: {exc}"
+            project.export_failed = False
+        project.dirty = False
+        if int(result["changed_pixel_count"]):
+            project.job_message = "Adjusted angle continuity and exported"
+            from .i18n import tr
+
+            self.report({"INFO"}, tr(project.job_message))
+        else:
+            project.job_message = f"Exported {written}"
+            self.report({"INFO"}, project.job_message)
         return {"FINISHED"}
+
+
+class QUICKSDF_OT_review_export_adjustments(bpy.types.Operator):
+    bl_idname = "quicksdf.review_export_adjustments"
+    bl_label = "Review Export Adjustments"
+    bl_description = "Show pixels changed only in the exported texture"
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        image = getattr(project, "export_adjustment_image", None)
+        if image is None or image.get(runtime.ROLE_KEY) != runtime.EXPORT_ADJUSTMENT_ROLE:
+            self.report({"WARNING"}, "Export an adjusted texture before opening its heatmap")
+            return {"CANCELLED"}
+        try:
+            from .studio import show_export_adjustment_review
+
+            if show_export_adjustment_review(context, project, image):
+                from .i18n import tr
+
+                self.report(
+                    {"INFO"},
+                    tr(
+                        "Export adjustments are shown read-only; choose an angle to return"
+                    ),
+                )
+                return {"FINISHED"}
+        except (AttributeError, ImportError, ReferenceError, RuntimeError):
+            pass
+        windows = list(getattr(context.window_manager, "windows", ()))
+        current_window = getattr(context, "window", None)
+        if current_window in windows:
+            windows.remove(current_window)
+            windows.insert(0, current_window)
+        for window in windows:
+            for area in window.screen.areas:
+                if area.type == "IMAGE_EDITOR":
+                    space = area.spaces.active
+                    if hasattr(space, "ui_mode"):
+                        space.ui_mode = "VIEW"
+                    elif hasattr(space, "mode"):
+                        space.mode = "VIEW"
+                    space.image = image
+                    area.tag_redraw()
+                    from .i18n import tr
+
+                    self.report(
+                        {"INFO"},
+                        tr(
+                            "Export adjustments are shown in the Image Editor; choose an angle to return"
+                        ),
+                    )
+                    return {"FINISHED"}
+        self.report({"WARNING"}, "Open Quick SDF Studio to review the export heatmap")
+        return {"CANCELLED"}
 
 
 class QUICKSDF_OT_cancel_job(bpy.types.Operator):
@@ -1900,7 +2264,7 @@ class QUICKSDF_OT_cancel_job(bpy.types.Operator):
         return (
             {"FINISHED"}
             if shutdown_export_job(
-                str(project.uuid), message="Export cancelled", wait=False
+                str(project.uuid), message="Export cancelled", wait=True
             )
             else {"CANCELLED"}
         )
@@ -1998,6 +2362,7 @@ CLASSES = (
     QUICKSDF_OT_validate,
     QUICKSDF_OT_generate,
     QUICKSDF_OT_export_texture,
+    QUICKSDF_OT_review_export_adjustments,
     QUICKSDF_OT_cancel_job,
     QUICKSDF_OT_export_mask_sequence,
 )

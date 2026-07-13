@@ -67,6 +67,19 @@ class GuardClipResult:
         return int(np.count_nonzero(np.any(self.clipped, axis=0)))
 
 
+@dataclass(frozen=True)
+class MonotonicRepairResult:
+    """A non-destructive projection of one side lane onto valid transitions."""
+
+    masks: np.ndarray
+    changed_mask: np.ndarray
+    transition_indices: np.ndarray
+    changed_sample_count: int
+    changed_pixel_count: int
+    protected_changed_sample_count: int
+    protected_changed_pixel_count: int
+
+
 def _as_binary(values: np.ndarray | Sequence[object], *, ndim: int) -> np.ndarray:
     """Convert common normalized/8-bit/16-bit mask arrays to bool."""
 
@@ -503,6 +516,74 @@ def validate_side_monotonic(
     )
 
 
+def repair_side_monotonic(
+    mask_stack: np.ndarray | Sequence[object],
+    base_stack: np.ndarray | Sequence[object],
+    coverage_stack: np.ndarray | Sequence[object],
+) -> MonotonicRepairResult:
+    """Project one 0..90 lane to the nearest valid Shadow→Light sequence.
+
+    For every pixel, all ``N + 1`` valid transition positions are considered.
+    Candidate cost is minimized lexicographically by protected edits, all
+    display edits, then distance from the base guide. Inputs are never mutated.
+    """
+
+    masks = _as_binary(mask_stack, ndim=3)
+    base = _as_binary(base_stack, ndim=3)
+    coverage = _as_binary(coverage_stack, ndim=3)
+    if base.shape != masks.shape or coverage.shape != masks.shape:
+        raise ValueError("mask, base, and coverage stacks must have the same shape")
+
+    protected = coverage | (masks != base)
+    # t=0 is always Light. Moving from t to t+1 changes sample t to Shadow.
+    protected_cost = np.count_nonzero(protected & ~masks, axis=0).astype(np.int32)
+    display_cost = np.count_nonzero(~masks, axis=0).astype(np.int32)
+    base_cost = np.count_nonzero(~base, axis=0).astype(np.int32)
+    best_protected = protected_cost.copy()
+    best_display = display_cost.copy()
+    best_base = base_cost.copy()
+    best_transition = np.zeros(masks.shape[1:], dtype=np.int32)
+
+    for transition in range(1, masks.shape[0] + 1):
+        index = transition - 1
+        display_delta = np.where(masks[index], 1, -1).astype(np.int32)
+        base_delta = np.where(base[index], 1, -1).astype(np.int32)
+        protected_cost += display_delta * protected[index].astype(np.int32)
+        display_cost += display_delta
+        base_cost += base_delta
+        better = (protected_cost < best_protected) | (
+            (protected_cost == best_protected)
+            & (
+                (display_cost < best_display)
+                | (
+                    (display_cost == best_display)
+                    & (base_cost < best_base)
+                )
+            )
+        )
+        if np.any(better):
+            best_protected[better] = protected_cost[better]
+            best_display[better] = display_cost[better]
+            best_base[better] = base_cost[better]
+            best_transition[better] = transition
+
+    repaired = np.arange(masks.shape[0], dtype=np.int32)[:, None, None] >= best_transition[None, ...]
+    repaired = np.ascontiguousarray(repaired, dtype=np.bool_)
+    changed = np.ascontiguousarray(repaired != masks)
+    protected_changed = changed & protected
+    return MonotonicRepairResult(
+        masks=repaired,
+        changed_mask=changed,
+        transition_indices=np.ascontiguousarray(best_transition),
+        changed_sample_count=int(np.count_nonzero(changed)),
+        changed_pixel_count=int(np.count_nonzero(np.any(changed, axis=0))),
+        protected_changed_sample_count=int(np.count_nonzero(protected_changed)),
+        protected_changed_pixel_count=int(
+            np.count_nonzero(np.any(protected_changed, axis=0))
+        ),
+    )
+
+
 def _threshold_for_lane(masks: np.ndarray, angles: np.ndarray) -> np.ndarray:
     indices = np.arange(masks.shape[0], dtype=np.intp)
     return _threshold_for_side(masks, angles, indices, {})
@@ -584,6 +665,7 @@ __all__ = [
     "LAST_TRANSITION",
     "GuardClipResult",
     "MonotonicValidation",
+    "MonotonicRepairResult",
     "RangeScope",
     "exact_edt",
     "exact_signed_edt",
@@ -592,6 +674,7 @@ __all__ = [
     "generate_threshold_rgba16",
     "guard_clip_proposal",
     "range_target_indices",
+    "repair_side_monotonic",
     "validate_monotonic",
     "validate_side_monotonic",
 ]

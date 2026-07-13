@@ -73,8 +73,22 @@ TRANSLATIONS = {
         ("*", "Remove Quick SDF Project"): "Quick SDFプロジェクトを削除",
         ("*", "Quick SDF Studio requires an interactive Blender window"): "Quick SDF StudioにはBlenderの操作可能なウィンドウが必要です",
         ("*", "Exit the current Quick SDF Studio before opening another project"): "別のプロジェクトを開く前に現在のQuick SDF Studioを終了してください",
+        ("*", "Retry Export"): "書き出しを再試行",
+        ("*", "Adjusted angle continuity and exported"): "角度のつながりを自動調整して書き出しました",
+        ("*", "Review Export Adjustments"): "書き出し時の自動調整を確認",
+        ("*", "%s authored pixels needed angle adjustment."): "%sか所の編集位置で角度のつながりを調整しました。",
+        ("*", "%s angle samples changed"): "%s個の角度サンプルを調整",
+        ("*", "%s edited pixels required adjustment."): "%sか所の手編集部分を調整しました。",
+        ("*", "Export adjustments are shown in the Image Editor; choose an angle to return"): "書き出し時の調整を画像エディターに表示しました。角度を選ぶとペイントへ戻ります。",
     }
 }
+
+# Keep this safety-critical review state understandable even in source trees
+# created under a non-UTF-8 Windows console.
+TRANSLATIONS["ja_JP"][(
+    "*",
+    "Export adjustments are shown read-only; choose an angle to return",
+)] = "\u66f8\u304d\u51fa\u3057\u8abf\u6574\u3092\u8aad\u307f\u53d6\u308a\u5c02\u7528\u3067\u8868\u793a\u3057\u307e\u3057\u305f\u3002\u89d2\u5ea6\u3092\u9078\u3076\u3068\u30da\u30a4\u30f3\u30c8\u306b\u623b\u308a\u307e\u3059\u3002"
 
 _REGISTERED = False
 

@@ -26,6 +26,7 @@ COVERAGE_ROLE = "angle_coverage"
 # Backward-compatible public name.  New images use DISPLAY_ROLE.
 MASK_ROLE = DISPLAY_ROLE
 THRESHOLD_ROLE = "threshold_preview"
+EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
 PALETTE_NAME = "Quick SDF Light Shadow"
 _PAINT_SNAPSHOTS: dict[str, Any] = {}
 _BASE_BAKE_UUIDS: set[str] = set()
@@ -764,6 +765,61 @@ def project_side_stack(project: Any, side: str) -> tuple[Any, Any]:
     return np.stack(masks, axis=0), np.asarray(angles, dtype=np.float64)
 
 
+def project_side_export_layers(project: Any, side: str) -> tuple[Any, Any, Any, Any]:
+    """Copy display, angle, base, and coverage arrays for one export lane.
+
+    This function is deliberately main-thread-only: all ``bpy`` image access is
+    completed here, leaving repair, symmetry, EDT and PNG encoding free to run
+    in a worker without retaining Blender data-block references.
+    """
+
+    import numpy as np
+
+    selected = sorted(
+        (item for item in project.angles if str(getattr(item, "side", "RIGHT")) == side),
+        key=lambda item: float(item.angle),
+    )
+    if not selected:
+        raise ValueError(f"Project has no {side.title()} angle keys")
+    display_layers = []
+    base_layers = []
+    coverage_layers = []
+    angles = []
+    expected_shape = None
+    for item in selected:
+        angle = float(item.angle)
+        display = resolve_display_image(project, item)
+        base = resolve_base_image(project, item)
+        coverage = resolve_coverage_image(project, item)
+        if display is None:
+            raise ValueError(f"Missing {side.title()} mask at {angle:g} degrees")
+        if base is None:
+            raise ValueError(f"Missing {side.title()} base mask at {angle:g} degrees")
+        if coverage is None:
+            raise ValueError(f"Missing {side.title()} override coverage at {angle:g} degrees")
+        display_mask = image_mask(display)
+        base_mask = image_mask(base)
+        coverage_values = coverage_mask(coverage)
+        if expected_shape is None:
+            expected_shape = display_mask.shape
+        if (
+            display_mask.shape != expected_shape
+            or base_mask.shape != expected_shape
+            or coverage_values.shape != expected_shape
+        ):
+            raise ValueError("All export layers must use the same resolution")
+        display_layers.append(display_mask)
+        base_layers.append(base_mask)
+        coverage_layers.append(coverage_values)
+        angles.append(angle)
+    return (
+        np.ascontiguousarray(np.stack(display_layers, axis=0), dtype=np.bool_),
+        np.asarray(angles, dtype=np.float64),
+        np.ascontiguousarray(np.stack(base_layers, axis=0), dtype=np.bool_),
+        np.ascontiguousarray(np.stack(coverage_layers, axis=0), dtype=np.bool_),
+    )
+
+
 def project_side_stacks(project: Any, *, island_pairs: Any | None = None) -> tuple[Any, Any, Any, Any]:
     """Return canonical Right and Left 0..90 stacks for preview/export.
 
@@ -825,6 +881,65 @@ def update_threshold_preview(project: Any, rgba16: Any) -> bpy.types.Image:
     # Core/PNG rows are top-down; Blender's image buffer starts at the bottom.
     normalized = np.flip(rgba, axis=0).astype(np.float32) / 65535.0
     image.pixels.foreach_set(normalized.ravel())
+    image.update()
+    return image
+
+
+def clear_export_adjustment_preview(project: Any) -> None:
+    image = getattr(project, "export_adjustment_image", None)
+    if image is not None:
+        active = active_angle(project)
+        replacement = resolve_display_image(project, active) if active is not None else None
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                if area.type != "IMAGE_EDITOR":
+                    continue
+                for space in area.spaces:
+                    if hasattr(space, "image") and space.image == image:
+                        space.image = replacement
+                        area.tag_redraw()
+        for material in bpy.data.materials:
+            if not material.use_nodes or material.node_tree is None:
+                continue
+            for node in material.node_tree.nodes:
+                if hasattr(node, "image") and node.image == image:
+                    node.image = replacement
+    if image is not None and image.get(PROJECT_UUID_KEY) == project.uuid:
+        bpy.data.images.remove(image)
+    project.export_adjustment_image = None
+
+
+def update_export_adjustment_preview(project: Any, heatmap: Any) -> bpy.types.Image | None:
+    """Store a transient red heatmap for Advanced export review."""
+
+    import numpy as np
+
+    values = np.asarray(heatmap, dtype=np.float32)
+    if values.ndim != 2 or any(size <= 0 for size in values.shape):
+        raise ValueError("Export adjustment heatmap must be a non-empty 2D array")
+    values = np.clip(values, 0.0, 1.0)
+    if not np.any(values > 0.0):
+        clear_export_adjustment_preview(project)
+        return None
+    height, width = values.shape
+    image = getattr(project, "export_adjustment_image", None)
+    if image is None or tuple(image.size[:]) != (width, height):
+        if image is not None and image.get(PROJECT_UUID_KEY) == project.uuid:
+            bpy.data.images.remove(image)
+        image = bpy.data.images.new(
+            f"QSDF Export Adjustments {project.uuid[:8]}",
+            width=width,
+            height=height,
+            alpha=True,
+            float_buffer=False,
+        )
+        _tag_image(image, project.uuid, role=EXPORT_ADJUSTMENT_ROLE)
+        project.export_adjustment_image = image
+    rgba = np.zeros((height, width, 4), dtype=np.float32)
+    rgba[..., 0] = values
+    rgba[..., 1] = values * 0.08
+    rgba[..., 3] = 1.0
+    image.pixels.foreach_set(np.flip(rgba, axis=0).ravel())
     image.update()
     return image
 
@@ -967,9 +1082,52 @@ def repair_project_references(scene: bpy.types.Scene) -> None:
             resolve_coverage_image(project, angle_item)
 
 
+def cleanup_export_adjustment_previews() -> None:
+    """Remove derived review images after lifecycle changes or unregister."""
+
+    # A Studio Image Editor showing the heatmap is deliberately in VIEW mode.
+    # Restore its real paint canvas before the derived image is unlinked.
+    try:
+        from .studio import leave_export_adjustment_review
+
+        leave_export_adjustment_review()
+    except (AttributeError, ImportError, ReferenceError, RuntimeError):
+        pass
+
+    for scene in bpy.data.scenes:
+        for project in getattr(scene, "quick_sdf_projects", ()):
+            try:
+                clear_export_adjustment_preview(project)
+                project.export_adjustment_pixel_count = 0
+                project.export_adjustment_sample_count = 0
+                project.export_adjustment_protected_pixel_count = 0
+            except (AttributeError, ReferenceError, TypeError):
+                pass
+    for image in tuple(bpy.data.images):
+        if image.get(ROLE_KEY) == EXPORT_ADJUSTMENT_ROLE:
+            try:
+                for screen in bpy.data.screens:
+                    for area in screen.areas:
+                        if area.type != "IMAGE_EDITOR":
+                            continue
+                        for space in area.spaces:
+                            if hasattr(space, "image") and space.image == image:
+                                space.image = None
+                bpy.data.images.remove(image)
+            except (ReferenceError, RuntimeError):
+                pass
+
+
 @persistent
 def _load_or_undo_post(_unused: Any) -> None:
     _PAINT_SNAPSHOTS.clear()
+    cleanup_export_adjustment_previews()
+    try:
+        from .live_preview import invalidate
+
+        invalidate()
+    except ImportError:
+        pass
     try:
         from .migration import migrate_all_scenes
 
@@ -1000,6 +1158,9 @@ def _deferred_migrate() -> None:
 def _save_project_images(_unused: Any) -> None:
     """Refresh packed authoring pixels immediately before Blender saves."""
 
+    # Export review is derived data.  Never serialize a potentially 4K
+    # heatmap into the artist's source-of-truth blend file.
+    cleanup_export_adjustment_previews()
     persistent_roles = {DISPLAY_ROLE, BASE_ROLE, COVERAGE_ROLE}
     for image in tuple(bpy.data.images):
         if image.get(ROLE_KEY) not in persistent_roles or not image.get(PROJECT_UUID_KEY):
@@ -1100,6 +1261,7 @@ def register_runtime() -> None:
 
 
 def unregister_runtime() -> None:
+    cleanup_export_adjustment_previews()
     _PAINT_SNAPSHOTS.clear()
     _BASE_BAKE_UUIDS.clear()
     _PENDING_BASE_SIGNATURES.clear()

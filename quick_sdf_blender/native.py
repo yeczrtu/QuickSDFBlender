@@ -48,6 +48,13 @@ def _load():
                 ctypes.c_int, ctypes.c_int, u16p, i32p, i32p,
             ]
             dll.qsdf_generate_threshold_pair.restype = ctypes.c_int
+        if hasattr(dll, "qsdf_generate_threshold_pair_cancelable"):
+            dll.qsdf_generate_threshold_pair_cancelable.argtypes = [
+                u8p, f32p, ctypes.c_int,
+                u8p, f32p, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, u16p, i32p, i32p, i32p,
+            ]
+            dll.qsdf_generate_threshold_pair_cancelable.restype = ctypes.c_int
         if hasattr(dll, "qsdf_bake_normal_sweep"):
             dll.qsdf_bake_normal_sweep.argtypes = [
                 f32p, f32p, ctypes.c_int,
@@ -63,6 +70,14 @@ def _load():
                 ctypes.c_int, ctypes.c_int, u8p, u8p, i32p,
             ]
             dll.qsdf_bake_face_shadow_guide.restype = ctypes.c_int
+        if hasattr(dll, "qsdf_repair_side_monotonic"):
+            dll.qsdf_repair_side_monotonic.argtypes = [
+                u8p, u8p, u8p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                u8p, u8p, i32p,
+                i32p, i32p, i32p, i32p, i32p,
+            ]
+            dll.qsdf_repair_side_monotonic.restype = ctypes.c_int
         _DLL = dll
     except OSError:
         _DLL = False
@@ -142,7 +157,9 @@ def generate_threshold(masks, angles):
     return output
 
 
-def generate_threshold_pair(right_masks, right_angles, left_masks, left_angles):
+def generate_threshold_pair(
+    right_masks, right_angles, left_masks, left_angles, *, cancel_flag=None
+):
     """Return independent right/left ``(H, W, 2) uint16`` thresholds.
 
     Unlike the legacy signed-stack ABI, each side owns its own zero-degree
@@ -162,7 +179,19 @@ def generate_threshold_pair(right_masks, right_angles, left_masks, left_angles):
     output = np.empty((height, width, 2), dtype=np.uint16)
     right_violations = ctypes.c_int(0)
     left_violations = ctypes.c_int(0)
-    code = dll.qsdf_generate_threshold_pair(
+    if cancel_flag is None:
+        cancel_value = ctypes.c_int(0)
+    elif isinstance(cancel_flag, ctypes.c_int):
+        cancel_value = cancel_flag
+    else:
+        cancel_value = ctypes.c_int(int(bool(cancel_flag)))
+    use_cancelable = hasattr(dll, "qsdf_generate_threshold_pair_cancelable")
+    function = (
+        dll.qsdf_generate_threshold_pair_cancelable
+        if use_cancelable
+        else dll.qsdf_generate_threshold_pair
+    )
+    arguments = (
         right.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         right_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         right_count,
@@ -175,11 +204,16 @@ def generate_threshold_pair(right_masks, right_angles, left_masks, left_angles):
         ctypes.byref(right_violations),
         ctypes.byref(left_violations),
     )
+    if use_cancelable:
+        arguments += (ctypes.byref(cancel_value),)
+    code = function(*arguments)
     if code == 2:
         raise NativeCoreError(
             "Non-monotonic masks: "
             f"right={right_violations.value}, left={left_violations.value} violation pixels"
         )
+    if code == 4:
+        raise NativeCoreError("Native Quick SDF threshold generation was cancelled")
     if code:
         raise NativeCoreError(f"Native Quick SDF threshold-pair core failed with status {code}")
     return output
@@ -204,6 +238,15 @@ def native_guide_bake_available() -> bool:
         dll is not None
         and version() >= 4
         and hasattr(dll, "qsdf_bake_face_shadow_guide")
+    )
+
+
+def native_repair_available() -> bool:
+    dll = _load()
+    return bool(
+        dll is not None
+        and version() >= 4
+        and hasattr(dll, "qsdf_repair_side_monotonic")
     )
 
 
@@ -382,6 +425,77 @@ def bake_face_shadow_guide(
     )
 
 
+def repair_side_monotonic(
+    mask_stack, base_stack, coverage_stack, *, cancel_flag=None
+):
+    """Use ABI 4 to repair an export lane, falling back to the pure core."""
+
+    from .core import (
+        MonotonicRepairResult,
+        _as_binary,
+        repair_side_monotonic as fallback,
+    )
+
+    arrays = tuple(
+        _as_binary(value, ndim=3)
+        for value in (mask_stack, base_stack, coverage_stack)
+    )
+    if cancel_flag is not None and int(getattr(cancel_flag, "value", bool(cancel_flag))):
+        raise NativeCoreError("Native Quick SDF repair was cancelled")
+    if not native_repair_available():
+        result = fallback(*arrays)
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", bool(cancel_flag))):
+            raise NativeCoreError("Quick SDF repair was cancelled")
+        return result
+    masks, base, coverage = tuple(np.ascontiguousarray(array, dtype=np.uint8) for array in arrays)
+    if masks.ndim != 3 or base.shape != masks.shape or coverage.shape != masks.shape:
+        return fallback(*arrays)
+    count, height, width = masks.shape
+    repaired = np.empty_like(masks)
+    changed = np.empty_like(masks)
+    transitions = np.empty((height, width), dtype=np.int32)
+    changed_samples = ctypes.c_int(0)
+    changed_pixels = ctypes.c_int(0)
+    protected_samples = ctypes.c_int(0)
+    protected_pixels = ctypes.c_int(0)
+    if cancel_flag is None:
+        cancel_value = ctypes.c_int(0)
+    elif isinstance(cancel_flag, ctypes.c_int):
+        cancel_value = cancel_flag
+    else:
+        cancel_value = ctypes.c_int(int(bool(cancel_flag)))
+    dll = _load()
+    code = dll.qsdf_repair_side_monotonic(
+        masks.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        base.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        coverage.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        count,
+        width,
+        height,
+        repaired.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        changed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        transitions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        ctypes.byref(changed_samples),
+        ctypes.byref(changed_pixels),
+        ctypes.byref(protected_samples),
+        ctypes.byref(protected_pixels),
+        ctypes.byref(cancel_value),
+    )
+    if code == 4:
+        raise NativeCoreError("Native Quick SDF repair was cancelled")
+    if code:
+        raise NativeCoreError(f"Native Quick SDF repair failed with status {code}")
+    return MonotonicRepairResult(
+        masks=np.ascontiguousarray(repaired.astype(np.bool_)),
+        changed_mask=np.ascontiguousarray(changed.astype(np.bool_)),
+        transition_indices=np.ascontiguousarray(transitions),
+        changed_sample_count=int(changed_samples.value),
+        changed_pixel_count=int(changed_pixels.value),
+        protected_changed_sample_count=int(protected_samples.value),
+        protected_changed_pixel_count=int(protected_pixels.value),
+    )
+
+
 def validate_monotonic(masks, angles) -> int:
     dll = _load()
     if dll is None:
@@ -411,6 +525,8 @@ __all__ = [
     "generate_threshold_pair",
     "native_bake_available",
     "native_guide_bake_available",
+    "native_repair_available",
+    "repair_side_monotonic",
     "validate_monotonic",
     "version",
 ]

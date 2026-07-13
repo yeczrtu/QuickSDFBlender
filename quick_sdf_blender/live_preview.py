@@ -11,7 +11,8 @@ from . import runtime
 
 SEEK_PREVIEW_ROLE = "seek_preview"
 ONION_PREVIEW_ROLE = "onion_preview"
-_SDF_CACHE: dict[tuple[str, int, int], Any] = {}
+_SDF_CACHE: dict[tuple[Any, ...], Any] = {}
+_REPAIR_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
 def _revision(image: Any) -> int:
@@ -40,6 +41,61 @@ def _sdf(image: Any):
     result = _SDF_CACHE.get(key)
     if result is None:
         result = exact_signed_edt(_sample_mask(image))
+        _SDF_CACHE[key] = result
+    return result
+
+
+def _repaired_preview_stack(project: Any, items: list[Any]):
+    """Return a cached 512px export projection without touching author images."""
+
+    import numpy as np
+
+    records = []
+    for item in items:
+        display = runtime.resolve_display_image(project, item)
+        base = runtime.resolve_base_image(project, item)
+        coverage = runtime.resolve_coverage_image(project, item)
+        if display is None or base is None or coverage is None:
+            return None, None
+        records.append((display, base, coverage))
+    key = (
+        str(project.uuid),
+        str(getattr(items[0], "side", "RIGHT")),
+        512,
+        tuple(
+            (image.name, _revision(image))
+            for record in records
+            for image in record
+        ),
+    )
+    cached = _REPAIR_CACHE.get(key)
+    if cached is None:
+        display_stack = np.stack([_sample_mask(record[0]) for record in records], axis=0)
+        base_stack = np.stack([_sample_mask(record[1]) for record in records], axis=0)
+        coverage_stack = np.stack([_sample_mask(record[2]) for record in records], axis=0)
+        try:
+            from . import native
+
+            cached = native.repair_side_monotonic(
+                display_stack, base_stack, coverage_stack
+            ).masks
+        except (ImportError, OSError, AttributeError):
+            from .core import repair_side_monotonic
+
+            cached = repair_side_monotonic(
+                display_stack, base_stack, coverage_stack
+            ).masks
+        _REPAIR_CACHE[key] = cached
+    return cached, key
+
+
+def _repaired_sdf(mask: Any, repair_key: tuple[Any, ...], index: int):
+    from .core import exact_signed_edt
+
+    key = ("repaired", repair_key, int(index))
+    result = _SDF_CACHE.get(key)
+    if result is None:
+        result = exact_signed_edt(mask)
         _SDF_CACHE[key] = result
     return result
 
@@ -140,6 +196,7 @@ def update_seek_preview(project: Any, angle: float) -> Any | None:
     )
     if not items:
         return None
+    repaired_stack, repair_key = _repaired_preview_stack(project, items)
     value = max(0.0, min(90.0, float(angle)))
     lower = max((item for item in items if float(item.angle) <= value), key=lambda item: float(item.angle), default=items[0])
     upper = min((item for item in items if float(item.angle) >= value), key=lambda item: float(item.angle), default=items[-1])
@@ -147,14 +204,28 @@ def update_seek_preview(project: Any, angle: float) -> Any | None:
     upper_image = runtime.resolve_display_image(project, upper)
     if lower_image is None or upper_image is None:
         return None
+    lower_index = next(index for index, item in enumerate(items) if item.uuid == lower.uuid)
+    upper_index = next(index for index, item in enumerate(items) if item.uuid == upper.uuid)
     lower_angle = float(lower.angle)
     upper_angle = float(upper.angle)
     if lower.uuid == upper.uuid or abs(upper_angle - lower_angle) <= 1.0e-7:
-        mask = _sample_mask(lower_image)
+        mask = (
+            repaired_stack[lower_index]
+            if repaired_stack is not None
+            else _sample_mask(lower_image)
+        )
     else:
         factor = (value - lower_angle) / (upper_angle - lower_angle)
-        first = _finite_sdf(_sdf(lower_image))
-        second = _finite_sdf(_sdf(upper_image))
+        if repaired_stack is not None:
+            first = _finite_sdf(
+                _repaired_sdf(repaired_stack[lower_index], repair_key, lower_index)
+            )
+            second = _finite_sdf(
+                _repaired_sdf(repaired_stack[upper_index], repair_key, upper_index)
+            )
+        else:
+            first = _finite_sdf(_sdf(lower_image))
+            second = _finite_sdf(_sdf(upper_image))
         mask = ((1.0 - factor) * first + factor * second) <= 0.0
     height, width = mask.shape
     rgba = np.ones((height, width, 4), dtype=np.float32)
@@ -171,6 +242,7 @@ def invalidate(project_uuid: str | None = None) -> None:
     # Revision-bearing cache keys make selective invalidation unnecessary; a
     # full clear bounds memory after long paint sessions.
     _SDF_CACHE.clear()
+    _REPAIR_CACHE.clear()
 
 
 def _detach_temporary_images(project_uuid: str = "", replacement: Any | None = None) -> None:

@@ -1,4 +1,7 @@
 import unittest
+import ctypes
+import threading
+import time
 
 import numpy as np
 
@@ -7,7 +10,10 @@ from quick_sdf_blender.bake import (
     bake_face_shadow_guide as reference_guide_bake,
     bake_normal_sweep as reference_bake,
 )
-from quick_sdf_blender.core import generate_threshold_rgba16
+from quick_sdf_blender.core import (
+    generate_threshold_rgba16,
+    repair_side_monotonic as reference_repair,
+)
 
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
@@ -15,6 +21,88 @@ class NativeCoreTests(unittest.TestCase):
     def test_version_four_guide_abi(self):
         self.assertGreaterEqual(native.version(), 4)
         self.assertTrue(native.native_guide_bake_available())
+        self.assertTrue(native.native_repair_available())
+
+    def test_native_monotonic_repair_matches_reference(self):
+        rng = np.random.default_rng(403)
+        masks = rng.random((7, 13, 11)) > 0.5
+        base = rng.random(masks.shape) > 0.5
+        coverage = rng.random(masks.shape) > 0.82
+        expected = reference_repair(masks, base, coverage)
+        actual = native.repair_side_monotonic(masks, base, coverage)
+        np.testing.assert_array_equal(actual.masks, expected.masks)
+        np.testing.assert_array_equal(actual.changed_mask, expected.changed_mask)
+        np.testing.assert_array_equal(
+            actual.transition_indices, expected.transition_indices
+        )
+        self.assertEqual(actual.changed_sample_count, expected.changed_sample_count)
+        self.assertEqual(actual.changed_pixel_count, expected.changed_pixel_count)
+        self.assertEqual(
+            actual.protected_changed_sample_count,
+            expected.protected_changed_sample_count,
+        )
+        self.assertEqual(
+            actual.protected_changed_pixel_count,
+            expected.protected_changed_pixel_count,
+        )
+
+    def test_native_repair_normalizes_supported_integer_and_memory_layouts(self):
+        masks = np.asfortranarray(
+            np.asarray([True, False, True, True], dtype=np.bool_)[:, None, None]
+        )
+        base = np.asarray(masks, dtype=np.uint8) * np.uint8(255)
+        coverage = np.asarray(np.zeros_like(masks), dtype=np.uint16)
+        expected = reference_repair(masks, base, coverage)
+        actual = native.repair_side_monotonic(masks, base, coverage)
+        np.testing.assert_array_equal(actual.masks, expected.masks)
+        np.testing.assert_array_equal(actual.changed_mask, expected.changed_mask)
+        np.testing.assert_array_equal(actual.transition_indices, expected.transition_indices)
+        self.assertEqual(actual.transition_indices.dtype, np.int32)
+
+    def test_native_repair_and_threshold_honor_cancel_flag(self):
+        angles = np.linspace(0.0, 90.0, 7, dtype=np.float32)
+        masks = np.zeros((7, 8, 8), dtype=np.bool_)
+        base = masks.copy()
+        coverage = masks.copy()
+        cancelled = ctypes.c_int(1)
+        with self.assertRaisesRegex(native.NativeCoreError, "cancelled"):
+            native.repair_side_monotonic(
+                masks, base, coverage, cancel_flag=cancelled
+            )
+        with self.assertRaisesRegex(native.NativeCoreError, "cancelled"):
+            native.generate_threshold_pair(
+                masks, angles, masks, angles, cancel_flag=cancelled
+            )
+
+    def test_running_native_threshold_cancels_cooperatively(self):
+        size = 1024
+        angles = np.linspace(0.0, 90.0, 7, dtype=np.float32)
+        y, x = np.indices((size, size))
+        right_transition = (x + y) % 8
+        left_transition = (x * 3 + y) % 8
+        right = np.arange(7)[:, None, None] >= right_transition[None, ...]
+        left = np.arange(7)[:, None, None] >= left_transition[None, ...]
+        cancel_flag = ctypes.c_int(0)
+        outcome = []
+
+        def generate():
+            try:
+                native.generate_threshold_pair(
+                    right, angles, left, angles, cancel_flag=cancel_flag
+                )
+            except BaseException as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=generate)
+        started = time.perf_counter()
+        worker.start()
+        time.sleep(0.02)
+        cancel_flag.value = 1
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(time.perf_counter() - started, 2.0)
+        self.assertEqual(len(outcome), 1)
+        self.assertRegex(str(outcome[0]), "cancelled")
 
     def test_native_normal_bake_matches_reference(self):
         uvs = np.asarray(
@@ -105,6 +193,35 @@ class NativeCoreTests(unittest.TestCase):
         np.testing.assert_array_equal(result[0, 0], [0, 65535])
         np.testing.assert_array_equal(result[0, 1], [65535, 0])
         self.assertGreater(result[0, 2, 0], result[0, 2, 1])
+
+    def test_existing_threshold_pair_symbol_remains_abi_compatible(self):
+        angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float32)
+        right = np.zeros((3, 2, 3), dtype=np.uint8)
+        left = np.zeros_like(right)
+        right[1:, 0, :] = 1
+        right[2, 1, :] = 1
+        left[2, 0, :] = 1
+        left[1:, 1, :] = 1
+        expected = native.generate_threshold_pair(right, angles, left, angles)
+        output = np.empty((2, 3, 2), dtype=np.uint16)
+        right_violations = ctypes.c_int(0)
+        left_violations = ctypes.c_int(0)
+        dll = native._load()
+        code = dll.qsdf_generate_threshold_pair(
+            right.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            3,
+            left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            3,
+            3,
+            2,
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.byref(right_violations),
+            ctypes.byref(left_violations),
+        )
+        self.assertEqual(code, 0)
+        np.testing.assert_array_equal(output, expected)
 
     def test_threshold_pair_rejects_one_invalid_side(self):
         angles = [0.0, 90.0]

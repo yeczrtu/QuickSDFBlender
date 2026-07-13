@@ -88,11 +88,19 @@ def _export_controls(layout: Any, project: Any, *, compact: bool = False) -> Non
     export = layout.column()
     export.scale_y = 1.0 if compact else 1.45
     export.operator(
-        "quicksdf.export_texture", text="Export Face Shadow Texture", icon="EXPORT"
+        "quicksdf.export_texture",
+        text="Retry Export" if bool(getattr(project, "export_failed", False)) else "Export Face Shadow Texture",
+        icon="FILE_REFRESH" if bool(getattr(project, "export_failed", False)) else "EXPORT",
     )
     message = str(getattr(project, "job_message", ""))
     if message:
-        layout.label(text=message, icon="CHECKMARK" if message.startswith("Exported") else "INFO")
+        if bool(getattr(project, "export_failed", False)):
+            icon = "ERROR"
+        elif message.startswith("Exported"):
+            icon = "CHECKMARK"
+        else:
+            icon = "INFO"
+        layout.label(text=message, icon=icon)
 
 
 class QSDF_PT_launcher(bpy.types.Panel):
@@ -243,6 +251,30 @@ class QSDF_PT_advanced(bpy.types.Panel):
         review.label(text="Review / Recovery")
         review.operator("quicksdf.export_mask_sequence", text="Export Review Masks")
         review.operator("quicksdf.restore_materials", text="Restore Materials", icon="LOOP_BACK")
+        adjusted = int(getattr(project, "export_adjustment_pixel_count", 0))
+        adjustment_image = getattr(project, "export_adjustment_image", None)
+        if adjusted and adjustment_image is not None:
+            adjustments = layout.box()
+            adjustments.label(
+                text=tr("%s authored pixels needed angle adjustment.") % f"{adjusted:,}"
+            )
+            adjustments.label(
+                text=tr("%s angle samples changed")
+                % f"{int(getattr(project, 'export_adjustment_sample_count', 0)):,}"
+            )
+            protected = int(
+                getattr(project, "export_adjustment_protected_pixel_count", 0)
+            )
+            if protected:
+                adjustments.label(
+                    text=tr("%s edited pixels required adjustment.") % f"{protected:,}",
+                    icon="INFO",
+                )
+            adjustments.operator(
+                "quicksdf.review_export_adjustments",
+                text="Review Export Adjustments",
+                icon="IMAGE_DATA",
+            )
         if project.diagnostic_message:
             warning = layout.box()
             warning.alert = True
