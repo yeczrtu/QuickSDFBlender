@@ -275,9 +275,108 @@ void enforce_bake_monotonic(uint8_t* masks, const float* angles, int count,
     }
 }
 
+bool build_guide_directions(const float* angles, int count, const float* forward,
+                            const float* up, int side_sign,
+                            std::vector<Vec3>& directions) {
+    if (!angles || !forward || !up || count < 2 ||
+        (side_sign != 1 && side_sign != -1))
+        return false;
+    Vec3 up_vector{up[0], up[1], up[2]};
+    Vec3 front{forward[0], forward[1], forward[2]};
+    if (!normalize(up_vector) || !normalize(front)) return false;
+    const double vertical = dot(front, up_vector);
+    front.x -= up_vector.x * vertical;
+    front.y -= up_vector.y * vertical;
+    front.z -= up_vector.z * vertical;
+    if (!normalize(front)) return false;
+    Vec3 side = cross(up_vector, front);
+    if (!normalize(side)) return false;
+    side.x *= side_sign;
+    side.y *= side_sign;
+    side.z *= side_sign;
+    if (std::abs(angles[0]) > 1.0e-5f ||
+        std::abs(angles[count - 1] - 90.0f) > 1.0e-5f)
+        return false;
+    directions.resize(size_t(count));
+    for (int index = 0; index < count; ++index) {
+        const float angle = angles[index];
+        if (!std::isfinite(angle) || angle < -1.0e-5f || angle > 90.0f + 1.0e-5f ||
+            (index > 0 && angle - angles[index - 1] <= 1.0e-5f))
+            return false;
+        const double radians = double(angle) * QSDF_PI / 180.0;
+        Vec3 direction{
+            side.x * std::cos(radians) + front.x * std::sin(radians),
+            side.y * std::cos(radians) + front.y * std::sin(radians),
+            side.z * std::cos(radians) + front.z * std::sin(radians),
+        };
+        if (!normalize(direction)) return false;
+        directions[size_t(index)] = direction;
+    }
+    return true;
+}
+
+int rasterize_guide_normals(const float* triangle_uvs, const float* corner_normals,
+                            int triangle_count, int width, int height,
+                            std::vector<Vec3>& normal_image,
+                            uint8_t* output_occupancy,
+                            const int* cancel_requested) {
+    const size_t pixels = size_t(width) * size_t(height);
+    normal_image.assign(pixels, Vec3{});
+    std::fill(output_occupancy, output_occupancy + pixels, uint8_t(0));
+    for (int triangle = 0; triangle < triangle_count; ++triangle) {
+        if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+        const float* uv = triangle_uvs + size_t(triangle) * 6;
+        const float* normal = corner_normals + size_t(triangle) * 9;
+        double x[3], y[3];
+        for (int corner = 0; corner < 3; ++corner) {
+            x[corner] = double(uv[corner * 2]) * width - 0.5;
+            y[corner] = (1.0 - double(uv[corner * 2 + 1])) * height - 0.5;
+        }
+        const int x0 = std::max(0, int(std::ceil(std::min({x[0], x[1], x[2]}))));
+        const int x1 = std::min(width - 1, int(std::floor(std::max({x[0], x[1], x[2]}))));
+        const int y0 = std::max(0, int(std::ceil(std::min({y[0], y[1], y[2]}))));
+        const int y1 = std::min(height - 1, int(std::floor(std::max({y[0], y[1], y[2]}))));
+        if (x1 < x0 || y1 < y0) continue;
+        const double denominator =
+            (y[1] - y[2]) * (x[0] - x[2]) +
+            (x[2] - x[1]) * (y[0] - y[2]);
+        if (std::abs(denominator) <= 1.0e-12) continue;
+        for (int row = y0; row <= y1; ++row) {
+            for (int column = x0; column <= x1; ++column) {
+                const double w0 =
+                    ((y[1] - y[2]) * (column - x[2]) +
+                     (x[2] - x[1]) * (row - y[2])) /
+                    denominator;
+                const double w1 =
+                    ((y[2] - y[0]) * (column - x[2]) +
+                     (x[0] - x[2]) * (row - y[2])) /
+                    denominator;
+                const double w2 = 1.0 - w0 - w1;
+                if (w0 < -1.0e-9 || w1 < -1.0e-9 || w2 < -1.0e-9) continue;
+                Vec3 value{};
+                value = add_scaled(value, normal, w0);
+                value = add_scaled(value, normal + 3, w1);
+                value = add_scaled(value, normal + 6, w2);
+                if (!normalize(value)) {
+                    int dominant = 0;
+                    if (w1 > w0) dominant = 1;
+                    if (w2 > (dominant == 0 ? w0 : w1)) dominant = 2;
+                    value = {normal[dominant * 3], normal[dominant * 3 + 1],
+                             normal[dominant * 3 + 2]};
+                    if (!normalize(value)) return QSDF_INVALID_ARGUMENT;
+                }
+                const size_t pixel = size_t(row) * width + column;
+                normal_image[pixel] = value;
+                output_occupancy[pixel] = 1;
+            }
+        }
+    }
+    return QSDF_OK;
+}
+
 }  // namespace
 
-QSDF_API int qsdf_version() { return 3; }
+QSDF_API int qsdf_version() { return 4; }
 
 QSDF_API int qsdf_bake_normal_sweep(
     const float* triangle_uvs, const float* corner_normals, int triangle_count,
@@ -354,6 +453,46 @@ QSDF_API int qsdf_bake_normal_sweep(
                                       dot(normal_image[pixel], direction) >= 0.0);
         }
         enforce_bake_monotonic(output_masks, angles, angle_count, zero_index, pixels);
+        return QSDF_OK;
+    } catch (const std::bad_alloc&) {
+        return QSDF_OUT_OF_MEMORY;
+    }
+}
+
+QSDF_API int qsdf_bake_face_shadow_guide(
+    const float* triangle_uvs, const float* corner_normals, int triangle_count,
+    const float* angles, int angle_count, const float* forward, const float* up,
+    int side_sign, float cutoff, int width, int height, uint8_t* output_masks,
+    uint8_t* output_occupancy, const int* cancel_requested) {
+    if (!triangle_uvs || !corner_normals || !angles || !forward || !up ||
+        !output_masks || !output_occupancy || triangle_count < 0 ||
+        angle_count < 2 || width < 1 || height < 1 || !std::isfinite(cutoff))
+        return QSDF_INVALID_ARGUMENT;
+    try {
+        const size_t pixels = size_t(width) * size_t(height);
+        std::vector<Vec3> normal_image;
+        const int rasterized = rasterize_guide_normals(
+            triangle_uvs, corner_normals, triangle_count, width, height,
+            normal_image, output_occupancy, cancel_requested);
+        if (rasterized != QSDF_OK) return rasterized;
+        std::vector<Vec3> directions;
+        if (!build_guide_directions(angles, angle_count, forward, up, side_sign,
+                                    directions))
+            return QSDF_INVALID_ARGUMENT;
+        for (int angle = 0; angle < angle_count; ++angle) {
+            if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+            uint8_t* mask = output_masks + size_t(angle) * pixels;
+            const Vec3 direction = directions[size_t(angle)];
+            for (size_t pixel = 0; pixel < pixels; ++pixel)
+                mask[pixel] = uint8_t(!output_occupancy[pixel] ||
+                                      dot(normal_image[pixel], direction) >= cutoff);
+        }
+        for (int angle = 1; angle < angle_count; ++angle) {
+            const uint8_t* previous = output_masks + size_t(angle - 1) * pixels;
+            uint8_t* current = output_masks + size_t(angle) * pixels;
+            for (size_t pixel = 0; pixel < pixels; ++pixel)
+                current[pixel] = uint8_t(current[pixel] || previous[pixel]);
+        }
         return QSDF_OK;
     } catch (const std::bad_alloc&) {
         return QSDF_OUT_OF_MEMORY;

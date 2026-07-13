@@ -236,13 +236,14 @@ def _sort_angles(project: Any) -> None:
 
 
 def migrate_project_v1_to_v2(project: Any) -> bool:
-    """Migrate one project, returning ``True`` when persistent data changed."""
+    """Compatibility entry point migrating any older project to schema v3."""
 
     from .model import SCHEMA_VERSION
 
     legacy = _legacy_layout(project)
-    if not legacy and int(getattr(project, "schema_version", 1)) >= SCHEMA_VERSION:
-        # Repair a partially-created v2 project without changing its topology.
+    current_schema = int(getattr(project, "schema_version", 1))
+    if not legacy and current_schema >= 2:
+        # Repair partially-created v2/v3 layers without changing image pixels.
         changed = False
         for item in getattr(project, "angles", ()):
             if (
@@ -252,6 +253,19 @@ def migrate_project_v1_to_v2(project: Any) -> bool:
             ):
                 _ensure_layers_for_item(project, item, legacy=False)
                 changed = True
+        if current_schema < SCHEMA_VERSION:
+            project.base_source = "LEGACY"
+            project.guide_version = 0
+            project.guide_shadow_amount = 50.0
+            project.thumbnail_uv_bbox = (0.0, 0.0, 1.0, 1.0)
+            project.guide_direction_warning = False
+            project.guide_direction_message = ""
+            project.author_active = False
+            project.preview_enabled = False
+            project.material_override_active = False
+            project.schema_version = SCHEMA_VERSION
+            project.dirty = True
+            changed = True
         return changed
 
     active_uuid = ""
@@ -292,6 +306,12 @@ def migrate_project_v1_to_v2(project: Any) -> bool:
     project.author_active = False
     project.preview_enabled = False
     project.material_override_active = False
+    project.base_source = "LEGACY"
+    project.guide_version = 0
+    project.guide_shadow_amount = 50.0
+    project.thumbnail_uv_bbox = (0.0, 0.0, 1.0, 1.0)
+    project.guide_direction_warning = False
+    project.guide_direction_message = ""
     project.active_angle_uuid = active_uuid
     for index, item in enumerate(project.angles):
         if str(item.uuid) == active_uuid:
@@ -301,6 +321,12 @@ def migrate_project_v1_to_v2(project: Any) -> bool:
     project.schema_version = SCHEMA_VERSION
     project.dirty = True
     return True
+
+
+def migrate_project_to_v3(project: Any) -> bool:
+    """Named schema-v3 entry point retained alongside the v1 compatibility API."""
+
+    return migrate_project_v1_to_v2(project)
 
 
 def ensure_project_schema(project: Any) -> bool:
@@ -336,5 +362,6 @@ __all__ = [
     "ensure_project_schema",
     "migrate_all_scenes",
     "migrate_project_v1_to_v2",
+    "migrate_project_to_v3",
     "split_legacy_rgba",
 ]

@@ -115,8 +115,8 @@ def _detect_project_symmetry(project, triangle_uvs, corner_normals, triangle_cen
     from .bake import rasterize_uv_normals
     from .symmetry import SymmetryMode, analyze_symmetry
 
-    up = np.asarray(_axis_vector(str(project.up_axis)), dtype=np.float64)
-    forward = np.asarray(_axis_vector(str(project.forward_axis)), dtype=np.float64)
+    up = np.asarray(tuple(project.up_vector), dtype=np.float64)
+    forward = np.asarray(tuple(project.forward_vector), dtype=np.float64)
     right = np.cross(up, forward)
     right /= max(float(np.linalg.norm(right)), 1.0e-12)
     signed = triangle_centers @ right
@@ -156,7 +156,7 @@ def _bake_project(context, project) -> None:
 
     import numpy as np
 
-    from .native import bake_normal_sweep
+    from .native import bake_face_shadow_guide
 
     runtime.begin_base_bake(str(project.uuid))
     window_manager = context.window_manager
@@ -166,6 +166,8 @@ def _bake_project(context, project) -> None:
             context, project
         )
         window_manager.progress_update(1)
+        guide_warning = False
+        guide_message = ""
         for side in ("RIGHT", "LEFT"):
             items = sorted(
                 (item for item in project.angles if str(item.side) == side),
@@ -174,16 +176,33 @@ def _bake_project(context, project) -> None:
             if not items:
                 continue
             local_angles = np.asarray([float(item.angle) for item in items], dtype=np.float64)
-            signed_angles = local_angles if side == "RIGHT" else -local_angles
-            masks, _occupancy = bake_normal_sweep(
+            masks, occupancy = bake_face_shadow_guide(
                 triangle_uvs,
                 corner_normals,
-                signed_angles,
-                _axis_vector(str(project.forward_axis)),
-                _axis_vector(str(project.up_axis)),
+                local_angles,
+                tuple(project.forward_vector),
+                tuple(project.up_vector),
+                side,
+                float(project.guide_shadow_amount),
                 int(project.resolution),
                 int(project.resolution),
             )
+            if np.any(occupancy):
+                rows, columns = np.nonzero(occupancy)
+                height, width = occupancy.shape
+                project.thumbnail_uv_bbox = (
+                    float(columns.min()) / width,
+                    1.0 - float(rows.max() + 1) / height,
+                    float(columns.max() + 1) / width,
+                    1.0 - float(rows.min()) / height,
+                )
+                middle = int(np.argmin(np.abs(local_angles - 45.0)))
+                light_ratio = float(np.mean(masks[middle, occupancy]))
+                changed = np.any(masks[1:] != masks[:-1], axis=0)
+                variation = float(np.mean(changed[occupancy]))
+                if light_ratio <= 0.02 or light_ratio >= 0.98 or variation < 0.01:
+                    guide_warning = True
+                    guide_message = "The guide is nearly uniform; confirm which way the face points"
             for item, mask in zip(items, masks):
                 display = runtime.resolve_display_image(project, item)
                 base = runtime.resolve_base_image(project, item)
@@ -205,6 +224,10 @@ def _bake_project(context, project) -> None:
             _detect_project_symmetry(project, triangle_uvs, corner_normals, triangle_centers)
         project.base_needs_update = False
         project.base_signature = runtime.compute_base_signature(project, context.scene)
+        project.base_source = "NORMAL_GUIDE"
+        project.guide_version = 1
+        project.guide_direction_warning = guide_warning
+        project.guide_direction_message = guide_message
         project.dirty = True
         window_manager.progress_update(3)
     finally:
@@ -238,6 +261,13 @@ def _create_project_data(context):
     project.active_side = "RIGHT"
     project.mirror_enabled = True
     project.symmetry_mode = "AUTO"
+    project.base_source = {
+        "NORMAL_SWEEP": "NORMAL_GUIDE",
+        "EXISTING": "IMPORTED",
+        "WHITE": "WHITE",
+    }.get(str(settings.initialization), "NORMAL_GUIDE")
+    project.guide_version = 1 if project.base_source == "NORMAL_GUIDE" else 0
+    project.guide_shadow_amount = 50.0
     context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
     try:
         source = settings.source_image if settings.initialization == "EXISTING" else None
@@ -355,16 +385,17 @@ class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
         obj = project.target_object
         if obj is None or context.region_data is None:
             return {"CANCELLED"}
-        world_forward = context.region_data.view_rotation @ Vector((0.0, 0.0, -1.0))
+        world_forward = context.region_data.view_rotation @ Vector((0.0, 0.0, 1.0))
         local_forward = (obj.matrix_world.to_quaternion().inverted() @ world_forward).normalized()
+        previous_forward = tuple(project.forward_vector)
         project.forward_vector = local_forward
-        candidates = {
-            "NEG_Y": Vector((0.0, -1.0, 0.0)),
-            "POS_Y": Vector((0.0, 1.0, 0.0)),
-            "NEG_X": Vector((-1.0, 0.0, 0.0)),
-            "POS_X": Vector((1.0, 0.0, 0.0)),
-        }
-        project.forward_axis = max(candidates, key=lambda name: local_forward.dot(candidates[name]))
+        try:
+            _bake_project(context, project)
+            runtime.sync_canvas(context, project)
+        except Exception as exc:
+            project.forward_vector = previous_forward
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         project.dirty = True
         return {"FINISHED"}
 

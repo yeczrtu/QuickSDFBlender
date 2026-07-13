@@ -498,7 +498,7 @@ if bpy is not None:
         bl_idname = "quicksdf.preview_enable"
         bl_label = "Enable Toon Preview"
         bl_description = "Temporarily show the current threshold mask as two-tone shading"
-        bl_options = {"REGISTER", "UNDO"}
+        bl_options = {"REGISTER"}
 
         def execute(self, context):
             project = _active_project(context.scene)
@@ -526,7 +526,7 @@ if bpy is not None:
         bl_idname = "quicksdf.preview_disable"
         bl_label = "Disable Toon Preview"
         bl_description = "Restore the material used before Quick SDF preview"
-        bl_options = {"REGISTER", "UNDO"}
+        bl_options = {"REGISTER"}
 
         def execute(self, context):
             project = _active_project(context.scene)
@@ -539,7 +539,7 @@ if bpy is not None:
         bl_idname = "quicksdf.restore_materials"
         bl_label = "Restore Materials"
         bl_description = "Emergency restore of every material temporarily replaced by Quick SDF"
-        bl_options = {"REGISTER", "UNDO"}
+        bl_options = {"REGISTER"}
 
         def execute(self, _context):
             count = restore_all_preview_materials()

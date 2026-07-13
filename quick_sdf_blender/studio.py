@@ -50,6 +50,7 @@ class StudioSession:
     preview_suspended: bool = False
     onion_suspended: bool = False
     show_first_stroke_hint: bool = True
+    first_hint_text: str = ""
     view_mode: str = "EDIT"
     paint_key_uuid: str = ""
     paint_key_angle: float = 0.0
@@ -774,6 +775,13 @@ def _continue_enter() -> float | None:
                 session.seek_angle = session.paint_key_angle
                 project.seek_angle = session.paint_key_angle
                 project.review_angle = _side_signed_angle(project, active_item)
+            session.show_first_stroke_hint = not bool(getattr(project, "first_stroke_complete", False))
+            if str(getattr(project, "base_source", "LEGACY")) == "NORMAL_GUIDE":
+                session.first_hint_text = (
+                    "A normal-based shadow guide is ready. Paint only the areas you want to adjust."
+                )
+            else:
+                session.first_hint_text = "Choose an angle · choose Light or Shadow · paint"
             _mode_set(context, window, view_area, "TEXTURE_PAINT")
             from .tools import activate_tools
 

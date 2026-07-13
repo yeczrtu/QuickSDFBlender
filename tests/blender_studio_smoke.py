@@ -114,6 +114,9 @@ def check() -> float | None:
             "VIEW_3D", "IMAGE_EDITOR", "DOPESHEET_EDITOR"
         }
         assert obj.mode == "TEXTURE_PAINT"
+        assert float(runtime.active_angle(project).angle) == 45.0
+        assert str(project.base_source) == "NORMAL_GUIDE"
+        assert studio.current_session().first_hint_text.startswith("A normal-based shadow guide")
         assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is False
         session = studio.current_session()
         assert session is not None

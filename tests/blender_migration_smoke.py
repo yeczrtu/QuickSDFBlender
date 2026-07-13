@@ -100,6 +100,23 @@ def _project_images(project: object) -> tuple[bpy.types.Image, ...]:
     )
 
 
+def _make_v2_project() -> tuple[object, dict[str, np.ndarray]]:
+    scene = bpy.context.scene
+    project = scene.quick_sdf_projects.add()
+    project.uuid = runtime.new_uuid()
+    project.name = "Schema v2 Pixel Preservation"
+    project.resolution = 512
+    runtime.create_project_images(project)
+    project.schema_version = 2
+    expected: dict[str, np.ndarray] = {}
+    for index, image in enumerate(_project_images(project)):
+        rgba = runtime.image_rgba(image)
+        rgba[index % 7, index % 11, :3] = (0.125, 0.5, 0.875)
+        runtime.write_image_rgba(image, rgba)
+        expected[image.name] = runtime.image_rgba(image)
+    return project, expected
+
+
 def _assert_layer_tags(
     image: bpy.types.Image,
     project: object,
@@ -113,7 +130,9 @@ def _assert_layer_tags(
 
 
 def _assert_migrated(project: object, expected: dict[str, np.ndarray]) -> None:
-    assert project.schema_version == 2
+    assert project.schema_version == 3
+    assert project.base_source == "LEGACY"
+    assert project.guide_version == 0
     assert not project.author_active
     assert not project.preview_enabled
     assert not project.material_override_active
@@ -194,6 +213,16 @@ def run() -> None:
     assert len(image_names) == 9  # three angle keys, each with three layers
     assert not migrate_project_v1_to_v2(project)
     assert tuple(sorted(image.name for image in _project_images(project))) == image_names
+
+    v2_project, v2_pixels = _make_v2_project()
+    v2_names = tuple(sorted(image.name for image in _project_images(v2_project)))
+    assert migrate_project_v1_to_v2(v2_project)
+    assert v2_project.schema_version == 3
+    assert v2_project.base_source == "LEGACY"
+    assert tuple(sorted(image.name for image in _project_images(v2_project))) == v2_names
+    for image in _project_images(v2_project):
+        np.testing.assert_array_equal(runtime.image_rgba(image), v2_pixels[image.name])
+    assert not migrate_project_v1_to_v2(v2_project)
 
     # Verify that save/reload and the registered load handler do not recreate
     # layers or reintroduce v1 transparency.

@@ -215,7 +215,10 @@ _tag_image = tag_image
 
 def make_image_opaque(image: bpy.types.Image) -> None:
     try:
-        image.alpha_mode = "NONE"
+        # Reassigning alpha_mode on a packed image reloads its old packed
+        # buffer and can discard pixel edits made immediately beforehand.
+        if str(image.alpha_mode) != "NONE":
+            image.alpha_mode = "NONE"
     except (AttributeError, TypeError, ValueError):
         pass
 
@@ -287,9 +290,18 @@ def create_project_images(project: Any, source: bpy.types.Image | None = None) -
         if source is not None:
             copy_image_pixels(source, display)
             copy_image_pixels(source, base)
-    project.active_angle_index = 0
-    project.active_angle_uuid = project.angles[0].uuid if project.angles else ""
+    project.active_angle_index = min(
+        range(len(project.angles)),
+        key=lambda index: abs(float(project.angles[index].angle) - 45.0),
+        default=0,
+    )
+    project.active_angle_uuid = (
+        project.angles[project.active_angle_index].uuid if project.angles else ""
+    )
     project.active_side = str(getattr(project, "authoring_side", "RIGHT"))
+    if project.angles:
+        project.seek_angle = float(project.angles[project.active_angle_index].angle)
+        project.review_angle = project.seek_angle
     project.schema_version = SCHEMA_VERSION
 
 
@@ -337,10 +349,28 @@ def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
         )
     opaque = values.copy()
     opaque[..., 3] = 1.0
-    image.pixels.foreach_set(np.flip(opaque, axis=0).ravel())
-    image[IMAGE_REVISION_KEY] = int(image.get(IMAGE_REVISION_KEY, 0)) + 1
-    make_image_opaque(image)
-    image.update()
+    # Blender keeps a separate projection-paint buffer for the active canvas.
+    # Python pixel writes to a packed canvas can otherwise be overwritten by
+    # that stale buffer. Detach only for the duration of this atomic write.
+    detached = []
+    for scene in bpy.data.scenes:
+        image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
+        if image_paint is not None and getattr(image_paint, "canvas", None) == image:
+            detached.append(image_paint)
+            image_paint.canvas = None
+    try:
+        image.pixels.foreach_set(np.flip(opaque, axis=0).ravel())
+        image[IMAGE_REVISION_KEY] = int(image.get(IMAGE_REVISION_KEY, 0)) + 1
+        make_image_opaque(image)
+        image.update()
+        # Material/Image Editor uploads can reload a generated Image from
+        # generated_color. Keep the current display pixels in its packed source
+        # before reattaching an active projection-paint canvas.
+        if str(image.get(ROLE_KEY, "")) == DISPLAY_ROLE:
+            image.pack()
+    finally:
+        for image_paint in detached:
+            image_paint.canvas = image
 
 
 def initialize_normal_sweep(project: Any) -> None:

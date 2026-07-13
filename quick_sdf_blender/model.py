@@ -21,7 +21,7 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_KEY_ANGLES = tuple(float(value) for value in range(0, 91, 15))
 LEGACY_SIGNED_ANGLES = tuple(float(value) for value in range(-90, 91, 15))
 # Public compatibility name.  From schema v2 onward a linked/mirrored project
@@ -32,6 +32,14 @@ DEFAULT_ANGLES = DEFAULT_KEY_ANGLES
 SIDE_ITEMS = (
     ("RIGHT", "Right", "Right-light authoring side"),
     ("LEFT", "Left", "Left-light authoring side"),
+)
+
+
+BASE_SOURCE_ITEMS = (
+    ("NORMAL_GUIDE", "Normal Guide", "Base masks generated from evaluated mesh normals"),
+    ("IMPORTED", "Imported Mask", "Base masks copied from artist-supplied images"),
+    ("WHITE", "All Light", "Base masks initialized as all Light"),
+    ("LEGACY", "Legacy", "Base masks preserved from an earlier Quick SDF version"),
 )
 
 
@@ -259,6 +267,27 @@ class QSDFProject(PropertyGroup):
     dirty: BoolProperty(name="Dirty", default=True)
     base_needs_update: BoolProperty(name="Base Needs Update", default=False)
     base_signature: StringProperty(name="Base Signature", default="", options={"HIDDEN"})
+    base_source: EnumProperty(
+        name="Base Source", items=BASE_SOURCE_ITEMS, default="NORMAL_GUIDE"
+    )
+    guide_version: IntProperty(name="Guide Version", default=1, min=0, options={"HIDDEN"})
+    guide_shadow_amount: FloatProperty(
+        name="Shadow Amount", default=50.0, min=0.0, max=100.0, subtype="PERCENTAGE"
+    )
+    thumbnail_uv_bbox: FloatVectorProperty(
+        name="Thumbnail UV Bounds",
+        size=4,
+        default=(0.0, 0.0, 1.0, 1.0),
+        min=0.0,
+        max=1.0,
+        options={"HIDDEN"},
+    )
+    guide_direction_warning: BoolProperty(
+        name="Check Guide Direction", default=False, options={"HIDDEN"}
+    )
+    guide_direction_message: StringProperty(
+        name="Guide Direction Message", default="", options={"HIDDEN"}
+    )
     first_stroke_complete: BoolProperty(name="First Stroke Complete", default=False)
     job_running: BoolProperty(
         name="Quick SDF Job Running", default=False, options={"HIDDEN", "SKIP_SAVE"}

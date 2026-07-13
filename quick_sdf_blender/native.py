@@ -55,6 +55,14 @@ def _load():
                 ctypes.c_int, ctypes.c_int, u8p, u8p, i32p,
             ]
             dll.qsdf_bake_normal_sweep.restype = ctypes.c_int
+        if hasattr(dll, "qsdf_bake_face_shadow_guide"):
+            dll.qsdf_bake_face_shadow_guide.argtypes = [
+                f32p, f32p, ctypes.c_int,
+                f32p, ctypes.c_int, f32p, f32p,
+                ctypes.c_int, ctypes.c_float,
+                ctypes.c_int, ctypes.c_int, u8p, u8p, i32p,
+            ]
+            dll.qsdf_bake_face_shadow_guide.restype = ctypes.c_int
         _DLL = dll
     except OSError:
         _DLL = False
@@ -188,6 +196,17 @@ def native_bake_available() -> bool:
     )
 
 
+def native_guide_bake_available() -> bool:
+    """Return whether the ABI-4 artist guide rasterizer is available."""
+
+    dll = _load()
+    return bool(
+        dll is not None
+        and version() >= 4
+        and hasattr(dll, "qsdf_bake_face_shadow_guide")
+    )
+
+
 def bake_normal_sweep(
     triangle_uvs,
     corner_normals,
@@ -272,6 +291,97 @@ def bake_normal_sweep(
     )
 
 
+def bake_face_shadow_guide(
+    triangle_uvs,
+    corner_normals,
+    angles,
+    forward,
+    up,
+    side,
+    shadow_amount,
+    width,
+    height=None,
+    *,
+    enforce_monotonic=True,
+    cancel_flag=None,
+):
+    """Bake the side-explicit face-shadow guide in ABI 4 or exact Python."""
+
+    from .bake import (
+        bake_face_shadow_guide as fallback,
+        guide_light_directions,
+        shadow_amount_cutoff,
+    )
+
+    if not native_guide_bake_available() or not enforce_monotonic:
+        return fallback(
+            triangle_uvs,
+            corner_normals,
+            angles,
+            forward,
+            up,
+            side,
+            shadow_amount,
+            width,
+            height,
+            enforce_monotonic=enforce_monotonic,
+        )
+    uvs = np.ascontiguousarray(np.asarray(triangle_uvs), dtype=np.float32)
+    normals = np.ascontiguousarray(np.asarray(corner_normals), dtype=np.float32)
+    angle_values, _directions = guide_light_directions(angles, forward, up, side)
+    angle_values = np.ascontiguousarray(angle_values, dtype=np.float32)
+    forward_values = np.ascontiguousarray(np.asarray(forward), dtype=np.float32)
+    up_values = np.ascontiguousarray(np.asarray(up), dtype=np.float32)
+    cutoff = shadow_amount_cutoff(shadow_amount)
+    if uvs.ndim != 3 or uvs.shape[1:] != (3, 2):
+        raise ValueError("triangle_uvs must have shape (N, 3, 2)")
+    if normals.shape != (uvs.shape[0], 3, 3):
+        raise ValueError("corner_normals must have shape (N, 3, 3)")
+    if not np.all(np.isfinite(uvs)) or not np.all(np.isfinite(normals)):
+        raise ValueError("triangle data must be finite")
+    lengths = np.linalg.norm(normals, axis=2)
+    if np.any(lengths <= 1.0e-12):
+        raise ValueError("corner normals must have non-zero length")
+    normals = np.ascontiguousarray(normals / lengths[..., None], dtype=np.float32)
+    image_width = int(width)
+    image_height = image_width if height is None else int(height)
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    masks = np.empty((angle_values.size, image_height, image_width), dtype=np.uint8)
+    occupancy = np.empty((image_height, image_width), dtype=np.uint8)
+    if cancel_flag is None:
+        cancel_value = ctypes.c_int(0)
+    elif isinstance(cancel_flag, ctypes.c_int):
+        cancel_value = cancel_flag
+    else:
+        cancel_value = ctypes.c_int(int(bool(cancel_flag)))
+    side_sign = 1 if str(side).upper() == "RIGHT" else -1
+    dll = _load()
+    code = dll.qsdf_bake_face_shadow_guide(
+        uvs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        normals.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(uvs.shape[0]),
+        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(angle_values.size),
+        forward_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        up_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        side_sign,
+        ctypes.c_float(cutoff),
+        image_width,
+        image_height,
+        masks.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        occupancy.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        ctypes.byref(cancel_value),
+    )
+    if code == 4:
+        raise NativeCoreError("Native Quick SDF guide bake was cancelled")
+    if code:
+        raise NativeCoreError(f"Native Quick SDF guide bake failed with status {code}")
+    return np.ascontiguousarray(masks.astype(np.bool_)), np.ascontiguousarray(
+        occupancy.astype(np.bool_)
+    )
+
+
 def validate_monotonic(masks, angles) -> int:
     dll = _load()
     if dll is None:
@@ -295,10 +405,12 @@ def validate_monotonic(masks, angles) -> int:
 __all__ = [
     "NativeCoreError",
     "available",
+    "bake_face_shadow_guide",
     "bake_normal_sweep",
     "generate_threshold",
     "generate_threshold_pair",
     "native_bake_available",
+    "native_guide_bake_available",
     "validate_monotonic",
     "version",
 ]

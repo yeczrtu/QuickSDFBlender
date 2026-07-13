@@ -165,12 +165,15 @@ def run(output_directory: Path) -> None:
     project = scene.quick_sdf_projects[0]
     assert project.target_object == cube
     assert project.resolution == 512
-    assert project.schema_version == 2
+    assert project.schema_version == 3
+    assert project.base_source == "NORMAL_GUIDE"
+    assert project.guide_version == 1
     assert len(project.angles) == 7
     assert [round(item.angle) for item in project.angles] == list(range(0, 91, 15))
     assert {item.side for item in project.angles} == {"RIGHT"}
     assert not project.author_active
     assert not project.base_needs_update
+    assert project.angles[project.active_angle_index].angle == 45.0
     original_base_signature = project.base_signature
     assert original_base_signature
     cube.data.vertices[0].co.x += 0.01
@@ -229,12 +232,24 @@ def run(output_directory: Path) -> None:
     source_image = runtime.resolve_angle_image(project, project.angles[project.active_angle_index])
     assert source_image is not None
     source_mask = runtime.image_mask(source_image)
+    source_before = runtime.image_rgba(source_image)
     footprint = np.zeros(source_mask.shape, dtype=np.bool_)
     footprint[255:257, 255:257] = True
     runtime.capture_paint_snapshot(project)
     painted = runtime.image_rgba(source_image)
     painted[..., :3][footprint] = float(project.paint_value)
+    assert np.all(painted[255:257, 255:257, :3] == float(project.paint_value))
     runtime.write_image_rgba(source_image, painted)
+    source_after = runtime.image_rgba(source_image)
+    assert np.any(source_after[..., :3] != source_before[..., :3]), (
+        current_light,
+        selected_index,
+        project.paint_value,
+        source_before[256, 256, :3],
+        source_after[256, 256, :3],
+        source_image.source,
+        bool(source_image.packed_file),
+    )
     _expect_finished(bpy.ops.quicksdf.propagate_overrides(), "propagate_overrides")
     for angle_item in project.angles:
         display = runtime.resolve_display_image(project, angle_item)
@@ -245,16 +260,51 @@ def run(output_directory: Path) -> None:
     _expect_finished(bpy.ops.quicksdf.history_undo(), "history_undo")
     _expect_finished(bpy.ops.quicksdf.history_redo(), "history_redo")
 
+    print("[Quick SDF smoke] rebake guide preserves painted RGB and coverage")
+    painted_before = {
+        item.uuid: (
+            runtime.image_rgba(runtime.resolve_display_image(project, item)).copy(),
+            runtime.image_rgba(runtime.resolve_coverage_image(project, item)).copy(),
+        )
+        for item in project.angles
+    }
+    project.forward_vector = (0.2, -1.0, 0.0)
+    project.guide_shadow_amount = 63.0
+    _expect_finished(bpy.ops.quicksdf.bake_base(), "bake_base guide")
+    from quick_sdf_blender.core import validate_monotonic, validate_side_monotonic
+
+    guide_stack, guide_angles = runtime.project_side_stack(project, "RIGHT")
+    guide_report = validate_side_monotonic(guide_stack, guide_angles)
+    assert guide_report.is_valid, guide_report.offending_transitions
+    signed_stack, signed_angles = runtime.project_mask_stack(project)
+    signed_report = validate_monotonic(signed_stack, signed_angles)
+    assert signed_report.is_valid, signed_report.offending_transitions
+    for item in project.angles:
+        before_display, before_coverage = painted_before[item.uuid]
+        display = runtime.image_rgba(runtime.resolve_display_image(project, item))
+        coverage = runtime.image_rgba(runtime.resolve_coverage_image(project, item))
+        covered = before_coverage[..., 0] >= 0.5
+        np.testing.assert_array_equal(coverage, before_coverage)
+        np.testing.assert_array_equal(display[..., :3][covered], before_display[..., :3][covered])
+
     print("[Quick SDF smoke] preview material is reversible")
     original_material = cube.material_slots[0].material
     original_link = cube.material_slots[0].link
+    masks_before_preview, angles_before_preview = runtime.project_mask_stack(project)
     _expect_finished(bpy.ops.quicksdf.preview_enable(), "preview_enable")
+    masks_after_enable, _angles_after_enable = runtime.project_mask_stack(project)
+    np.testing.assert_array_equal(masks_after_enable, masks_before_preview)
     preview_material = cube.material_slots[0].material
     assert preview_material is not None and preview_material != original_material
     assert preview_material.node_tree.nodes.get("QSDF Original Overlay") is not None
     _expect_finished(bpy.ops.quicksdf.preview_disable(), "preview_disable")
+    masks_after_disable, _angles_after_disable = runtime.project_mask_stack(project)
+    np.testing.assert_array_equal(masks_after_disable, masks_before_preview)
     assert cube.material_slots[0].material == original_material
     assert cube.material_slots[0].link == original_link
+    signed_stack, signed_angles = runtime.project_mask_stack(project)
+    signed_report = validate_monotonic(signed_stack, signed_angles)
+    assert signed_report.is_valid, signed_report.offending_transitions
 
     print("[Quick SDF smoke] validate, generate, and export RGBA16 PNG")
     _expect_finished(bpy.ops.quicksdf.validate(), "validate")

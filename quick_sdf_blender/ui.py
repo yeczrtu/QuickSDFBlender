@@ -138,6 +138,21 @@ class QSDF_PT_launcher(bpy.types.Panel):
                 warning = layout.box()
                 warning.label(text="Base needs update", icon="ERROR")
                 warning.operator("quicksdf.bake_base", text="Rebake Base", icon="FILE_REFRESH")
+            if str(getattr(project, "base_source", "LEGACY")) == "LEGACY":
+                guide = layout.box()
+                guide.label(text="Start with a shadow guide from the model", icon="LIGHT_SUN")
+                guide.operator(
+                    "quicksdf.bake_base", text="Create Normal Shadow Guide", icon="SHADING_RENDERED"
+                )
+            if bool(getattr(project, "guide_direction_warning", False)):
+                direction = layout.box()
+                direction.alert = True
+                direction.label(
+                    text=tr(str(project.guide_direction_message)), icon="ORIENTATION_VIEW"
+                )
+                direction.operator(
+                    "quicksdf.set_forward_from_view", text="Use This View as Front", icon="VIEW_CAMERA"
+                )
             _mirror_confirmation(layout, project)
             _export_controls(layout, project)
             layout.operator("quicksdf.studio_exit", text="Exit Quick SDF", icon="X")
@@ -146,6 +161,12 @@ class QSDF_PT_launcher(bpy.types.Panel):
             button = layout.column()
             button.scale_y = 1.7
             button.operator("quicksdf.studio_enter", text="Open Quick SDF Studio", icon="WORKSPACE")
+            if str(getattr(project, "base_source", "LEGACY")) == "LEGACY":
+                guide = layout.box()
+                guide.label(text="Start with a shadow guide from the model", icon="LIGHT_SUN")
+                guide.operator(
+                    "quicksdf.bake_base", text="Create Normal Shadow Guide", icon="SHADING_RENDERED"
+                )
             _mirror_confirmation(layout, project)
 
 
@@ -177,10 +198,15 @@ class QSDF_PT_advanced(bpy.types.Panel):
         column.prop(project, "resolution")
         axes = layout.box()
         axes.label(text="Character Axes")
-        row = axes.row(align=True)
-        row.prop(project, "forward_axis", text="Forward")
-        row.prop(project, "up_axis", text="Up")
-        axes.operator("quicksdf.set_forward_from_view", text="Set Forward from View")
+        axes.operator("quicksdf.set_forward_from_view", text="Use This View as Front")
+
+        guide = layout.box()
+        guide.label(text="Adjust Shadow Guide")
+        guide.prop(project, "guide_shadow_amount", text="Shadow Amount", slider=True)
+        guide.operator("quicksdf.bake_base", text="Update Shadow Guide", icon="FILE_REFRESH")
+        if bool(getattr(project, "guide_direction_warning", False)):
+            guide.alert = True
+            guide.label(text=tr(str(project.guide_direction_message)), icon="ERROR")
 
         mirror = layout.box()
         mirror.label(text="Mirror")

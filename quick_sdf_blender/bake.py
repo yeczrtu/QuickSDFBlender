@@ -74,6 +74,23 @@ def _validated_angles(angles: Sequence[float] | np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values)
 
 
+def _validated_guide_angles(angles: Sequence[float] | np.ndarray) -> np.ndarray:
+    values = np.asarray(angles, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2:
+        raise ValueError("guide angles must be a one-dimensional sequence with at least two keys")
+    if not np.all(np.isfinite(values)) or np.any(values < -_ANGLE_EPSILON) or np.any(
+        values > 90.0 + _ANGLE_EPSILON
+    ):
+        raise ValueError("guide angles must be finite values in the inclusive range 0..90")
+    if np.any(np.diff(values) <= _ANGLE_EPSILON):
+        raise ValueError("guide angles must be strictly increasing")
+    if not np.isclose(values[0], 0.0, atol=_ANGLE_EPSILON, rtol=0.0) or not np.isclose(
+        values[-1], 90.0, atol=_ANGLE_EPSILON, rtol=0.0
+    ):
+        raise ValueError("guide angles must include 0 and 90 degree endpoints")
+    return np.ascontiguousarray(values)
+
+
 def _unit_vector(value: Sequence[float] | np.ndarray, *, name: str) -> np.ndarray:
     vector = np.asarray(value, dtype=np.float64)
     if vector.shape != (3,):
@@ -116,6 +133,50 @@ def light_directions(
     directions = forward_vector[None, :] * cosine + axis_cross_forward[None, :] * sine
     directions /= np.linalg.norm(directions, axis=1)[:, None]
     return angle_values, np.ascontiguousarray(directions, dtype=np.float32)
+
+
+def guide_light_directions(
+    angles: Sequence[float] | np.ndarray,
+    forward: Sequence[float] | np.ndarray,
+    up: Sequence[float] | np.ndarray,
+    side: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return guide directions where 0° is side light and 90° is front light."""
+
+    angle_values = _validated_guide_angles(angles)
+    side_name = str(side).upper()
+    if side_name not in {"RIGHT", "LEFT"}:
+        raise ValueError("side must be RIGHT or LEFT")
+    up_vector = _unit_vector(up, name="up")
+    front = _unit_vector(forward, name="forward")
+    front = front - up_vector * float(np.dot(front, up_vector))
+    front_length = float(np.linalg.norm(front))
+    if front_length <= _EPSILON:
+        raise ValueError("forward and up must not be parallel")
+    front /= front_length
+    side_vector = np.cross(up_vector, front)
+    side_vector /= float(np.linalg.norm(side_vector))
+    if side_name == "LEFT":
+        side_vector = -side_vector
+
+    radians = np.deg2rad(angle_values)
+    directions = (
+        side_vector[None, :] * np.cos(radians)[:, None]
+        + front[None, :] * np.sin(radians)[:, None]
+    )
+    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    return angle_values, np.ascontiguousarray(directions, dtype=np.float32)
+
+
+def shadow_amount_cutoff(shadow_amount: float) -> float:
+    """Map the artist-facing 0..100 Shadow Amount to the N·L cutoff."""
+
+    if isinstance(shadow_amount, bool):
+        raise TypeError("shadow_amount must be a number")
+    amount = float(shadow_amount)
+    if not np.isfinite(amount) or not 0.0 <= amount <= 100.0:
+        raise ValueError("shadow_amount must be in the range 0..100")
+    return -0.15 + amount * 0.005
 
 
 def enforce_monotonic_expansion(
@@ -259,9 +320,41 @@ def bake_normal_sweep(
     return np.ascontiguousarray(masks), occupancy
 
 
+def bake_face_shadow_guide(
+    triangle_uvs: np.ndarray | Sequence[object],
+    corner_normals: np.ndarray | Sequence[object],
+    angles: Sequence[float] | np.ndarray,
+    forward: Sequence[float] | np.ndarray,
+    up: Sequence[float] | np.ndarray,
+    side: str,
+    shadow_amount: float,
+    width: int,
+    height: int | None = None,
+    *,
+    enforce_monotonic: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bake the artist-facing normal guide while keeping the legacy sweep intact."""
+
+    angle_values, directions = guide_light_directions(angles, forward, up, side)
+    cutoff = shadow_amount_cutoff(shadow_amount)
+    normals, occupancy = rasterize_uv_normals(
+        triangle_uvs, corner_normals, width, height
+    )
+    dots = np.einsum("hwc,ac->ahw", normals, directions, optimize=True)
+    masks = (~occupancy)[None, :] | (dots >= cutoff)
+    if enforce_monotonic:
+        masks = np.ascontiguousarray(masks, dtype=np.bool_)
+        for closer in range(1, masks.shape[0]):
+            masks[closer] |= masks[closer - 1]
+    return np.ascontiguousarray(masks), occupancy
+
+
 __all__ = [
+    "bake_face_shadow_guide",
     "bake_normal_sweep",
     "enforce_monotonic_expansion",
+    "guide_light_directions",
     "light_directions",
     "rasterize_uv_normals",
+    "shadow_amount_cutoff",
 ]

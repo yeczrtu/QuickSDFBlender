@@ -36,6 +36,7 @@ class TimelineGeometry:
 
 _DRAW_HANDLE: Any = None
 _COLOR_SHADER: Any = None
+_IMAGE_SHADER: Any = None
 
 
 def _visible_keys(project: Any) -> list[tuple[int, Any]]:
@@ -138,19 +139,35 @@ def _text(text: str, x: float, y: float, color=(0.9, 0.92, 0.96, 1.0), size: int
     blf.draw(0, text)
 
 
-def _draw_thumbnail(image: Any, rect: Rect) -> bool:
+def _draw_thumbnail(
+    image: Any,
+    rect: Rect,
+    uv_bbox: tuple[float, float, float, float],
+) -> bool:
     try:
+        global _IMAGE_SHADER
         import gpu
-        from gpu_extras.presets import draw_texture_2d
+        from gpu_extras.batch import batch_for_shader
 
         texture = gpu.texture.from_image(image)
-        draw_texture_2d(
-            texture,
+        if _IMAGE_SHADER is None:
+            _IMAGE_SHADER = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
+        u0, v0, u1, v1 = uv_bbox
+        positions = (
             (rect.x0 + 2.0, rect.y0 + 2.0),
-            max(1.0, rect.x1 - rect.x0 - 4.0),
-            max(1.0, rect.y1 - rect.y0 - 16.0),
-            is_scene_linear_with_rec709_srgb_target=True,
+            (rect.x1 - 2.0, rect.y0 + 2.0),
+            (rect.x1 - 2.0, rect.y1 - 16.0),
+            (rect.x0 + 2.0, rect.y1 - 16.0),
         )
+        tex_coords = ((u0, v0), (u1, v0), (u1, v1), (u0, v1))
+        batch = batch_for_shader(
+            _IMAGE_SHADER,
+            "TRIS",
+            {"pos": positions, "texCoord": tex_coords},
+            indices=((0, 1, 2), (2, 3, 0)),
+        )
+        _IMAGE_SHADER.uniform_sampler("image", texture)
+        batch.draw(_IMAGE_SHADER)
         return True
     except (ReferenceError, RuntimeError, SystemError, ValueError):
         return False
@@ -189,6 +206,12 @@ def _draw_timeline() -> None:
     paint_angle = float(session.paint_key_angle) if session is not None else float(
         getattr(project.angles[active], "angle", 0.0) if 0 <= active < len(project.angles) else 0.0
     )
+    bbox_values = tuple(float(value) for value in getattr(project, "thumbnail_uv_bbox", (0.0, 0.0, 1.0, 1.0)))
+    uv_bbox = bbox_values if (
+        len(bbox_values) == 4
+        and 0.0 <= bbox_values[0] < bbox_values[2] <= 1.0
+        and 0.0 <= bbox_values[1] < bbox_values[3] <= 1.0
+    ) else (0.0, 0.0, 1.0, 1.0)
     try:
         gpu.state.blend_set("ALPHA")
         _rect(Rect(0.0, 0.0, context.region.width, context.region.height), (0.025, 0.03, 0.04, 0.98))
@@ -206,7 +229,7 @@ def _draw_timeline() -> None:
             item = key_map[collection_index]
             _rect(rect, (0.10, 0.22, 0.34, 0.82) if collection_index in affected else (0.08, 0.09, 0.11, 1.0))
             image = _image_for_key(project, item)
-            if image is None or not _draw_thumbnail(image, rect):
+            if image is None or not _draw_thumbnail(image, rect, uv_bbox):
                 _rect(Rect(rect.x0 + 2, rect.y0 + 2, rect.x1 - 2, rect.y1 - 16), (0.18, 0.19, 0.21, 1.0))
             angle = float(getattr(item, "angle", 0.0))
             _text(f"{angle:g}°", rect.x0 + 4.0, rect.y0 + 3.0, size=10)
@@ -229,7 +252,8 @@ def _draw_timeline() -> None:
         elif session is not None and session.show_first_stroke_hint:
             from .i18n import tr
 
-            _text(tr("Choose an angle · choose Light or Shadow · paint"), geometry.rail.x0, geometry.rail.y1 + 5.0, size=11)
+            message = session.first_hint_text or "Choose an angle · choose Light or Shadow · paint"
+            _text(tr(message), geometry.rail.x0, geometry.rail.y1 + 5.0, size=11)
     except (AttributeError, ReferenceError, RuntimeError, SystemError, ValueError):
         return
     finally:
@@ -385,7 +409,7 @@ def register_timeline() -> None:
 
 
 def unregister_timeline() -> None:
-    global _DRAW_HANDLE, _COLOR_SHADER
+    global _DRAW_HANDLE, _COLOR_SHADER, _IMAGE_SHADER
     if _DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceDopeSheetEditor.draw_handler_remove(_DRAW_HANDLE, "WINDOW")
@@ -393,6 +417,7 @@ def unregister_timeline() -> None:
             pass
         _DRAW_HANDLE = None
     _COLOR_SHADER = None
+    _IMAGE_SHADER = None
 
 
 __all__ = [

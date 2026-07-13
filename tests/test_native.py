@@ -3,14 +3,18 @@ import unittest
 import numpy as np
 
 from quick_sdf_blender import native
-from quick_sdf_blender.bake import bake_normal_sweep as reference_bake
+from quick_sdf_blender.bake import (
+    bake_face_shadow_guide as reference_guide_bake,
+    bake_normal_sweep as reference_bake,
+)
 from quick_sdf_blender.core import generate_threshold_rgba16
 
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
 class NativeCoreTests(unittest.TestCase):
-    def test_version_two_pair_abi(self):
-        self.assertGreaterEqual(native.version(), 3)
+    def test_version_four_guide_abi(self):
+        self.assertGreaterEqual(native.version(), 4)
+        self.assertTrue(native.native_guide_bake_available())
 
     def test_native_normal_bake_matches_reference(self):
         uvs = np.asarray(
@@ -46,6 +50,48 @@ class NativeCoreTests(unittest.TestCase):
         )
         self.assertEqual(masks.shape, (3, 13, 17))
         self.assertTrue(np.all(masks[:, ~occupancy]))
+
+    def test_native_face_shadow_guide_matches_reference(self):
+        uvs = np.asarray(
+            [
+                [[0.05, 0.05], [0.95, 0.10], [0.15, 0.95]],
+                [[0.95, 0.10], [0.90, 0.95], [0.15, 0.95]],
+            ],
+            dtype=np.float32,
+        )
+        normals = np.asarray(
+            [
+                [[0.8, -1.0, 0.0], [0.2, -1.0, 0.4], [-0.8, -1.0, 0.0]],
+                [[0.2, -1.0, 0.4], [-0.8, -1.0, 0.0], [0.0, -1.0, -0.5]],
+            ],
+            dtype=np.float32,
+        )
+        angles = np.asarray([0.0, 15.0, 45.0, 75.0, 90.0], dtype=np.float32)
+        for side in ("RIGHT", "LEFT"):
+            expected_masks, expected_occupancy = reference_guide_bake(
+                uvs,
+                normals,
+                angles,
+                (0.3, -1.0, 0.2),
+                (0.0, 0.0, 1.0),
+                side,
+                50.0,
+                29,
+                23,
+            )
+            masks, occupancy = native.bake_face_shadow_guide(
+                uvs,
+                normals,
+                angles,
+                (0.3, -1.0, 0.2),
+                (0.0, 0.0, 1.0),
+                side,
+                50.0,
+                29,
+                23,
+            )
+            np.testing.assert_array_equal(occupancy, expected_occupancy)
+            np.testing.assert_array_equal(masks, expected_masks)
 
     def test_threshold_pair_supports_distinct_zero_masks(self):
         angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float32)
