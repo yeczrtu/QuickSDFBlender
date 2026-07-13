@@ -184,14 +184,23 @@ def _draw_timeline() -> None:
     geometry = build_geometry(context.region.width, context.region.height, keys)
     active = int(getattr(project, "active_angle_index", -1))
     affected = _affected_indices(project, keys)
+    session = active_session(context)
+    previewing = bool(session is not None and session.view_mode == "PREVIEW")
+    paint_angle = float(session.paint_key_angle) if session is not None else float(
+        getattr(project.angles[active], "angle", 0.0) if 0 <= active < len(project.angles) else 0.0
+    )
     try:
         gpu.state.blend_set("ALPHA")
         _rect(Rect(0.0, 0.0, context.region.width, context.region.height), (0.025, 0.03, 0.04, 0.98))
         _rect(geometry.rail, (0.18, 0.20, 0.24, 1.0))
         span = max(1.0e-6, geometry.angle_max - geometry.angle_min)
-        seek_factor = max(0.0, min(1.0, (_seek_value(project) - geometry.angle_min) / span))
-        seek_x = geometry.rail.x0 + seek_factor * (geometry.rail.x1 - geometry.rail.x0)
-        _rect(Rect(seek_x - 2.0, geometry.rail.y0 - 4.0, seek_x + 2.0, geometry.rail.y1 + 4.0), (0.25, 0.72, 1.0, 1.0))
+        paint_factor = max(0.0, min(1.0, (paint_angle - geometry.angle_min) / span))
+        paint_x = geometry.rail.x0 + paint_factor * (geometry.rail.x1 - geometry.rail.x0)
+        _rect(Rect(paint_x - 2.0, geometry.rail.y0 - 4.0, paint_x + 2.0, geometry.rail.y1 + 4.0), (0.25, 0.72, 1.0, 1.0))
+        if previewing:
+            seek_factor = max(0.0, min(1.0, (_seek_value(project) - geometry.angle_min) / span))
+            seek_x = geometry.rail.x0 + seek_factor * (geometry.rail.x1 - geometry.rail.x0)
+            _rect(Rect(seek_x - 2.0, geometry.rail.y0 - 5.0, seek_x + 2.0, geometry.rail.y1 + 5.0), (1.0, 0.45, 0.08, 1.0))
         key_map = {index: item for index, item in keys}
         for collection_index, rect in geometry.key_rects:
             item = key_map[collection_index]
@@ -209,8 +218,15 @@ def _draw_timeline() -> None:
                 _rect(Rect(rect.x1 - 7, rect.y1 - 7, rect.x1 - 3, rect.y1 - 3), (0.95, 0.95, 1.0, 1.0))
             else:
                 _rect(Rect(rect.x1 - 6, rect.y1 - 6, rect.x1 - 4, rect.y1 - 4), (0.70, 0.74, 0.80, 1.0))
-        session = active_session(context)
-        if session is not None and session.show_first_stroke_hint:
+        if previewing and session is not None:
+            _text(
+                f"Preview {_seek_value(project):g}°  ·  Back to Paint {session.paint_key_angle:g}°",
+                geometry.rail.x0,
+                geometry.rail.y1 + 5.0,
+                color=(1.0, 0.68, 0.28, 1.0),
+                size=11,
+            )
+        elif session is not None and session.show_first_stroke_hint:
             from .i18n import tr
 
             _text(tr("Choose an angle · choose Light or Shadow · paint"), geometry.rail.x0, geometry.rail.y1 + 5.0, size=11)
@@ -278,11 +294,12 @@ def _set_seek(context: Any, project: Any, value: float) -> None:
 
 class QSDF_GT_timeline_capture(bpy.types.Gizmo):
     bl_idname = "QSDF_GT_timeline_capture"
-    __slots__ = ("_shape", "_initial_seek")
+    __slots__ = ("_shape", "_initial_seek", "_initial_mode")
 
     def setup(self):
         self._shape = self.new_custom_shape("TRIS", ((0, 0), (1, 0), (1, 1), (0, 0), (1, 1), (0, 1)))
         self._initial_seek = 0.0
+        self._initial_mode = "EDIT"
 
     def draw(self, _context):
         # The visible timeline is rendered by the shared draw handler.
@@ -303,8 +320,10 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
             if rect.contains(x, y):
                 _select_key(context, project, index)
                 return {"FINISHED"}
-        if geometry.rail.x0 <= x <= geometry.rail.x1:
+        if geometry.rail.contains(x, y):
             self._initial_seek = _seek_value(project)
+            session = active_session(context)
+            self._initial_mode = str(getattr(session, "view_mode", "EDIT"))
             _set_seek(context, project, geometry.angle_from_x(x))
             return {"RUNNING_MODAL"}
         return {"FINISHED"}
@@ -314,7 +333,13 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
         if project is None:
             return {"CANCELLED"}
         if event.type == "ESC":
-            _set_seek(context, project, self._initial_seek)
+            if self._initial_mode == "EDIT" and _operator_exists("quicksdf.back_to_paint"):
+                try:
+                    bpy.ops.quicksdf.back_to_paint("EXEC_DEFAULT")
+                except RuntimeError:
+                    _set_seek(context, project, self._initial_seek)
+            else:
+                _set_seek(context, project, self._initial_seek)
             return {"CANCELLED"}
         if event.type == "MOUSEMOVE":
             geometry = build_geometry(context.region.width, context.region.height, _visible_keys(project))

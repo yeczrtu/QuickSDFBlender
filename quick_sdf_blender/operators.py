@@ -525,17 +525,7 @@ class QUICKSDF_OT_angle_set(bpy.types.Operator):
             index = min(choices or range(len(project.angles)), key=lambda i: abs(project.angles[i].angle))
         else:
             index = max(0, min(self.index, len(project.angles) - 1))
-        project.active_angle_index = index
-        project.active_angle_uuid = project.angles[index].uuid
-        project.active_side = project.angles[index].side
-        project.review_angle = (
-            -float(project.angles[index].angle)
-            if str(project.angles[index].side) == "LEFT"
-            else float(project.angles[index].angle)
-        )
-        project.seek_angle = project.angles[index].angle
-        runtime.sync_canvas(context, project)
-        return {"FINISHED"}
+        return {"FINISHED"} if _select_angle_uuid(context, project, project.angles[index].uuid) else {"CANCELLED"}
 
 
 class QUICKSDF_OT_angle_step(bpy.types.Operator):
@@ -578,23 +568,12 @@ def _sort_angle_items(project) -> None:
 
 
 def _select_angle_uuid(context, project, uuid: str) -> bool:
-    for index, item in enumerate(project.angles):
-        if str(item.uuid) != str(uuid):
-            continue
-        project.active_angle_index = index
-        project.active_angle_uuid = item.uuid
-        project.active_side = item.side
-        project.seek_angle = float(item.angle)
-        project.review_angle = float(item.angle) if item.side == "RIGHT" else -float(item.angle)
-        runtime.sync_canvas(context, project)
-        try:
-            from .timeline import tag_timeline_redraw
+    try:
+        from .studio import select_paint_key
 
-            tag_timeline_redraw()
-        except (ImportError, AttributeError, RuntimeError):
-            pass
-        return True
-    return False
+        return select_paint_key(context, project, key_uuid=str(uuid))
+    except (ImportError, AttributeError, ReferenceError, RuntimeError, ValueError):
+        return False
 
 
 class QUICKSDF_OT_key_select(bpy.types.Operator):
@@ -628,25 +607,31 @@ class QUICKSDF_OT_seek_set(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
-        project.seek_angle = max(0.0, min(90.0, float(self.angle)))
-        sign = -1.0 if str(project.authoring_side) == "LEFT" else 1.0
-        project.review_angle = sign * project.seek_angle
-        # Scrubbing intentionally does not change the edit key or paint canvas.
         try:
-            from .live_preview import update_seek_preview
+            from .studio import seek_preview
 
-            update_seek_preview(project, project.seek_angle)
-        except (ImportError, ReferenceError, RuntimeError, ValueError):
-            # The seek rail remains usable even if a transient GPU/material ID
-            # disappears during an undo or workspace transition.
-            pass
-        try:
-            from .timeline import tag_timeline_redraw
-
-            tag_timeline_redraw()
-        except (ImportError, AttributeError, RuntimeError):
-            pass
+            seek_preview(context, project, float(self.angle))
+        except (ImportError, AttributeError, ReferenceError, RuntimeError, ValueError):
+            return {"CANCELLED"}
         return {"FINISHED"}
+
+
+class QUICKSDF_OT_back_to_paint(bpy.types.Operator):
+    bl_idname = "quicksdf.back_to_paint"
+    bl_label = "Back to Paint"
+    bl_description = "Return the 3D preview to the angle currently being painted"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            from .studio import back_to_paint
+
+            return {"FINISHED"} if back_to_paint(context, project) else {"CANCELLED"}
+        except (ImportError, AttributeError, ReferenceError, RuntimeError, ValueError):
+            return {"CANCELLED"}
 
 
 def _assign_angle_layers(project, item, display, base, coverage) -> None:
@@ -1416,6 +1401,13 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        try:
+            from .studio import back_to_paint, is_studio_active
+
+            if is_studio_active(context, str(project.uuid)) and not back_to_paint(context, project):
+                return {"CANCELLED"}
+        except (ImportError, AttributeError, ReferenceError, RuntimeError):
+            pass
         if bool(getattr(project, "onion_enabled", False)):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
@@ -1936,6 +1928,7 @@ CLASSES = (
     QUICKSDF_OT_angle_step,
     QUICKSDF_OT_key_select,
     QUICKSDF_OT_seek_set,
+    QUICKSDF_OT_back_to_paint,
     QUICKSDF_OT_key_add,
     QUICKSDF_OT_key_move,
     QUICKSDF_OT_key_delete,

@@ -50,6 +50,10 @@ class StudioSession:
     preview_suspended: bool = False
     onion_suspended: bool = False
     show_first_stroke_hint: bool = True
+    view_mode: str = "EDIT"
+    paint_key_uuid: str = ""
+    paint_key_angle: float = 0.0
+    seek_angle: float = 0.0
 
 
 @dataclass(slots=True)
@@ -106,6 +110,131 @@ def resolve_session_project(session: StudioSession | None = None) -> Any | None:
             if str(getattr(project, "uuid", "")) == session.project_uuid:
                 return project
     return None
+
+
+def _side_signed_angle(project: Any, item: Any) -> float:
+    angle = float(getattr(item, "angle", 0.0))
+    return -angle if str(getattr(item, "side", getattr(project, "authoring_side", "RIGHT"))) == "LEFT" else angle
+
+
+def _resolve_paint_key(
+    project: Any,
+    *,
+    key_uuid: str = "",
+    index: int = -1,
+) -> tuple[int, Any] | tuple[None, None]:
+    angles = getattr(project, "angles", ())
+    if key_uuid:
+        for candidate_index, item in enumerate(angles):
+            if str(getattr(item, "uuid", "")) == str(key_uuid):
+                return candidate_index, item
+    if 0 <= int(index) < len(angles):
+        return int(index), angles[int(index)]
+    active_uuid = str(getattr(project, "active_angle_uuid", ""))
+    if active_uuid:
+        for candidate_index, item in enumerate(angles):
+            if str(getattr(item, "uuid", "")) == active_uuid:
+                return candidate_index, item
+    if angles:
+        active_index = max(0, min(int(getattr(project, "active_angle_index", 0)), len(angles) - 1))
+        return active_index, angles[active_index]
+    return None, None
+
+
+def select_paint_key(
+    context: Any,
+    project: Any,
+    *,
+    key_uuid: str = "",
+    index: int = -1,
+) -> bool:
+    """Select one edit key and atomically synchronize every paint surface."""
+
+    resolved_index, item = _resolve_paint_key(project, key_uuid=key_uuid, index=index)
+    if item is None or resolved_index is None:
+        return False
+    angle = float(getattr(item, "angle", 0.0))
+    project.active_angle_index = resolved_index
+    project.active_angle_uuid = str(getattr(item, "uuid", ""))
+    if hasattr(project, "active_side"):
+        project.active_side = str(getattr(item, "side", getattr(project, "authoring_side", "RIGHT")))
+    project.seek_angle = angle
+    project.review_angle = _side_signed_angle(project, item)
+
+    session = active_session(context)
+    if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        session.view_mode = "EDIT"
+        session.paint_key_uuid = str(getattr(item, "uuid", ""))
+        session.paint_key_angle = angle
+        session.seek_angle = angle
+
+    from .runtime import sync_canvas
+
+    image = sync_canvas(context, project)
+    if session is not None and image is not None:
+        try:
+            _assign_preview(project, image)
+        except (ReferenceError, RuntimeError, ValueError):
+            pass
+    tag_studio_redraw()
+    return True
+
+
+def seek_preview(context: Any, project: Any, angle: float) -> float:
+    """Scrub the 3D result without changing the edit key or paint canvas."""
+
+    value = max(0.0, min(90.0, float(angle)))
+    project.seek_angle = value
+    sign = -1.0 if str(getattr(project, "authoring_side", "RIGHT")) == "LEFT" else 1.0
+    project.review_angle = sign * value
+    session = active_session(context)
+    if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        session.view_mode = "PREVIEW"
+        session.seek_angle = value
+    try:
+        from .live_preview import update_seek_preview
+
+        update_seek_preview(project, value)
+    except (ImportError, ReferenceError, RuntimeError, ValueError):
+        pass
+    tag_studio_redraw()
+    return value
+
+
+def back_to_paint(context: Any, project: Any) -> bool:
+    """Return Preview to the stored edit key before any mutating action."""
+
+    session = active_session(context)
+    key_uuid = session.paint_key_uuid if session is not None else str(getattr(project, "active_angle_uuid", ""))
+    if select_paint_key(context, project, key_uuid=key_uuid):
+        return True
+    return select_paint_key(context, project, index=int(getattr(project, "active_angle_index", 0)))
+
+
+def reconcile_view_state(context: Any | None = None) -> bool:
+    """Re-resolve transient key IDs after Undo/Redo or key list edits."""
+
+    context = context or bpy.context
+    session = active_session(context)
+    project = resolve_session_project(session)
+    if session is None or project is None:
+        return False
+    resolved_index, item = _resolve_paint_key(project, key_uuid=session.paint_key_uuid)
+    if item is None:
+        resolved_index, item = _resolve_paint_key(project)
+    if item is None or resolved_index is None:
+        return False
+    session.paint_key_uuid = str(getattr(item, "uuid", ""))
+    session.paint_key_angle = float(getattr(item, "angle", 0.0))
+    project.active_angle_index = resolved_index
+    project.active_angle_uuid = session.paint_key_uuid
+    if session.view_mode == "PREVIEW":
+        from .runtime import sync_canvas
+
+        sync_canvas(context, project)
+        seek_preview(context, project, session.seek_angle)
+        return True
+    return select_paint_key(context, project, key_uuid=session.paint_key_uuid)
 
 
 def studio_areas(window: Any) -> tuple[Any | None, Any | None, Any | None]:
@@ -527,6 +656,14 @@ def _continue_enter() -> float | None:
             image = sync_canvas(context, project)
             if image is None:
                 raise StudioError("The active angle image could not be used as a paint canvas")
+            _index, active_item = _resolve_paint_key(project)
+            if active_item is not None:
+                session.view_mode = "EDIT"
+                session.paint_key_uuid = str(getattr(active_item, "uuid", ""))
+                session.paint_key_angle = float(getattr(active_item, "angle", 0.0))
+                session.seek_angle = session.paint_key_angle
+                project.seek_angle = session.paint_key_angle
+                project.review_angle = _side_signed_angle(project, active_item)
             _mode_set(context, window, view_area, "TEXTURE_PAINT")
             from .tools import activate_tools
 
@@ -729,10 +866,10 @@ def _save_post(_unused: Any) -> None:
             item = active_angle(project)
             image = resolve_angle_image(project, item) if item else None
             _assign_preview(project, image)
-            if str(getattr(project, "preview_mode", "OVERLAY")) == "TOON":
+            if _SESSION.view_mode == "PREVIEW":
                 from .live_preview import update_seek_preview
 
-                update_seek_preview(project, float(getattr(project, "seek_angle", 0.0)))
+                update_seek_preview(project, float(_SESSION.seek_angle))
             if _SESSION.onion_suspended:
                 project.onion_enabled = True
         except (ImportError, ReferenceError, RuntimeError, ValueError):
@@ -766,6 +903,11 @@ def _undo_post(_unused: Any) -> None:
     global _SESSION
     if _SESSION is not None and (find_window(_SESSION.window_pointer) is None or resolve_session_project() is None):
         _SESSION = None
+    elif _SESSION is not None:
+        try:
+            reconcile_view_state(bpy.context)
+        except (AttributeError, ImportError, ReferenceError, RuntimeError, ValueError):
+            pass
 
 
 def register_studio() -> None:
@@ -812,7 +954,8 @@ CLASSES: tuple[type, ...] = ()
 __all__ = [
     "CLASSES", "StudioBusyError", "StudioError", "StudioSession", "StudioUnavailableError",
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
-    "dismiss_first_stroke_hint", "enter_studio", "exit_studio", "find_studio_workspace",
-    "is_studio_active", "register_studio", "resolve_session_project", "studio_areas",
+    "back_to_paint", "dismiss_first_stroke_hint", "enter_studio", "exit_studio",
+    "find_studio_workspace", "is_studio_active", "reconcile_view_state", "register_studio",
+    "resolve_session_project", "seek_preview", "select_paint_key", "studio_areas",
     "tag_studio_redraw", "unregister_studio",
 ]

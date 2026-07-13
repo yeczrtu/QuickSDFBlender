@@ -136,13 +136,25 @@ def check() -> float | None:
         assert project.onion_enabled
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
         assert image_area.spaces.active.image.get(runtime.ROLE_KEY) == ONION_PREVIEW_ROLE
+        edit_uuid = str(runtime.active_angle(project).uuid)
+        edit_angle = float(runtime.active_angle(project).angle)
         assert bpy.ops.quicksdf.seek_set(angle=22.5) == {"FINISHED"}
+        assert studio.current_session().view_mode == "PREVIEW"
+        assert str(runtime.active_angle(project).uuid) == edit_uuid
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
         from quick_sdf_blender.live_preview import SEEK_PREVIEW_ROLE
 
         preview_material = obj.material_slots[0].material
         preview_image = preview_material.node_tree.nodes["QSDF Mask"].image
         assert preview_image.get(runtime.ROLE_KEY) == SEEK_PREVIEW_ROLE
+        assert bpy.ops.quicksdf.paint_snapshot() == {"FINISHED"}
+        assert studio.current_session().view_mode == "EDIT"
+        assert float(project.seek_angle) == edit_angle
+        assert str(runtime.active_angle(project).uuid) == edit_uuid
+        assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
+        assert preview_material.node_tree.nodes["QSDF Mask"].image == canvas
+        runtime.discard_paint_snapshot(project)
+        assert bpy.ops.quicksdf.seek_set(angle=22.5) == {"FINISHED"}
         export_path = ROOT / "build" / "studio_async_export.png"
         export_path.unlink(missing_ok=True)
         assert bpy.ops.quicksdf.export_texture(
