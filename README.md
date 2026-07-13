@@ -1,4 +1,4 @@
-# Quick SDF Studio 0.3.0
+# Quick SDF Studio 0.3.1
 
 Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作るWindows向けExtensionです。法線から作られた影ガイドを下描きにして、気になる部分だけを直せます。
 
@@ -24,7 +24,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 1. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
 2. 右上メニューから `ディスクからインストール` を選ぶ
-3. `quick_sdf_blender-0.3.0-windows-x64.zip` を選択する（展開不要）
+3. `quick_sdf_blender-0.3.1-windows-x64.zip` を選択する（展開不要）
 4. 3D Viewで `N` を押し、`Quick SDF` タブを開く
 
 対象Meshにはローカルの0–1 UV Mapが必要です。初期解像度は1024です。
