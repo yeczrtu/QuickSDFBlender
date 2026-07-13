@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import binascii
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+import zlib
+
+import numpy as np
+
+from quick_sdf_blender.core import (
+    ALWAYS_LIGHT,
+    ALWAYS_SHADOW,
+    RangeScope,
+    exact_edt,
+    exact_signed_edt,
+    generate_threshold_rgba16,
+    guard_clip_proposal,
+    range_target_indices,
+    validate_monotonic,
+)
+from quick_sdf_blender.png16 import PNG_SIGNATURE, encode_png_rgba16, write_png_rgba16
+
+
+ANGLES = np.arange(-90.0, 91.0, 15.0)
+
+
+def brute_distance(features: np.ndarray) -> np.ndarray:
+    points = np.argwhere(features)
+    if not points.size:
+        return np.full(features.shape, np.inf)
+    result = np.empty(features.shape, dtype=np.float64)
+    for y, x in np.ndindex(features.shape):
+        result[y, x] = np.sqrt(np.min(np.sum((points - (y, x)) ** 2, axis=1)))
+    return result
+
+
+def decode_png(data: bytes) -> tuple[dict[str, int], np.ndarray]:
+    assert data.startswith(PNG_SIGNATURE)
+    position = len(PNG_SIGNATURE)
+    chunks: list[tuple[bytes, bytes]] = []
+    while position < len(data):
+        size = struct.unpack_from(">I", data, position)[0]
+        kind = data[position + 4 : position + 8]
+        payload = data[position + 8 : position + 8 + size]
+        checksum = struct.unpack_from(">I", data, position + 8 + size)[0]
+        assert checksum == (binascii.crc32(kind + payload) & 0xFFFFFFFF)
+        chunks.append((kind, payload))
+        position += size + 12
+    header = next(payload for kind, payload in chunks if kind == b"IHDR")
+    width, height, depth, color, compression, filtering, interlace = struct.unpack(
+        ">IIBBBBB", header
+    )
+    raw = zlib.decompress(b"".join(payload for kind, payload in chunks if kind == b"IDAT"))
+    stride = width * 8 + 1
+    rows = []
+    for y in range(height):
+        assert raw[y * stride] == 0
+        rows.append(raw[y * stride + 1 : (y + 1) * stride])
+    pixels = np.frombuffer(b"".join(rows), dtype=">u2").reshape(height, width, 4)
+    return {
+        "width": width,
+        "height": height,
+        "depth": depth,
+        "color": color,
+        "compression": compression,
+        "filter": filtering,
+        "interlace": interlace,
+    }, pixels.astype(np.uint16)
+
+
+class ExactEdtTests(unittest.TestCase):
+    def test_exact_against_brute_force_non_square(self) -> None:
+        for shape in ((1, 5), (5, 1), (4, 7), (7, 4)):
+            features = np.zeros(shape, dtype=bool)
+            features[0, 0] = True
+            features[-1, -1] = True
+            if shape[0] > 2 and shape[1] > 2:
+                features[2, 1] = True
+            np.testing.assert_allclose(exact_edt(features), brute_distance(features), atol=1e-12)
+
+    def test_circle_and_edges_against_brute_force(self) -> None:
+        yy, xx = np.ogrid[:9, :11]
+        features = (yy - 4) ** 2 + (xx - 5) ** 2 <= 5
+        features[0, -1] = True
+        np.testing.assert_allclose(exact_edt(features), brute_distance(features), atol=1e-12)
+
+    def test_no_features_is_infinite(self) -> None:
+        self.assertTrue(np.all(np.isinf(exact_edt(np.zeros((3, 4), dtype=bool)))))
+
+    def test_signed_convention_and_constant_masks(self) -> None:
+        mask = np.asarray([[False, True], [False, True]])
+        signed = exact_signed_edt(mask)
+        np.testing.assert_allclose(signed, [[1.0, -1.0], [1.0, -1.0]])
+        self.assertTrue(np.all(np.isneginf(exact_signed_edt(np.ones((2, 3), dtype=bool)))))
+        self.assertTrue(np.all(np.isposinf(exact_signed_edt(np.zeros((2, 3), dtype=bool)))))
+
+
+class MonotonicTests(unittest.TestCase):
+    def test_valid_asymmetric_expansion(self) -> None:
+        stack = np.zeros((len(ANGLES), 2, 3), dtype=bool)
+        for index, angle in enumerate(ANGLES):
+            stack[index, :, 0] = abs(angle) >= 30
+            stack[index, :, 1] = (angle >= 60) if angle >= 0 else (abs(angle) >= 45)
+        report = validate_monotonic(stack, ANGLES)
+        self.assertTrue(report.is_valid)
+        self.assertEqual(report.violation_count, 0)
+
+    def test_reports_each_side_and_transition(self) -> None:
+        stack = np.ones((len(ANGLES), 2, 2), dtype=bool)
+        zero = int(np.where(ANGLES == 0)[0][0])
+        plus15 = int(np.where(ANGLES == 15)[0][0])
+        minus15 = int(np.where(ANGLES == -15)[0][0])
+        stack[plus15, 0, 0] = False
+        stack[minus15, 1, 1] = False
+        report = validate_monotonic(stack, ANGLES)
+        self.assertFalse(report.is_valid)
+        self.assertEqual(report.violation_count, 2)
+        self.assertEqual(report.violation_pixel_count, 2)
+        self.assertTrue(report.positive_violation_map[0, 0])
+        self.assertTrue(report.negative_violation_map[1, 1])
+        self.assertEqual(len(report.offending_transitions), 2)
+
+    def test_guard_clips_only_offending_entries(self) -> None:
+        before = np.zeros((len(ANGLES), 1, 2), dtype=bool)
+        proposal = before.copy()
+        zero = int(np.where(ANGLES == 0)[0][0])
+        plus15 = int(np.where(ANGLES == 15)[0][0])
+        plus30 = int(np.where(ANGLES == 30)[0][0])
+        proposal[plus15, 0, 0] = True  # isolated Light: invalid and clipped
+        proposal[plus30:, 0, 1] = True  # valid expansion: retained
+        result = guard_clip_proposal(before, proposal, ANGLES)
+        self.assertTrue(result.validation.is_valid)
+        self.assertFalse(result.masks[plus15, 0, 0])
+        self.assertTrue(result.clipped[plus15, 0, 0])
+        self.assertTrue(np.all(result.masks[plus30:, 0, 1]))
+        self.assertEqual(result.clipped_entry_count, 1)
+
+    def test_rejects_invalid_guard_baseline(self) -> None:
+        stack = np.ones((len(ANGLES), 1, 1), dtype=bool)
+        stack[np.where(ANGLES == 15)[0][0], 0, 0] = False
+        with self.assertRaises(ValueError):
+            guard_clip_proposal(stack, stack, ANGLES)
+
+
+class RangeTests(unittest.TestCase):
+    def test_all_range_modes_on_positive_side(self) -> None:
+        active = int(np.where(ANGLES == 30)[0][0])
+        values = lambda scope: ANGLES[range_target_indices(ANGLES, active, scope)].tolist()
+        self.assertEqual(values(RangeScope.CURRENT), [30.0])
+        self.assertEqual(values("TOWARD_FRONT"), [0.0, 15.0, 30.0])
+        self.assertEqual(values("TOWARD_SIDE"), [30.0, 45.0, 60.0, 75.0, 90.0])
+        self.assertEqual(values("WHOLE_SIDE"), [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0])
+        self.assertEqual(values("BOTH_SIDES"), ANGLES.tolist())
+
+    def test_negative_and_zero_ranges(self) -> None:
+        active = int(np.where(ANGLES == -30)[0][0])
+        selected = ANGLES[range_target_indices(ANGLES, active, "TOWARD_FRONT")]
+        self.assertEqual(selected.tolist(), [-30.0, -15.0, 0.0])
+        zero = int(np.where(ANGLES == 0)[0][0])
+        self.assertEqual(
+            ANGLES[range_target_indices(ANGLES, zero, "TOWARD_FRONT")].tolist(), [0.0]
+        )
+        self.assertEqual(range_target_indices(ANGLES, zero, "TOWARD_SIDE").size, len(ANGLES))
+
+
+class ThresholdTests(unittest.TestCase):
+    def test_reserved_values_and_channels(self) -> None:
+        stack = np.zeros((len(ANGLES), 1, 3), dtype=bool)
+        stack[:, 0, 0] = True  # always Light
+        # pixel 1 stays Shadow; pixel 2 transitions differently by side
+        for index, angle in enumerate(ANGLES):
+            if angle >= 0:
+                stack[index, 0, 2] = angle >= 30
+            else:
+                stack[index, 0, 2] = abs(angle) >= 60
+        output = generate_threshold_rgba16(stack, ANGLES)
+        self.assertEqual(output.dtype, np.uint16)
+        self.assertEqual(output.shape, (1, 3, 4))
+        np.testing.assert_array_equal(output[0, 0, :], [ALWAYS_LIGHT, ALWAYS_LIGHT, 0, 65535])
+        np.testing.assert_array_equal(output[0, 1, :], [ALWAYS_SHADOW, ALWAYS_SHADOW, 0, 65535])
+        self.assertTrue(1 <= int(output[0, 2, 0]) <= 65534)
+        self.assertTrue(1 <= int(output[0, 2, 1]) <= 65534)
+        self.assertLess(output[0, 2, 0], output[0, 2, 1])
+
+    def test_sdf_ratio_places_straight_boundary_halfway(self) -> None:
+        angles = np.asarray([-90.0, 0.0, 90.0])
+        stack = np.zeros((3, 1, 2), dtype=bool)
+        stack[0] = True
+        stack[2] = True
+        output = generate_threshold_rgba16(stack, angles)
+        # Adjacent black/white pixel centres have equal |SDF|, so transition is 45 degrees.
+        expected = 1 + int(np.floor(0.5 * 65533 + 0.5))
+        np.testing.assert_array_equal(output[0, :, 0], [expected, expected])
+        np.testing.assert_array_equal(output[0, :, 1], [expected, expected])
+
+    def test_non_monotonic_export_is_rejected(self) -> None:
+        stack = np.ones((len(ANGLES), 1, 1), dtype=bool)
+        stack[np.where(ANGLES == 15)[0][0], 0, 0] = False
+        with self.assertRaisesRegex(ValueError, "not monotonic"):
+            generate_threshold_rgba16(stack, ANGLES)
+
+    def test_generation_requires_both_side_endpoints(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires"):
+            generate_threshold_rgba16(np.ones((3, 1, 1), bool), [-45, 0, 90])
+
+
+class PngTests(unittest.TestCase):
+    def test_byte_exact_rgba16_roundtrip(self) -> None:
+        pixels = np.asarray(
+            [[[0x0000, 0x0001, 0x00FF, 0xFFFF], [0x1234, 0xABCD, 0x8000, 0x7FFF]]],
+            dtype=np.uint16,
+        )
+        header, decoded = decode_png(encode_png_rgba16(pixels, compress_level=9))
+        self.assertEqual(
+            header,
+            {"width": 2, "height": 1, "depth": 16, "color": 6, "compression": 0, "filter": 0, "interlace": 0},
+        )
+        np.testing.assert_array_equal(decoded, pixels)
+
+    def test_atomic_write_and_overwrite_policy(self) -> None:
+        pixels = np.zeros((2, 2, 4), dtype=np.uint16)
+        pixels[..., 3] = 65535
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "threshold.png"
+            self.assertEqual(write_png_rgba16(path, pixels), path)
+            _, decoded = decode_png(path.read_bytes())
+            np.testing.assert_array_equal(decoded, pixels)
+            with self.assertRaises(FileExistsError):
+                write_png_rgba16(path, pixels)
+            pixels[..., 0] = 42
+            write_png_rgba16(path, pixels, overwrite=True)
+            _, decoded = decode_png(path.read_bytes())
+            np.testing.assert_array_equal(decoded, pixels)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_rejects_non_uint16_or_wrong_shape(self) -> None:
+        with self.assertRaises(TypeError):
+            encode_png_rgba16(np.zeros((2, 2, 4), dtype=np.uint8))
+        with self.assertRaises(ValueError):
+            encode_png_rgba16(np.zeros((2, 2, 3), dtype=np.uint16))
+
+
+if __name__ == "__main__":
+    unittest.main()

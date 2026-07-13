@@ -1,0 +1,1964 @@
+"""Primary Blender operators for Quick SDF projects and angle masks."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import struct
+import zlib
+
+import bpy
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from mathutils import Vector
+
+from . import runtime
+from .history import History
+
+
+_HISTORIES: dict[str, History] = {}
+_EXPORT_JOB: dict[str, object] | None = None
+
+
+def _project(context: bpy.types.Context):
+    return runtime.active_project(context.scene)
+
+
+def _require_project(operator: bpy.types.Operator, context: bpy.types.Context):
+    project = _project(context)
+    if project is None:
+        operator.report({"ERROR"}, "Create or select a Quick SDF project first")
+    return project
+
+
+def _set_active_object(context: bpy.types.Context, obj: bpy.types.Object) -> None:
+    if context.view_layer.objects.active is not obj:
+        context.view_layer.objects.active = obj
+    if not obj.select_get():
+        obj.select_set(True)
+
+
+def _project_for_object(scene: bpy.types.Scene, obj: bpy.types.Object | None):
+    if obj is None:
+        return None
+    for index, project in enumerate(getattr(scene, "quick_sdf_projects", ())):
+        if project.target_object == obj:
+            scene.quick_sdf_active_project_index = index
+            return project
+    return None
+
+
+def _axis_vector(name: str):
+    values = {
+        "NEG_X": (-1.0, 0.0, 0.0),
+        "POS_X": (1.0, 0.0, 0.0),
+        "NEG_Y": (0.0, -1.0, 0.0),
+        "POS_Y": (0.0, 1.0, 0.0),
+        "NEG_Z": (0.0, 0.0, -1.0),
+        "POS_Z": (0.0, 0.0, 1.0),
+    }
+    return values[name]
+
+
+def _extract_evaluated_bake_input(context, project):
+    """Copy evaluated UV triangles and per-corner normals on the main thread."""
+
+    import numpy as np
+
+    obj = project.target_object
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    if mesh is None:
+        raise ValueError("Could not evaluate the target mesh")
+    try:
+        uv_layer = mesh.uv_layers.get(project.uv_map_name)
+        if uv_layer is None:
+            raise ValueError("The evaluated mesh no longer contains the project UV map")
+        mesh.calc_loop_triangles()
+        corner_normals = mesh.corner_normals
+        triangles_uv = []
+        triangles_normal = []
+        triangle_centers = []
+        slot = int(project.material_slot_index)
+        for triangle in mesh.loop_triangles:
+            polygon = mesh.polygons[triangle.polygon_index]
+            if polygon.material_index != slot:
+                continue
+            triangles_uv.append([tuple(uv_layer.data[index].uv) for index in triangle.loops])
+            normals = []
+            for index in triangle.loops:
+                value = corner_normals[index]
+                vector = getattr(value, "vector", value)
+                normals.append(tuple(vector))
+            triangles_normal.append(normals)
+            center = sum(
+                (mesh.vertices[index].co for index in triangle.vertices),
+                mesh.vertices[triangle.vertices[0]].co * 0.0,
+            ) / 3.0
+            triangle_centers.append(tuple(center))
+        if not triangles_uv:
+            raise ValueError("No evaluated faces use the selected material slot")
+        return (
+            np.ascontiguousarray(triangles_uv, dtype=np.float32),
+            np.ascontiguousarray(triangles_normal, dtype=np.float32),
+            np.ascontiguousarray(triangle_centers, dtype=np.float32),
+        )
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _detect_project_symmetry(project, triangle_uvs, corner_normals, triangle_centers) -> None:
+    """Suggest a live UV mirror without asking a technical setup question."""
+
+    import numpy as np
+
+    from .bake import rasterize_uv_normals
+    from .symmetry import SymmetryMode, analyze_symmetry
+
+    up = np.asarray(_axis_vector(str(project.up_axis)), dtype=np.float64)
+    forward = np.asarray(_axis_vector(str(project.forward_axis)), dtype=np.float64)
+    right = np.cross(up, forward)
+    right /= max(float(np.linalg.norm(right)), 1.0e-12)
+    signed = triangle_centers @ right
+    positive = signed >= 0.0
+    negative = ~positive
+    if not np.any(positive) or not np.any(negative):
+        project.symmetry_candidate = "TEXTURE_MIRROR"
+        project.symmetry_confidence = 0.0
+        project.symmetry_requires_confirmation = True
+        project.symmetry_mode = "AUTO"
+        return
+    size = min(256, int(project.resolution))
+    _normal, positive_occupancy = rasterize_uv_normals(
+        triangle_uvs[positive], corner_normals[positive], size, size
+    )
+    _normal, negative_occupancy = rasterize_uv_normals(
+        triangle_uvs[negative], corner_normals[negative], size, size
+    )
+    analysis = analyze_symmetry(
+        positive_occupancy, negative_occupancy, confirmation_threshold=0.90
+    )
+    mapping = {
+        SymmetryMode.OVERLAPPED: "OVERLAPPED_UV",
+        SymmetryMode.TEXTURE_MIRROR: "TEXTURE_MIRROR",
+        SymmetryMode.ISLAND_PAIR: "ISLAND_PAIR",
+        SymmetryMode.INDEPENDENT: "ISLAND_PAIR",
+    }
+    candidate = mapping[analysis.suggested_mode]
+    project.symmetry_candidate = candidate
+    project.symmetry_confidence = float(analysis.confidence)
+    project.symmetry_requires_confirmation = analysis.confidence < 0.90
+    project.symmetry_mode = "AUTO" if project.symmetry_requires_confirmation else candidate
+
+
+def _bake_project(context, project) -> None:
+    """Bake evaluated corner normals and preserve every manual override."""
+
+    import numpy as np
+
+    from .native import bake_normal_sweep
+
+    runtime.begin_base_bake(str(project.uuid))
+    window_manager = context.window_manager
+    window_manager.progress_begin(0, 3)
+    try:
+        triangle_uvs, corner_normals, triangle_centers = _extract_evaluated_bake_input(
+            context, project
+        )
+        window_manager.progress_update(1)
+        for side in ("RIGHT", "LEFT"):
+            items = sorted(
+                (item for item in project.angles if str(item.side) == side),
+                key=lambda item: float(item.angle),
+            )
+            if not items:
+                continue
+            local_angles = np.asarray([float(item.angle) for item in items], dtype=np.float64)
+            signed_angles = local_angles if side == "RIGHT" else -local_angles
+            masks, _occupancy = bake_normal_sweep(
+                triangle_uvs,
+                corner_normals,
+                signed_angles,
+                _axis_vector(str(project.forward_axis)),
+                _axis_vector(str(project.up_axis)),
+                int(project.resolution),
+                int(project.resolution),
+            )
+            for item, mask in zip(items, masks):
+                display = runtime.resolve_display_image(project, item)
+                base = runtime.resolve_base_image(project, item)
+                coverage = runtime.resolve_coverage_image(project, item)
+                if display is None or base is None or coverage is None:
+                    raise ValueError(f"Angle data is incomplete at {float(item.angle):g} degrees")
+                base_rgba = np.ones((*mask.shape, 4), dtype=np.float32)
+                base_rgba[..., :3] = mask[..., None]
+                old_display = runtime.image_rgba(display)
+                overridden = runtime.coverage_mask(coverage)
+                composed = base_rgba.copy()
+                composed[..., :3][overridden] = old_display[..., :3][overridden]
+                runtime.write_image_rgba(base, base_rgba)
+                runtime.write_image_rgba(display, composed)
+                item.is_generated = True
+                item.dirty = True
+        window_manager.progress_update(2)
+        if bool(getattr(project, "mirror_enabled", True)):
+            _detect_project_symmetry(project, triangle_uvs, corner_normals, triangle_centers)
+        project.base_needs_update = False
+        project.base_signature = runtime.compute_base_signature(project, context.scene)
+        project.dirty = True
+        window_manager.progress_update(3)
+    finally:
+        window_manager.progress_end()
+        runtime.end_base_bake(str(project.uuid))
+
+
+def _create_project_data(context):
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
+        raise ValueError("Select a mesh object first")
+    if obj.library is not None or obj.data.library is not None:
+        raise ValueError("Make the mesh and object local before creating a project")
+    if not obj.data.uv_layers:
+        raise ValueError("The active mesh needs a 0-1 UV map")
+    settings = context.scene.quick_sdf_settings
+    if settings.initialization == "EXISTING" and settings.source_image is None:
+        raise ValueError("Select an existing mask image")
+    created_material = None
+    if not obj.material_slots:
+        created_material = bpy.data.materials.new(f"{obj.name} Quick SDF")
+        obj.data.materials.append(created_material)
+    project = context.scene.quick_sdf_projects.add()
+    project.uuid = runtime.new_uuid()
+    project.name = f"{obj.name} Face Shadow"
+    project.target_object = obj
+    project.material_slot_index = max(0, int(obj.active_material_index))
+    project.uv_map_name = obj.data.uv_layers.active.name
+    project.resolution = int(settings.resolution)
+    project.authoring_side = "RIGHT"
+    project.active_side = "RIGHT"
+    project.mirror_enabled = True
+    project.symmetry_mode = "AUTO"
+    context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
+    try:
+        source = settings.source_image if settings.initialization == "EXISTING" else None
+        runtime.create_project_images(project, source)
+        if settings.initialization == "NORMAL_SWEEP":
+            _bake_project(context, project)
+        errors, warnings, _report = runtime.validate_project(project, include_monotonic=True)
+        if errors:
+            raise ValueError("\n".join(errors))
+        project.warning_message = "\n".join(warnings)
+        runtime.sync_canvas(context, project)
+        return project
+    except Exception:
+        runtime.remove_project_images(project)
+        index = int(context.scene.quick_sdf_active_project_index)
+        context.scene.quick_sdf_projects.remove(index)
+        context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
+        if created_material is not None:
+            if obj.data.materials and obj.data.materials[-1] == created_material:
+                obj.data.materials.pop(index=len(obj.data.materials) - 1)
+            if created_material.users == 0:
+                bpy.data.materials.remove(created_material)
+        raise
+
+
+class QUICKSDF_OT_project_create(bpy.types.Operator):
+    bl_idname = "quicksdf.project_create"
+    bl_label = "Create Quick SDF Project"
+    bl_description = "Create seven paint-ready face-shadow keys from the evaluated pose"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "MESH"
+
+    def execute(self, context):
+        try:
+            _create_project_data(context)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Created and auto-baked seven face-shadow keys")
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_project_remove(bpy.types.Operator):
+    bl_idname = "quicksdf.project_remove"
+    bl_label = "Remove Quick SDF Project"
+    bl_description = "Remove the active project and its generated images"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return runtime.active_project(context.scene) is not None
+
+    def execute(self, context):
+        project = _project(context)
+        index = context.scene.quick_sdf_active_project_index
+        shutdown_export_job(str(project.uuid), message="Export cancelled because the project was removed")
+        try:
+            from .studio import is_studio_active, exit_studio
+
+            if is_studio_active(context, str(project.uuid)):
+                exit_studio(context, reason="project-remove")
+        except (ImportError, RuntimeError, ReferenceError):
+            pass
+        runtime.discard_paint_snapshot(project)
+        _HISTORIES.pop(str(project.uuid), None)
+        obj = project.target_object
+        if obj is not None and not bpy.app.background and obj.mode == "TEXTURE_PAINT":
+            try:
+                _set_active_object(context, obj)
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError:
+                self.report({"ERROR"}, "Could not leave Texture Paint; project was not removed")
+                return {"CANCELLED"}
+        try:
+            from .preview import restore_preview_materials
+
+            restore_preview_materials(project)
+        except (ImportError, RuntimeError, ReferenceError) as exc:
+            self.report({"ERROR"}, f"Could not restore preview material: {exc}")
+            return {"CANCELLED"}
+        runtime.remove_project_images(project)
+        context.scene.quick_sdf_projects.remove(index)
+        context.scene.quick_sdf_active_project_index = min(index, len(context.scene.quick_sdf_projects) - 1)
+        if context.scene.quick_sdf_projects:
+            runtime.sync_canvas(context)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_project_delete(bpy.types.Operator):
+    """Script-facing alias retained for the original implementation contract."""
+
+    bl_idname = "quicksdf.project_delete"
+    bl_label = "Delete Quick SDF Project"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, _context):
+        return bpy.ops.quicksdf.project_remove()
+
+
+class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
+    bl_idname = "quicksdf.set_forward_from_view"
+    bl_label = "Set Forward from View"
+    bl_description = "Use the current 3D view direction as character forward"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return runtime.active_project(context.scene) is not None and context.region_data is not None
+
+    def execute(self, context):
+        project = _project(context)
+        obj = project.target_object
+        if obj is None or context.region_data is None:
+            return {"CANCELLED"}
+        world_forward = context.region_data.view_rotation @ Vector((0.0, 0.0, -1.0))
+        local_forward = (obj.matrix_world.to_quaternion().inverted() @ world_forward).normalized()
+        project.forward_vector = local_forward
+        candidates = {
+            "NEG_Y": Vector((0.0, -1.0, 0.0)),
+            "POS_Y": Vector((0.0, 1.0, 0.0)),
+            "NEG_X": Vector((-1.0, 0.0, 0.0)),
+            "POS_X": Vector((1.0, 0.0, 0.0)),
+        }
+        project.forward_axis = max(candidates, key=lambda name: local_forward.dot(candidates[name]))
+        project.dirty = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_author_start(bpy.types.Operator):
+    bl_idname = "quicksdf.author_start"
+    bl_label = "Open Quick SDF Studio"
+    bl_description = "Compatibility alias for Quick SDF Studio"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        return bpy.ops.quicksdf.studio_enter()
+
+
+class QUICKSDF_OT_author_stop(bpy.types.Operator):
+    bl_idname = "quicksdf.author_stop"
+    bl_label = "Exit Quick SDF"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        return bpy.ops.quicksdf.studio_exit()
+
+
+class QUICKSDF_OT_create_and_edit(bpy.types.Operator):
+    bl_idname = "quicksdf.create_and_edit"
+    bl_label = "Create & Edit"
+    bl_description = "Create the face-shadow project, auto-bake the current pose, and open Studio"
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "MESH"
+
+    def execute(self, context):
+        project = _project_for_object(context.scene, context.active_object)
+        created = project is None
+        try:
+            if project is None:
+                project = _create_project_data(context)
+            from .studio import enter_studio
+
+            enter_studio(context, project)
+        except Exception as exc:
+            if created:
+                project = _project_for_object(context.scene, context.active_object)
+                if project is not None:
+                    runtime.remove_project_images(project)
+                    index = int(context.scene.quick_sdf_active_project_index)
+                    context.scene.quick_sdf_projects.remove(index)
+                    context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_studio_enter(bpy.types.Operator):
+    bl_idname = "quicksdf.studio_enter"
+    bl_label = "Open Quick SDF Studio"
+    bl_description = "Open the paint canvas, 3D preview, and angle timeline in one workspace"
+
+    def execute(self, context):
+        project = _project_for_object(context.scene, context.active_object) or _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            from .studio import enter_studio
+
+            enter_studio(context, project)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_studio_exit(bpy.types.Operator):
+    bl_idname = "quicksdf.studio_exit"
+    bl_label = "Exit Quick SDF"
+    bl_description = "Restore the original workspace, mode, canvas, selection, and material"
+
+    def execute(self, context):
+        try:
+            from .studio import exit_studio
+
+            exit_studio(context, reason="user")
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_bake_base(bpy.types.Operator):
+    bl_idname = "quicksdf.bake_base"
+    bl_label = "Rebake Base"
+    bl_description = "Update the automatic shadow from the evaluated pose and keep painted corrections"
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        if bool(getattr(project, "onion_enabled", False)):
+            project.onion_enabled = False
+            runtime.sync_canvas(context, project)
+        try:
+            _bake_project(context, project)
+            runtime.sync_canvas(context, project)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Base updated; painted corrections were preserved")
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_create_workspace(bpy.types.Operator):
+    bl_idname = "quicksdf.create_workspace"
+    bl_label = "Create Author Workspace"
+    bl_description = "Duplicate the current workspace and add a synchronized Image Editor"
+
+    def execute(self, context):
+        if context.window is None or bpy.app.background:
+            self.report({"WARNING"}, "Workspace creation requires an interactive Blender window")
+            return {"CANCELLED"}
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        workspace_name = f"Quick SDF - {project.name}"
+        existing = bpy.data.workspaces.get(workspace_name)
+        if existing is not None:
+            context.window.workspace = existing
+        else:
+            try:
+                bpy.ops.workspace.duplicate()
+            except RuntimeError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            context.window.workspace.name = workspace_name
+        screen = context.window.screen
+        if screen and not any(area.type == "IMAGE_EDITOR" for area in screen.areas):
+            candidates = [area for area in screen.areas if area.type != "VIEW_3D"]
+            if candidates:
+                max(candidates, key=lambda area: area.width * area.height).type = "IMAGE_EDITOR"
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_angle_set(bpy.types.Operator):
+    bl_idname = "quicksdf.angle_set"
+    bl_label = "Set Quick SDF Angle"
+    bl_options = {"INTERNAL"}
+
+    index: IntProperty(name="Index", default=-1)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or not project.angles:
+            return {"CANCELLED"}
+        if self.index < 0:
+            side = str(getattr(project, "active_side", getattr(project, "authoring_side", "RIGHT")))
+            choices = [i for i, item in enumerate(project.angles) if str(item.side) == side]
+            index = min(choices or range(len(project.angles)), key=lambda i: abs(project.angles[i].angle))
+        else:
+            index = max(0, min(self.index, len(project.angles) - 1))
+        project.active_angle_index = index
+        project.active_angle_uuid = project.angles[index].uuid
+        project.active_side = project.angles[index].side
+        project.review_angle = (
+            -float(project.angles[index].angle)
+            if str(project.angles[index].side) == "LEFT"
+            else float(project.angles[index].angle)
+        )
+        project.seek_angle = project.angles[index].angle
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_angle_step(bpy.types.Operator):
+    bl_idname = "quicksdf.angle_step"
+    bl_label = "Step Quick SDF Angle"
+    bl_options = {"INTERNAL"}
+
+    step: IntProperty(name="Step", default=1)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or not project.angles:
+            return {"CANCELLED"}
+        current = runtime.active_angle(project)
+        side = str(getattr(current, "side", getattr(project, "active_side", "RIGHT")))
+        indices = [
+            index for index, item in enumerate(project.angles) if str(item.side) == side
+        ]
+        indices.sort(key=lambda index: float(project.angles[index].angle))
+        position = indices.index(int(project.active_angle_index)) if int(project.active_angle_index) in indices else 0
+        position = max(0, min(position + int(self.step), len(indices) - 1))
+        return bpy.ops.quicksdf.key_select(index=indices[position])
+
+
+def _sort_angle_items(project) -> None:
+    desired = [
+        item.uuid
+        for item in sorted(
+            project.angles,
+            key=lambda value: (
+                0 if str(value.side) == "RIGHT" else 1,
+                float(value.angle),
+            ),
+        )
+    ]
+    for target, uuid in enumerate(desired):
+        current = next(index for index, item in enumerate(project.angles) if item.uuid == uuid)
+        if current != target:
+            project.angles.move(current, target)
+
+
+def _select_angle_uuid(context, project, uuid: str) -> bool:
+    for index, item in enumerate(project.angles):
+        if str(item.uuid) != str(uuid):
+            continue
+        project.active_angle_index = index
+        project.active_angle_uuid = item.uuid
+        project.active_side = item.side
+        project.seek_angle = float(item.angle)
+        project.review_angle = float(item.angle) if item.side == "RIGHT" else -float(item.angle)
+        runtime.sync_canvas(context, project)
+        try:
+            from .timeline import tag_timeline_redraw
+
+            tag_timeline_redraw()
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+        return True
+    return False
+
+
+class QUICKSDF_OT_key_select(bpy.types.Operator):
+    bl_idname = "quicksdf.key_select"
+    bl_label = "Select Face Shadow Key"
+    bl_options = {"INTERNAL"}
+
+    uuid: StringProperty(name="Key UUID", default="")
+    index: IntProperty(name="Index", default=-1)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or not project.angles:
+            return {"CANCELLED"}
+        uuid = self.uuid
+        if not uuid and self.index >= 0:
+            uuid = project.angles[min(self.index, len(project.angles) - 1)].uuid
+        if not uuid:
+            uuid = min(project.angles, key=lambda item: abs(float(item.angle))).uuid
+        return {"FINISHED"} if _select_angle_uuid(context, project, uuid) else {"CANCELLED"}
+
+
+class QUICKSDF_OT_seek_set(bpy.types.Operator):
+    bl_idname = "quicksdf.seek_set"
+    bl_label = "Scrub Light Angle"
+    bl_options = {"INTERNAL"}
+
+    angle: FloatProperty(name="Angle", default=0.0, min=0.0, max=90.0)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        project.seek_angle = max(0.0, min(90.0, float(self.angle)))
+        sign = -1.0 if str(project.authoring_side) == "LEFT" else 1.0
+        project.review_angle = sign * project.seek_angle
+        # Scrubbing intentionally does not change the edit key or paint canvas.
+        try:
+            from .live_preview import update_seek_preview
+
+            update_seek_preview(project, project.seek_angle)
+        except (ImportError, ReferenceError, RuntimeError, ValueError):
+            # The seek rail remains usable even if a transient GPU/material ID
+            # disappears during an undo or workspace transition.
+            pass
+        try:
+            from .timeline import tag_timeline_redraw
+
+            tag_timeline_redraw()
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+        return {"FINISHED"}
+
+
+def _assign_angle_layers(project, item, display, base, coverage) -> None:
+    item.display_image = display
+    item.display_image_name = display.name
+    item.image = display
+    item.image_name = display.name
+    item.base_image = base
+    item.base_image_name = base.name
+    item.coverage_image = coverage
+    item.coverage_image_name = coverage.name
+
+
+class QUICKSDF_OT_key_add(bpy.types.Operator):
+    bl_idname = "quicksdf.key_add"
+    bl_label = "Add Angle Key"
+    bl_description = "Add a paint key at the seek angle and initialize it from the evaluated pose"
+    bl_options = {"REGISTER", "UNDO"}
+
+    angle: FloatProperty(name="Angle", default=-1.0, min=-1.0, max=90.0)
+    duplicate: BoolProperty(name="Duplicate Current", default=False)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        side = str(project.active_side or project.authoring_side)
+        angle = float(project.seek_angle if self.angle < 0.0 else self.angle)
+        angle = max(0.0, min(90.0, angle))
+        if any(str(item.side) == side and abs(float(item.angle) - angle) < 1.0e-4 for item in project.angles):
+            self.report({"ERROR"}, "An angle key already exists here")
+            return {"CANCELLED"}
+        source = runtime.active_angle(project)
+        item = project.angles.add()
+        item.uuid = runtime.new_uuid()
+        new_uuid = str(item.uuid)
+        item.angle = angle
+        item.side = side
+        layers = []
+        for role in (runtime.DISPLAY_ROLE, runtime.BASE_ROLE, runtime.COVERAGE_ROLE):
+            layers.append(
+                runtime.create_angle_layer_image(
+                    project.uuid, item.uuid, angle, int(project.resolution), role, side=side
+                )
+            )
+        _assign_angle_layers(project, item, *layers)
+        try:
+            if self.duplicate and source is not None:
+                for resolver, destination in zip(
+                    (runtime.resolve_display_image, runtime.resolve_base_image, runtime.resolve_coverage_image),
+                    layers,
+                ):
+                    source_image = resolver(project, source)
+                    if source_image is not None:
+                        runtime.copy_image_pixels(source_image, destination, grayscale=False)
+                item.is_manual = True
+            else:
+                _bake_project(context, project)
+            _sort_angle_items(project)
+            _select_angle_uuid(context, project, new_uuid)
+        except Exception as exc:
+            for image in layers:
+                if image.users == 0:
+                    bpy.data.images.remove(image)
+            index = next(
+                (index for index, value in enumerate(project.angles) if value.uuid == new_uuid),
+                -1,
+            )
+            if index >= 0:
+                project.angles.remove(index)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_key_move(bpy.types.Operator):
+    bl_idname = "quicksdf.key_move"
+    bl_label = "Move Angle Key"
+    bl_options = {"REGISTER", "UNDO"}
+
+    uuid: StringProperty(name="Key UUID", default="")
+    angle: FloatProperty(name="Angle", default=45.0, min=0.0, max=90.0)
+
+    def invoke(self, context, _event):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        item = next(
+            (value for value in project.angles if value.uuid == self.uuid),
+            runtime.active_angle(project),
+        )
+        if item is None:
+            return {"CANCELLED"}
+        self.uuid = str(item.uuid)
+        self.angle = float(item.angle)
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        item = next((value for value in project.angles if value.uuid == self.uuid), runtime.active_angle(project))
+        if item is None or abs(float(item.angle)) < 1.0e-5 or abs(float(item.angle) - 90.0) < 1.0e-5:
+            self.report({"ERROR"}, "The 0 and 90 degree endpoints are locked")
+            return {"CANCELLED"}
+        if any(
+            str(value.uuid) != str(item.uuid)
+            and str(value.side) == str(item.side)
+            and abs(float(value.angle) - self.angle) < 1.0e-4
+            for value in project.angles
+        ):
+            self.report({"ERROR"}, "An angle key already exists here")
+            return {"CANCELLED"}
+        uuid = item.uuid
+        item.angle = float(self.angle)
+        item.retimed = True
+        _sort_angle_items(project)
+        _select_angle_uuid(context, project, uuid)
+        project.dirty = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_key_delete(bpy.types.Operator):
+    bl_idname = "quicksdf.key_delete"
+    bl_label = "Delete Angle Key"
+    bl_options = {"REGISTER", "UNDO"}
+
+    uuid: StringProperty(name="Key UUID", default="")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        item = next((value for value in project.angles if value.uuid == self.uuid), runtime.active_angle(project))
+        if item is None or abs(float(item.angle)) < 1.0e-5 or abs(float(item.angle) - 90.0) < 1.0e-5:
+            self.report({"ERROR"}, "The 0 and 90 degree endpoints cannot be deleted")
+            return {"CANCELLED"}
+        index = next(index for index, value in enumerate(project.angles) if value.uuid == item.uuid)
+        images = (
+            runtime.resolve_display_image(project, item),
+            runtime.resolve_base_image(project, item),
+            runtime.resolve_coverage_image(project, item),
+        )
+        project.angles.remove(index)
+        for image in images:
+            if image is not None and image.get(runtime.PROJECT_UUID_KEY) == project.uuid:
+                bpy.data.images.remove(image)
+        replacement = project.angles[max(0, min(index - 1, len(project.angles) - 1))]
+        _select_angle_uuid(context, project, replacement.uuid)
+        project.dirty = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_sync_canvas(bpy.types.Operator):
+    bl_idname = "quicksdf.sync_canvas"
+    bl_label = "Activate Selected Angle"
+    bl_description = "Use the selected angle mask in Texture Paint and visible Image Editors"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        angle_item = runtime.active_angle(project)
+        if angle_item is not None:
+            project.review_angle = angle_item.angle
+        return {"FINISHED"} if runtime.sync_canvas(context, project) is not None else {"CANCELLED"}
+
+
+class QUICKSDF_OT_boundary_track_add(bpy.types.Operator):
+    bl_idname = "quicksdf.boundary_track_add"
+    bl_label = "Add Boundary Track"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        track = project.boundary_tracks.add()
+        track.uuid = runtime.new_uuid()
+        track.name = f"Boundary {len(project.boundary_tracks)}"
+        track.side = str(getattr(project, "active_side", "RIGHT"))
+        project.active_boundary_track_index = len(project.boundary_tracks) - 1
+        angle_item = runtime.active_angle(project)
+        if angle_item is not None:
+            key = track.keys.add()
+            key.uuid = runtime.new_uuid()
+            key.angle = angle_item.angle
+            key.angle_uuid = angle_item.uuid
+            key.side = angle_item.side
+            key.is_manual = True
+            track.active_key_index = 0
+        project.dirty = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_boundary_track_remove(bpy.types.Operator):
+    bl_idname = "quicksdf.boundary_track_remove"
+    bl_label = "Remove Boundary Track"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or not project.boundary_tracks:
+            return {"CANCELLED"}
+        index = max(0, min(project.active_boundary_track_index, len(project.boundary_tracks) - 1))
+        project.boundary_tracks.remove(index)
+        project.active_boundary_track_index = min(index, len(project.boundary_tracks) - 1)
+        try:
+            from .boundary import regenerate_boundary_images
+
+            regenerate_boundary_images(project)
+        except (RuntimeError, ValueError) as exc:
+            self.report({"WARNING"}, f"Track removed, but masks need regeneration: {exc}")
+        project.dirty = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_paint_value_toggle(bpy.types.Operator):
+    bl_idname = "quicksdf.paint_value_toggle"
+    bl_label = "Toggle Light / Shadow"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        project.paint_value = 1 - int(project.paint_value)
+        color = (1.0, 1.0, 1.0) if project.paint_value else (0.0, 0.0, 0.0)
+        brush = getattr(context.scene.tool_settings.image_paint, "brush", None)
+        if brush is not None:
+            try:
+                brush.color = color
+            except (AttributeError, TypeError):
+                pass
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_paint_value_set(bpy.types.Operator):
+    bl_idname = "quicksdf.paint_value_set"
+    bl_label = "Choose Light or Shadow"
+    bl_options = {"INTERNAL"}
+
+    value: IntProperty(name="Value", default=1, min=0, max=1)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        project.paint_value = int(self.value)
+        color = (1.0, 1.0, 1.0) if project.paint_value else (0.0, 0.0, 0.0)
+        brush = getattr(context.scene.tool_settings.image_paint, "brush", None)
+        if brush is not None:
+            try:
+                brush.color = color
+            except (AttributeError, TypeError):
+                pass
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_studio_display_mode(bpy.types.Operator):
+    bl_idname = "quicksdf.studio_display_mode"
+    bl_label = "Change Studio Display"
+    bl_options = {"INTERNAL"}
+
+    mode: StringProperty(name="Mode", default="OVERLAY")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or self.mode not in {"OVERLAY", "MASK", "TOON"}:
+            return {"CANCELLED"}
+        project.preview_mode = self.mode
+        item = runtime.active_angle(project)
+        image = runtime.resolve_display_image(project, item) if item is not None else None
+        try:
+            from .preview import set_preview_image
+
+            if image is not None:
+                set_preview_image(project, image)
+        except (RuntimeError, ValueError):
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_symmetry_choose(bpy.types.Operator):
+    bl_idname = "quicksdf.symmetry_choose"
+    bl_label = "Choose Mirror Layout"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: StringProperty(name="Layout", default="TEXTURE_MIRROR")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None or self.mode not in {"TEXTURE_MIRROR", "ISLAND_PAIR", "OVERLAPPED_UV"}:
+            return {"CANCELLED"}
+        project.symmetry_candidate = self.mode
+        project.symmetry_mode = self.mode
+        project.symmetry_requires_confirmation = False
+        project.mirror_enabled = True
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_break_mirror(bpy.types.Operator):
+    bl_idname = "quicksdf.break_mirror"
+    bl_label = "Break Mirror"
+    bl_description = "Create a separate opposite-side lane for asymmetric painting"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        import numpy as np
+
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        if not bool(project.mirror_enabled):
+            return {"FINISHED"}
+        source_side = str(project.authoring_side)
+        target_side = "LEFT" if source_side == "RIGHT" else "RIGHT"
+        if any(str(item.side) == target_side for item in project.angles):
+            project.mirror_enabled = False
+            project.symmetry_mode = "INDEPENDENT"
+            return {"FINISHED"}
+        mode_name = str(project.symmetry_mode)
+        if mode_name == "AUTO":
+            mode_name = str(project.symmetry_candidate)
+        mode_map = {
+            "TEXTURE_MIRROR": "TEXTURE_MIRROR",
+            "OVERLAPPED_UV": "OVERLAPPED",
+            "ISLAND_PAIR": "ISLAND_PAIR",
+        }
+        pairs = None
+        if mode_name == "ISLAND_PAIR":
+            sample = runtime.resolve_display_image(project, next(item for item in project.angles if str(item.side) == source_side))
+            pairs = _symmetry_island_pairs(project, (sample.size[1], sample.size[0]))
+        from .symmetry import mirror_side_layer
+
+        created_images = []
+        created_uuids = []
+        try:
+            for source in sorted(
+                (item for item in project.angles if str(item.side) == source_side),
+                key=lambda item: float(item.angle),
+            ):
+                target = project.angles.add()
+                target.uuid = runtime.new_uuid()
+                target.angle = float(source.angle)
+                target.side = target_side
+                created_uuids.append(target.uuid)
+                destinations = []
+                for role, resolver in (
+                    (runtime.DISPLAY_ROLE, runtime.resolve_display_image),
+                    (runtime.BASE_ROLE, runtime.resolve_base_image),
+                    (runtime.COVERAGE_ROLE, runtime.resolve_coverage_image),
+                ):
+                    source_image = resolver(project, source)
+                    destination = runtime.create_angle_layer_image(
+                        project.uuid,
+                        target.uuid,
+                        float(target.angle),
+                        int(project.resolution),
+                        role,
+                        side=target_side,
+                    )
+                    created_images.append(destination)
+                    rgba = runtime.image_rgba(source_image)
+                    mirrored = mirror_side_layer(
+                        rgba,
+                        mode_map.get(mode_name, "TEXTURE_MIRROR"),
+                        island_pairs=pairs,
+                    )
+                    runtime.write_image_rgba(destination, np.asarray(mirrored, dtype=np.float32))
+                    destinations.append(destination)
+                _assign_angle_layers(project, target, *destinations)
+            project.mirror_enabled = False
+            project.symmetry_mode = "INDEPENDENT"
+            _sort_angle_items(project)
+        except Exception as exc:
+            for uuid in reversed(created_uuids):
+                index = next((i for i, item in enumerate(project.angles) if item.uuid == uuid), -1)
+                if index >= 0:
+                    project.angles.remove(index)
+            for image in created_images:
+                if image.name in bpy.data.images:
+                    bpy.data.images.remove(image)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_mirror_toggle(bpy.types.Operator):
+    bl_idname = "quicksdf.mirror_toggle"
+    bl_label = "Toggle Mirror"
+    bl_description = "Link or separate the opposite face-light side"
+
+    def invoke(self, context, event):
+        project = _project(context)
+        if project is not None and bool(project.mirror_enabled):
+            # The main Studio control is a reassuring state indicator, not a
+            # destructive toggle. Asymmetry is entered explicitly via the
+            # Advanced "Break Mirror" action.
+            return {"FINISHED"}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        if bool(project.mirror_enabled):
+            return {"FINISHED"}
+        keep_side = str(project.authoring_side)
+        remove = [
+            index for index, item in enumerate(project.angles) if str(item.side) != keep_side
+        ]
+        for index in reversed(remove):
+            item = project.angles[index]
+            images = (
+                runtime.resolve_display_image(project, item),
+                runtime.resolve_base_image(project, item),
+                runtime.resolve_coverage_image(project, item),
+            )
+            project.angles.remove(index)
+            for image in images:
+                if image is not None and image.get(runtime.PROJECT_UUID_KEY) == project.uuid:
+                    bpy.data.images.remove(image)
+        project.mirror_enabled = True
+        project.symmetry_mode = str(project.symmetry_candidate or "TEXTURE_MIRROR")
+        _sort_angle_items(project)
+        if project.angles:
+            _select_angle_uuid(context, project, project.angles[0].uuid)
+        return {"FINISHED"}
+
+
+def _symmetry_island_pairs(project, shape):
+    import numpy as np
+
+    from .boundary import rasterize_closed_curve, uv_boundary_loops
+    from .symmetry import IslandPair
+
+    obj = project.target_object
+    uv_layer = obj.data.uv_layers.get(project.uv_map_name) if obj is not None else None
+    if uv_layer is None:
+        return []
+    faces = [
+        [tuple(uv_layer.data[index].uv) for index in polygon.loop_indices]
+        for polygon in obj.data.polygons
+        if polygon.material_index == int(project.material_slot_index)
+    ]
+    loops = uv_boundary_loops(faces)
+    height, width = shape
+    records = []
+    for loop in loops:
+        if len(loop) < 3:
+            continue
+        mask = np.asarray(rasterize_closed_curve(loop, width, height), dtype=np.bool_).reshape(height, width)
+        mask = np.flip(mask, axis=0).copy()
+        centroid = np.mean(np.asarray(loop, dtype=np.float64), axis=0)
+        records.append((loop, mask, centroid))
+    pairs = []
+    unused = set(range(len(records)))
+    while unused:
+        source_index = min(unused)
+        unused.remove(source_index)
+        source = records[source_index]
+        if not unused:
+            pairs.append(IslandPair(source[1], source[1]))
+            break
+        target_point = np.array((1.0 - source[2][0], source[2][1]))
+        target_index = min(unused, key=lambda i: float(np.linalg.norm(records[i][2] - target_point)))
+        unused.remove(target_index)
+        target = records[target_index]
+        # Both directions are included because a face layout may place either
+        # island on the source side of the positive-light authoring mask.
+        pairs.append(IslandPair(source[1], target[1]))
+        pairs.append(IslandPair(target[1], source[1]))
+    return pairs
+
+
+class QUICKSDF_OT_apply_symmetry(bpy.types.Operator):
+    bl_idname = "quicksdf.apply_symmetry"
+    bl_label = "Apply Symmetry"
+    bl_description = "Generate negative-angle base masks from positive-angle masks while preserving paint overrides"
+    bl_options = {"REGISTER", "UNDO"}
+
+    force: BoolProperty(name="Confirm Low Confidence", default=False, options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        project = _project(context)
+        if project is not None and project.symmetry_mode == "AUTO" and not self.force:
+            self.force = True
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
+
+    def execute(self, context):
+        import numpy as np
+
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        from .core import validate_monotonic
+        from .symmetry import SymmetryMode, analyze_symmetry, apply_symmetry_to_stack
+
+        mode_name = str(project.symmetry_mode)
+        if mode_name == "INDEPENDENT":
+            self.report({"INFO"}, "Independent mode does not generate mirrored masks")
+            return {"CANCELLED"}
+        mode_map = {
+            "OVERLAPPED_UV": SymmetryMode.OVERLAPPED,
+            "TEXTURE_MIRROR": SymmetryMode.TEXTURE_MIRROR,
+            "ISLAND_PAIR": SymmetryMode.ISLAND_PAIR,
+            "AUTO": SymmetryMode.AUTO,
+        }
+        try:
+            masks, angles = runtime.project_mask_stack(project)
+            pairs = _symmetry_island_pairs(project, masks.shape[1:]) if mode_name in {"ISLAND_PAIR", "AUTO"} else []
+            if mode_name == "AUTO":
+                positive = np.logical_or.reduce(masks[angles > 0.0])
+                negative = np.logical_or.reduce(masks[angles < 0.0])
+                analysis = analyze_symmetry(positive, negative)
+                project.symmetry_confidence = analysis.confidence
+                if analysis.requires_confirmation and not self.force:
+                    project.warning_message = (
+                        f"Auto symmetry confidence is {analysis.confidence:.0%}; review the generated side."
+                    )
+                    raise ValueError(project.warning_message)
+            generated = apply_symmetry_to_stack(
+                masks, angles, mode_map[mode_name], island_pairs=pairs or None
+            )
+            staged = []
+            final_masks = masks.copy()
+            for index, angle in enumerate(angles):
+                if angle >= 0.0:
+                    continue
+                image = runtime.resolve_angle_image(project, project.angles[index])
+                rgba = runtime.image_rgba(image)
+                generated_region = rgba[..., 3] <= 0.5
+                values = generated[index].astype(np.float32)
+                for channel in range(3):
+                    rgba[..., channel][generated_region] = values[generated_region]
+                final_masks[index] = rgba[..., 0] >= 0.5
+                staged.append((index, image, rgba))
+            report = validate_monotonic(final_masks, angles)
+            project.has_violations = not report.is_valid
+            if not report.is_valid:
+                raise ValueError(
+                    f"Mirrored result has {report.violation_pixel_count} monotonic violation pixels"
+                )
+            for index, image, rgba in staged:
+                image.pixels.foreach_set(np.flip(rgba, axis=0).ravel())
+                image.update()
+                project.angles[index].is_generated = True
+                project.angles[index].dirty = True
+            project.dirty = True
+            runtime.sync_canvas(context, project)
+        except (RuntimeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Applied {mode_name.replace('_', ' ').title()} symmetry")
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_clear_overrides(bpy.types.Operator):
+    bl_idname = "quicksdf.clear_overrides"
+    bl_label = "Clear Paint Overrides"
+    bl_description = "Clear alpha override flags for the configured angle range"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        import numpy as np
+
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        from .core import range_target_indices
+
+        values = [item.angle for item in project.angles]
+        indices = range_target_indices(values, project.active_angle_index, project.apply_target)
+        snapshots = {}
+        if project.boundary_tracks:
+            for angle_item in project.angles:
+                image = runtime.resolve_angle_image(project, angle_item)
+                if image is not None:
+                    snapshots[image.name] = runtime.image_rgba(image)
+        for index in indices:
+            image = runtime.resolve_angle_image(project, project.angles[int(index)])
+            if image is not None:
+                runtime.clear_image_alpha(image)
+        try:
+            from .boundary import regenerate_boundary_images
+
+            regenerate_boundary_images(project)
+        except (RuntimeError, ValueError) as exc:
+            for image_name, rgba in snapshots.items():
+                image = bpy.data.images.get(image_name)
+                if image is not None:
+                    region = np.ones(rgba.shape[:2], dtype=np.bool_)
+                    runtime.restore_image_region(image, rgba, region)
+            self.report({"ERROR"}, f"Could not clear overrides: {exc}")
+            return {"CANCELLED"}
+        project.dirty = True
+        return {"FINISHED"}
+
+
+def _gradient_footprint(footprint, ratio: float, falloff: float):
+    """Contract a stroke footprint by its exact interior distance."""
+    import numpy as np
+
+    if ratio <= 0.0 or not np.any(footprint):
+        return footprint.copy()
+    from .core import exact_signed_edt
+
+    area = float(np.count_nonzero(footprint))
+    equivalent_radius = max(1.0, (area / np.pi) ** 0.5)
+    erosion = equivalent_radius * min(0.98, ratio * max(0.01, float(falloff)))
+    signed = exact_signed_edt(footprint)
+    return footprint & ((-signed) >= erosion)
+
+
+def _resolve_selected_monotonic(candidate, angles, selected):
+    """Resolve violations when the native stroke already invalidated baseline.
+
+    Only selected angle images may change.  A closer light pixel is propagated
+    outward when possible; otherwise the closer proposed pixel is clipped.
+    """
+    import numpy as np
+
+    result = candidate.copy()
+    selected_set = {int(index) for index in selected}
+    angle_values = np.asarray(angles, dtype=np.float64)
+    clipped = np.zeros_like(result, dtype=np.bool_)
+    repairs = np.zeros_like(result, dtype=np.bool_)
+    for _pass in range(result.shape[0] * 2):
+        changed = False
+        for sign in (-1, 1):
+            indices = np.flatnonzero((angle_values * sign > 0.0) | np.isclose(angle_values, 0.0))
+            indices = indices[np.argsort(np.abs(angle_values[indices]), kind="stable")]
+            for closer, farther in zip(indices[:-1], indices[1:]):
+                invalid = result[closer] & ~result[farther]
+                if not np.any(invalid):
+                    continue
+                if int(farther) in selected_set:
+                    result[farther][invalid] = True
+                    repairs[farther] |= invalid
+                    changed = True
+                elif int(closer) in selected_set:
+                    result[closer][invalid] = False
+                    clipped[closer] |= invalid
+                    changed = True
+        if not changed:
+            break
+    return result, clipped, repairs
+
+
+class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
+    bl_idname = "quicksdf.propagate_overrides"
+    bl_label = "Apply Smart Paint"
+    bl_description = "Keep the face-shadow keys consistent after one native paint stroke"
+    bl_options = {"INTERNAL"}
+
+    invert: BoolProperty(name="Invert Stroke", default=False, options={"HIDDEN"})
+
+    def execute(self, context):
+        import numpy as np
+
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        active_item = runtime.active_angle(project)
+        source_image = runtime.resolve_display_image(project, active_item)
+        if source_image is None:
+            self.report({"ERROR"}, "The active angle image is missing")
+            return {"CANCELLED"}
+        source_rgba = runtime.image_rgba(source_image)
+        snapshot = runtime.consume_paint_snapshot(project)
+        if snapshot is None or snapshot.shape != source_rgba.shape:
+            return {"CANCELLED"}
+        footprint = np.any(
+            np.abs(source_rgba[..., :3] - snapshot[..., :3]) > (0.5 / 255.0), axis=2
+        )
+        if not np.any(footprint):
+            return {"CANCELLED"}
+        try:
+            from .smart_paint import apply_smart_stroke
+
+            side = str(active_item.side)
+            items = sorted(
+                (item for item in project.angles if str(item.side) == side),
+                key=lambda item: float(item.angle),
+            )
+            active_index = next(index for index, item in enumerate(items) if item.uuid == active_item.uuid)
+            angles = np.asarray([float(item.angle) for item in items], dtype=np.float64)
+            masks = np.stack(
+                [
+                    (snapshot[..., 0] >= 0.5)
+                    if item.uuid == active_item.uuid
+                    else runtime.image_mask(runtime.resolve_display_image(project, item))
+                    for item in items
+                ],
+                axis=0,
+            )
+            coverage = np.stack(
+                [runtime.coverage_mask(runtime.resolve_coverage_image(project, item)) for item in items],
+                axis=0,
+            )
+            paint_light = bool(int(project.paint_value))
+            if self.invert:
+                paint_light = not paint_light
+            result = apply_smart_stroke(
+                masks,
+                coverage,
+                angles,
+                active_index,
+                footprint,
+                paint_light=paint_light,
+            )
+            before_history: dict[str, np.ndarray] = {}
+            for index in result.affected_indices:
+                item = items[index]
+                display = runtime.resolve_display_image(project, item)
+                coverage_image = runtime.resolve_coverage_image(project, item)
+                before_history[display.name] = snapshot.copy() if item.uuid == active_item.uuid else runtime.image_rgba(display)
+                before_history[coverage_image.name] = runtime.image_rgba(coverage_image)
+                runtime.write_mask_overrides(
+                    display,
+                    result.masks[index],
+                    footprint,
+                    coverage_image=coverage_image,
+                )
+                if item.uuid == active_item.uuid:
+                    antialiased = runtime.image_rgba(display)
+                    antialiased[..., :3][footprint] = source_rgba[..., :3][footprint]
+                    runtime.write_image_rgba(display, antialiased)
+                item.is_manual = True
+                item.dirty = True
+            after_history = {
+                name: runtime.image_rgba(bpy.data.images[name]) for name in before_history
+            }
+            history = _HISTORIES.setdefault(str(project.uuid), History())
+            history.push("Smart Paint", before_history, after_history)
+            try:
+                from .live_preview import invalidate
+
+                invalidate(str(project.uuid))
+            except ImportError:
+                pass
+            project.first_stroke_complete = True
+            try:
+                from .studio import dismiss_first_stroke_hint
+
+                dismiss_first_stroke_hint()
+            except (ImportError, RuntimeError):
+                pass
+            project.has_violations = False
+            project.dirty = True
+        except (RuntimeError, ValueError) as exc:
+            runtime.write_image_rgba(source_image, snapshot)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
+    bl_idname = "quicksdf.paint_snapshot"
+    bl_label = "Capture Quick SDF Paint Snapshot"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        if bool(getattr(project, "onion_enabled", False)):
+            project.onion_enabled = False
+            runtime.sync_canvas(context, project)
+        try:
+            runtime.capture_paint_snapshot(project)
+        except (RuntimeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class _QuickSDFPaintMacroMixin:
+    @classmethod
+    def poll(cls, context):
+        project = runtime.active_project(getattr(context, "scene", None))
+        if project is None:
+            return False
+        try:
+            from .studio import is_studio_active
+
+            active = is_studio_active(context, str(project.uuid))
+        except (ImportError, ReferenceError, RuntimeError):
+            active = False
+        editor_paint = getattr(context, "mode", "") == "PAINT_TEXTURE" or (
+            getattr(getattr(context, "area", None), "type", "") == "IMAGE_EDITOR"
+            and getattr(getattr(context, "space_data", None), "mode", "") == "PAINT"
+        )
+        return bool(active and editor_paint and getattr(project, "author_tool", "PAINT") == "PAINT")
+
+
+class QUICKSDF_OT_range_paint(_QuickSDFPaintMacroMixin, bpy.types.Macro):
+    bl_idname = "quicksdf.range_paint"
+    bl_label = "Quick SDF Range Paint"
+    bl_description = "Paint with Blender's native brush, then propagate this angle's overrides"
+    bl_options = {"UNDO", "INTERNAL"}
+
+
+class QUICKSDF_OT_range_paint_invert(_QuickSDFPaintMacroMixin, bpy.types.Macro):
+    bl_idname = "quicksdf.range_paint_invert"
+    bl_label = "Quick SDF Inverted Range Paint"
+    bl_description = "Temporarily invert the native paint action, then propagate overrides"
+    bl_options = {"UNDO", "INTERNAL"}
+
+
+def register_macros() -> None:
+    """Build paint macros after all component operators have been registered."""
+    QUICKSDF_OT_range_paint.define("QUICKSDF_OT_paint_snapshot")
+    normal = QUICKSDF_OT_range_paint.define("PAINT_OT_image_paint")
+    normal.properties.mode = "NORMAL"
+    QUICKSDF_OT_range_paint.define("QUICKSDF_OT_propagate_overrides")
+    QUICKSDF_OT_range_paint_invert.define("QUICKSDF_OT_paint_snapshot")
+    inverted = QUICKSDF_OT_range_paint_invert.define("PAINT_OT_image_paint")
+    inverted.properties.mode = "INVERT"
+    propagated = QUICKSDF_OT_range_paint_invert.define("QUICKSDF_OT_propagate_overrides")
+    propagated.properties.invert = True
+
+
+def _history_images(project) -> dict[str, object]:
+    result = {}
+    for item in project.angles:
+        for resolver in (runtime.resolve_display_image, runtime.resolve_coverage_image):
+            image = resolver(project, item)
+            if image is not None:
+                result[image.name] = runtime.image_rgba(image)
+    return result
+
+
+class QUICKSDF_OT_history_undo(bpy.types.Operator):
+    bl_idname = "quicksdf.history_undo"
+    bl_label = "Undo Quick SDF Stroke"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        project = runtime.active_project(getattr(context, "scene", None))
+        history = _HISTORIES.get(str(getattr(project, "uuid", "")))
+        return bool(history and history.can_undo)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        history = _HISTORIES.get(str(project.uuid))
+        try:
+            restored = history.undo(_history_images(project))
+            for name, rgba in restored.items():
+                image = bpy.data.images.get(name)
+                if image is not None:
+                    runtime.write_image_rgba(image, rgba)
+            runtime.sync_canvas(context, project)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_history_redo(bpy.types.Operator):
+    bl_idname = "quicksdf.history_redo"
+    bl_label = "Redo Quick SDF Stroke"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        project = runtime.active_project(getattr(context, "scene", None))
+        history = _HISTORIES.get(str(getattr(project, "uuid", "")))
+        return bool(history and history.can_redo)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        history = _HISTORIES.get(str(project.uuid))
+        try:
+            restored = history.redo(_history_images(project))
+            for name, rgba in restored.items():
+                image = bpy.data.images.get(name)
+                if image is not None:
+                    runtime.write_image_rgba(image, rgba)
+            runtime.sync_canvas(context, project)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_validate(bpy.types.Operator):
+    bl_idname = "quicksdf.validate"
+    bl_label = "Validate Quick SDF"
+    bl_description = "Validate project inputs and monotonic angle transitions"
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            errors, warnings, report = runtime.validate_project(project, include_monotonic=True)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        if errors:
+            self.report({"WARNING"}, errors[-1])
+        elif warnings:
+            self.report({"WARNING"}, warnings[0])
+        else:
+            self.report({"INFO"}, "Face-shadow keys are ready to export")
+        return {"FINISHED"}
+
+
+def _prepare_threshold_inputs(project):
+    """Copy every bpy-backed mask before work moves to a native worker."""
+
+    from .core import validate_side_monotonic
+
+    errors, _warnings, _report = runtime.validate_project(project, include_monotonic=False)
+    if errors:
+        raise ValueError(errors[0])
+    pairs = None
+    mirror_mode = str(getattr(project, "symmetry_mode", "AUTO"))
+    if mirror_mode == "AUTO":
+        mirror_mode = str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR"))
+    if bool(getattr(project, "mirror_enabled", True)) and mirror_mode == "ISLAND_PAIR":
+        sample_item = next(iter(project.angles), None)
+        sample = runtime.resolve_display_image(project, sample_item) if sample_item is not None else None
+        if sample is not None:
+            pairs = _symmetry_island_pairs(project, (sample.size[1], sample.size[0]))
+    right, right_angles, left, left_angles = runtime.project_side_stacks(
+        project, island_pairs=pairs
+    )
+    reports = (
+        validate_side_monotonic(right, right_angles),
+        validate_side_monotonic(left, left_angles),
+    )
+    project.has_violations = any(not report.is_valid for report in reports)
+    if project.has_violations:
+        count = sum(report.violation_pixel_count for report in reports)
+        raise ValueError(f"Some imported pixels change in the wrong direction ({count} pixels)")
+    return right, right_angles, left, left_angles
+
+
+def _compute_threshold_rgba(inputs):
+    """Blender-free worker entry point; ctypes releases the GIL in native EDT."""
+
+    import numpy as np
+
+    from .core import generate_threshold_pair
+
+    right, right_angles, left, left_angles = inputs
+    try:
+        from . import native
+
+        if native.available() and native.version() >= 2:
+            channels = native.generate_threshold_pair(
+                right, right_angles, left, left_angles
+            )
+            rgba = np.zeros((*channels.shape[:2], 4), dtype=np.uint16)
+            rgba[..., :2] = channels
+            rgba[..., 3] = np.uint16(65535)
+            return rgba
+    except (ImportError, OSError, AttributeError):
+        pass
+    return generate_threshold_pair(
+        right, right_angles, left, left_angles, validate=False
+    )
+
+
+def _project_by_uuid(uuid: str):
+    for scene in bpy.data.scenes:
+        for project in getattr(scene, "quick_sdf_projects", ()):
+            if str(project.uuid) == str(uuid):
+                return project
+    return None
+
+
+def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) -> None:
+    global _EXPORT_JOB
+    job = _EXPORT_JOB
+    _EXPORT_JOB = None
+    if job is None:
+        return
+    manager = job.get("manager")
+    if manager is not None:
+        manager.shutdown(wait=wait)
+    project = _project_by_uuid(str(job.get("project_uuid", "")))
+    if project is not None:
+        project.job_running = False
+        project.job_progress = 0.0 if error else 1.0
+        project.job_message = message
+        if error:
+            project.diagnostic_message = message
+    # Release executor/thread objects before Blender can immediately close or
+    # disable the extension on the following UI event.
+    job.clear()
+    manager = None
+    import gc
+
+    gc.collect()
+
+
+def _poll_export_job() -> float | None:
+    job = _EXPORT_JOB
+    if job is None:
+        return None
+    if "settled_message" in job:
+        _finish_export_job(str(job["settled_message"]))
+        return None
+    from .jobs import JobState
+
+    manager = job["manager"]
+    project = _project_by_uuid(str(job["project_uuid"]))
+    if project is None:
+        manager.cancel()
+        _finish_export_job(
+            "Export cancelled because the project was removed", error=True, wait=False
+        )
+        return None
+    state = manager.poll()
+    if state in {JobState.PENDING, JobState.RUNNING}:
+        project.job_progress = min(0.92, float(project.job_progress) + 0.015)
+        project.job_message = "Generating face shadow texture…"
+        return 0.1
+    try:
+        rgba = manager.take_result()
+        project.job_progress = 0.95
+        runtime.update_threshold_preview(project, rgba)
+        from .png16 import write_png_rgba16
+
+        written = write_png_rgba16(
+            job["path"], rgba, overwrite=bool(job["overwrite"])
+        )
+        project.output_path = str(written)
+        project.dirty = False
+        project.validation_message = "Generated"
+    except Exception as exc:
+        _finish_export_job(f"Export failed: {exc}", error=True)
+        return None
+    # End and collect the worker before publishing completion. Blender's image
+    # and GPU caches then receive one event-loop interval before an immediate
+    # Exit/Save/quit can tear down the Studio.
+    manager.shutdown(wait=True)
+    job["manager"] = None
+    job["settled_message"] = f"Exported {written}"
+    project.job_progress = 1.0
+    project.job_message = "Finalizing export…"
+    import gc
+
+    gc.collect()
+    return 0.5
+
+
+def _start_export_job(project, inputs, path: Path, overwrite: bool) -> None:
+    global _EXPORT_JOB
+    if _EXPORT_JOB is not None:
+        raise RuntimeError("Another Quick SDF export is already running")
+    from .jobs import GenerationJobManager
+
+    manager = GenerationJobManager()
+    manager.submit(_compute_threshold_rgba, inputs)
+    _EXPORT_JOB = {
+        "manager": manager,
+        "project_uuid": str(project.uuid),
+        "path": Path(path),
+        "overwrite": bool(overwrite),
+    }
+    project.job_running = True
+    project.job_progress = 0.01
+    project.job_message = "Generating face shadow texture…"
+    if not bpy.app.timers.is_registered(_poll_export_job):
+        bpy.app.timers.register(_poll_export_job, first_interval=0.05)
+
+
+def shutdown_export_job(
+    project_uuid: str = "", *, message: str = "Export cancelled", wait: bool = True
+) -> bool:
+    global _EXPORT_JOB
+    job = _EXPORT_JOB
+    if job is None or (project_uuid and str(job.get("project_uuid", "")) != str(project_uuid)):
+        return False
+    manager = job.get("manager")
+    if manager is not None:
+        manager.cancel()
+    _finish_export_job(message, error=True, wait=wait)
+    if bpy.app.timers.is_registered(_poll_export_job):
+        bpy.app.timers.unregister(_poll_export_job)
+    return True
+
+
+def _generate(project, context):
+    inputs = _prepare_threshold_inputs(project)
+    window_manager = context.window_manager
+    window_manager.progress_begin(0, 2)
+    try:
+        window_manager.progress_update(1)
+        rgba = _compute_threshold_rgba(inputs)
+        runtime.update_threshold_preview(project, rgba)
+        window_manager.progress_update(2)
+    finally:
+        window_manager.progress_end()
+    project.dirty = False
+    project.validation_message = "Generated"
+    return rgba
+
+
+class QUICKSDF_OT_generate(bpy.types.Operator):
+    bl_idname = "quicksdf.generate"
+    bl_label = "Generate Threshold Texture"
+    bl_description = "Generate the 16-bit R/G light-angle threshold image"
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            _generate(project, context)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Threshold texture generated")
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_export_texture(bpy.types.Operator):
+    bl_idname = "quicksdf.export_texture"
+    bl_label = "Export Face Shadow Texture"
+    bl_description = "Check, generate, and save the finished 16-bit face-shadow PNG"
+
+    filepath: StringProperty(name="File Path", subtype="FILE_PATH", default="")
+    overwrite: BoolProperty(name="Overwrite", default=False)
+    confirmed: BoolProperty(name="Confirmed", default=False, options={"HIDDEN", "SKIP_SAVE"})
+    check_existing: BoolProperty(name="Check Existing", default=True, options={"HIDDEN", "SKIP_SAVE"})
+    from_file_selector: BoolProperty(
+        name="Chosen in File Browser", default=False, options={"HIDDEN", "SKIP_SAVE"}
+    )
+
+    def invoke(self, context, event):
+        project = _project(context)
+        if project is None:
+            return {"CANCELLED"}
+        saved = str(getattr(project, "output_path", ""))
+        if saved:
+            self.filepath = saved
+            path = Path(bpy.path.abspath(saved))
+            if path.exists() and not self.overwrite:
+                self.confirmed = True
+                return context.window_manager.invoke_confirm(self, event)
+            return self.execute(context)
+        self.filepath = f"{project.name.replace(' ', '_')}_FaceShadow.png"
+        self.from_file_selector = True
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        path_text = self.filepath or project.output_path
+        if not path_text:
+            self.report({"ERROR"}, "Choose an output PNG path")
+            return {"CANCELLED"}
+        path = Path(bpy.path.abspath(path_text))
+        if path.suffix.lower() != ".png":
+            path = path.with_suffix(".png")
+        # Blender's file browser performs its own existing-file confirmation.
+        # Once it returns to execute, that explicit confirmation is sufficient;
+        # script calls still need overwrite=True.
+        allow_overwrite = bool(
+            self.overwrite or self.confirmed or self.from_file_selector or project.overwrite
+        )
+        if path.exists() and not allow_overwrite:
+            self.report({"ERROR"}, f"File already exists: {path}")
+            return {"CANCELLED"}
+        if not bpy.app.background and getattr(context, "window", None) is not None:
+            try:
+                inputs = _prepare_threshold_inputs(project)
+                _start_export_job(project, inputs, path, allow_overwrite)
+                self.report({"INFO"}, "Generating face shadow texture")
+                return {"FINISHED"}
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+        from .png16 import write_png_rgba16
+
+        try:
+            rgba = _generate(project, context)
+            written = write_png_rgba16(path, rgba, overwrite=allow_overwrite)
+        except (FileExistsError, OSError, ValueError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        project.output_path = str(written)
+        self.report({"INFO"}, f"Exported {written}")
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_cancel_job(bpy.types.Operator):
+    bl_idname = "quicksdf.cancel_job"
+    bl_label = "Cancel"
+    bl_description = "Cancel the running Quick SDF generation"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        project = runtime.active_project(getattr(context, "scene", None))
+        return bool(project is not None and getattr(project, "job_running", False))
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        return (
+            {"FINISHED"}
+            if shutdown_export_job(
+                str(project.uuid), message="Export cancelled", wait=False
+            )
+            else {"CANCELLED"}
+        )
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+
+def _write_mask_png(path: Path, mask, overwrite: bool) -> None:
+    import numpy as np
+
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"File already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.asarray(mask, dtype=np.uint8) * np.uint8(255)
+    height, width = data.shape
+    scanlines = b"".join(b"\0" + data[row].tobytes() for row in range(height))
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(scanlines, 6))
+    png += _png_chunk(b"IEND", b"")
+    temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        temporary.write_bytes(png)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+class QUICKSDF_OT_export_mask_sequence(bpy.types.Operator):
+    bl_idname = "quicksdf.export_mask_sequence"
+    bl_label = "Export Review Masks"
+    bl_description = "Export the 13 binary authoring masks as 8-bit grayscale PNG files"
+
+    directory: StringProperty(name="Directory", subtype="DIR_PATH", default="")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        directory_text = self.directory or context.scene.quick_sdf_settings.mask_sequence_directory
+        directory = Path(bpy.path.abspath(directory_text))
+        try:
+            masks, angles = runtime.project_mask_stack(project)
+            for mask, angle in zip(masks, angles):
+                sign = "p" if angle >= 0 else "m"
+                filename = f"mask_{sign}{abs(int(round(float(angle)))):03d}.png"
+                _write_mask_png(directory / filename, mask, bool(project.overwrite))
+        except (FileExistsError, OSError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Exported {len(project.angles)} review masks")
+        return {"FINISHED"}
+
+
+CLASSES = (
+    QUICKSDF_OT_project_create,
+    QUICKSDF_OT_project_remove,
+    QUICKSDF_OT_project_delete,
+    QUICKSDF_OT_set_forward_from_view,
+    QUICKSDF_OT_author_start,
+    QUICKSDF_OT_author_stop,
+    QUICKSDF_OT_create_and_edit,
+    QUICKSDF_OT_studio_enter,
+    QUICKSDF_OT_studio_exit,
+    QUICKSDF_OT_bake_base,
+    QUICKSDF_OT_create_workspace,
+    QUICKSDF_OT_angle_set,
+    QUICKSDF_OT_angle_step,
+    QUICKSDF_OT_key_select,
+    QUICKSDF_OT_seek_set,
+    QUICKSDF_OT_key_add,
+    QUICKSDF_OT_key_move,
+    QUICKSDF_OT_key_delete,
+    QUICKSDF_OT_sync_canvas,
+    QUICKSDF_OT_boundary_track_add,
+    QUICKSDF_OT_boundary_track_remove,
+    QUICKSDF_OT_paint_value_toggle,
+    QUICKSDF_OT_paint_value_set,
+    QUICKSDF_OT_studio_display_mode,
+    QUICKSDF_OT_symmetry_choose,
+    QUICKSDF_OT_break_mirror,
+    QUICKSDF_OT_mirror_toggle,
+    QUICKSDF_OT_apply_symmetry,
+    QUICKSDF_OT_clear_overrides,
+    QUICKSDF_OT_propagate_overrides,
+    QUICKSDF_OT_paint_snapshot,
+    QUICKSDF_OT_range_paint,
+    QUICKSDF_OT_range_paint_invert,
+    QUICKSDF_OT_history_undo,
+    QUICKSDF_OT_history_redo,
+    QUICKSDF_OT_validate,
+    QUICKSDF_OT_generate,
+    QUICKSDF_OT_export_texture,
+    QUICKSDF_OT_cancel_job,
+    QUICKSDF_OT_export_mask_sequence,
+)
