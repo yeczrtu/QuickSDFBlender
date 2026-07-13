@@ -1652,7 +1652,11 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                             runtime.write_image_rgba8(image, rgba)
                         except Exception:
                             pass
-            else:
+            # Collection can fail after earlier angle images were captured but
+            # before the active canvas was added. Restore that native stroke as
+            # well; a CANCELLED compatibility operation must never leave paint
+            # behind merely because ``before_history`` is partially populated.
+            if source_image.name not in before_history:
                 try:
                     runtime.write_image_rgba(source_image, snapshot)
                 except Exception:

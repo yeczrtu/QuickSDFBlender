@@ -340,6 +340,53 @@ def run(output_directory: Path) -> None:
     _expect_finished(bpy.ops.quicksdf.history_undo(), "history_undo")
     _expect_finished(bpy.ops.quicksdf.history_redo(), "history_redo")
 
+    print("[Quick SDF smoke] roll back a partial legacy Smart Paint collection")
+    # Reproduce a compatibility-path failure after an earlier key has already
+    # populated ``before_history`` but before the active (90 degree) canvas is
+    # captured. A cancelled propagation must still remove the native stroke.
+    _expect_finished(bpy.ops.quicksdf.key_select(index=6), "key_select legacy rollback")
+    legacy_source = runtime.resolve_display_image(project, project.angles[6])
+    fail_display = runtime.resolve_display_image(project, project.angles[1])
+    assert legacy_source is not None and fail_display is not None
+    legacy_original = runtime.image_rgba(legacy_source)
+    legacy_region = np.zeros(runtime.image_mask(legacy_source).shape, dtype=np.bool_)
+    legacy_region[200:202, 200:202] = True
+    legacy_light = runtime.image_rgba(legacy_source)
+    legacy_light[..., :3][legacy_region] = 1.0
+    legacy_light[..., 3] = 1.0
+    runtime.write_image_rgba(legacy_source, legacy_light)
+    runtime.capture_paint_snapshot(project)
+    legacy_snapshot = runtime.image_rgba(legacy_source)
+    legacy_shadow = legacy_snapshot.copy()
+    legacy_shadow[..., :3][legacy_region] = 0.0
+    runtime.write_image_rgba(legacy_source, legacy_shadow)
+    assert np.any(runtime.image_rgba(legacy_source) != legacy_snapshot)
+
+    original_image_rgba8 = runtime.image_rgba8
+    failure_injected = False
+
+    def fail_before_active_collection(image):
+        nonlocal failure_injected
+        if image == fail_display:
+            failure_injected = True
+            raise RuntimeError("simulated legacy pre-active collection failure")
+        return original_image_rgba8(image)
+
+    runtime.image_rgba8 = fail_before_active_collection
+    try:
+        try:
+            failed_legacy_result = bpy.ops.quicksdf.propagate_overrides()
+        except RuntimeError as exc:
+            assert "simulated legacy pre-active collection failure" in str(exc)
+        else:
+            assert failed_legacy_result == {"CANCELLED"}, failed_legacy_result
+    finally:
+        runtime.image_rgba8 = original_image_rgba8
+    assert failure_injected
+    assert not runtime.has_paint_snapshot(project)
+    np.testing.assert_array_equal(runtime.image_rgba(legacy_source), legacy_snapshot)
+    runtime.write_image_rgba(legacy_source, legacy_original)
+
     print("[Quick SDF smoke] rebake guide preserves painted RGB and coverage")
     painted_before = {
         item.uuid: (
