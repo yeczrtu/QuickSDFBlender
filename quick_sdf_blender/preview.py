@@ -167,9 +167,17 @@ if bpy is not None:
         nodes = material.node_tree.nodes
         links = material.node_tree.links
 
-        output = next((node for node in nodes if node.bl_idname == "ShaderNodeOutputMaterial"), None)
+        material_outputs = tuple(
+            node for node in nodes if node.bl_idname == "ShaderNodeOutputMaterial"
+        )
+        output = next(
+            (node for node in material_outputs if bool(getattr(node, "is_active_output", False))),
+            material_outputs[0] if material_outputs else None,
+        )
         if output is None:
             output = nodes.new("ShaderNodeOutputMaterial")
+        if hasattr(output, "is_active_output"):
+            output.is_active_output = True
         output.name = "QSDF Material Output"
         output.location = (680, 0)
         group_node = nodes.get("QSDF Preview") or nodes.new("ShaderNodeGroup")

@@ -37,14 +37,23 @@ def _set_active_object(context: bpy.types.Context, obj: bpy.types.Object) -> Non
         obj.select_set(True)
 
 
-def _project_for_object(scene: bpy.types.Scene, obj: bpy.types.Object | None):
+def _project_entry_for_object(
+    scene: bpy.types.Scene,
+    obj: bpy.types.Object | None,
+) -> tuple[int, object] | tuple[None, None]:
     if obj is None:
-        return None
+        return None, None
     for index, project in enumerate(getattr(scene, "quick_sdf_projects", ())):
         if project.target_object == obj:
-            scene.quick_sdf_active_project_index = index
-            return project
-    return None
+            return index, project
+    return None, None
+
+
+def _project_for_object(scene: bpy.types.Scene, obj: bpy.types.Object | None):
+    """Pure lookup; Studio commits the active index only after preflight."""
+
+    _index, project = _project_entry_for_object(scene, obj)
+    return project
 
 
 def _axis_vector(name: str):
@@ -235,7 +244,7 @@ def _bake_project(context, project) -> None:
         runtime.end_base_bake(str(project.uuid))
 
 
-def _create_project_data(context):
+def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True):
     obj = context.active_object
     if obj is None or obj.type != "MESH":
         raise ValueError("Select a mesh object first")
@@ -250,7 +259,9 @@ def _create_project_data(context):
     if not obj.material_slots:
         created_material = bpy.data.materials.new(f"{obj.name} Quick SDF")
         obj.data.materials.append(created_material)
+    previous_index = int(getattr(context.scene, "quick_sdf_active_project_index", -1))
     project = context.scene.quick_sdf_projects.add()
+    created_index = len(context.scene.quick_sdf_projects) - 1
     project.uuid = runtime.new_uuid()
     project.name = f"{obj.name} Face Shadow"
     project.target_object = obj
@@ -268,7 +279,6 @@ def _create_project_data(context):
     }.get(str(settings.initialization), "NORMAL_GUIDE")
     project.guide_version = 1 if project.base_source == "NORMAL_GUIDE" else 0
     project.guide_shadow_amount = 50.0
-    context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
     try:
         source = settings.source_image if settings.initialization == "EXISTING" else None
         runtime.create_project_images(project, source)
@@ -278,13 +288,29 @@ def _create_project_data(context):
         if errors:
             raise ValueError("\n".join(errors))
         project.warning_message = "\n".join(warnings)
-        runtime.sync_canvas(context, project)
+        if activate:
+            context.scene.quick_sdf_active_project_index = created_index
+        if sync_ui:
+            runtime.sync_canvas(context, project)
         return project
     except Exception:
         runtime.remove_project_images(project)
-        index = int(context.scene.quick_sdf_active_project_index)
-        context.scene.quick_sdf_projects.remove(index)
-        context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
+        remove_index = next(
+            (
+                index
+                for index, candidate in enumerate(context.scene.quick_sdf_projects)
+                if str(getattr(candidate, "uuid", "")) == str(getattr(project, "uuid", ""))
+            ),
+            None,
+        )
+        if remove_index is not None:
+            context.scene.quick_sdf_projects.remove(remove_index)
+        if context.scene.quick_sdf_projects:
+            context.scene.quick_sdf_active_project_index = max(
+                0, min(previous_index, len(context.scene.quick_sdf_projects) - 1)
+            )
+        else:
+            context.scene.quick_sdf_active_project_index = -1
         if created_material is not None:
             if obj.data.materials and obj.data.materials[-1] == created_material:
                 obj.data.materials.pop(index=len(obj.data.materials) - 1)
@@ -429,22 +455,31 @@ class QUICKSDF_OT_create_and_edit(bpy.types.Operator):
         return context.active_object is not None and context.active_object.type == "MESH"
 
     def execute(self, context):
-        project = _project_for_object(context.scene, context.active_object)
+        target_object = context.active_object
+        _existing_index, project = _project_entry_for_object(context.scene, target_object)
         created = project is None
+        previous_index = int(getattr(context.scene, "quick_sdf_active_project_index", -1))
         try:
             if project is None:
-                project = _create_project_data(context)
-            from .studio import enter_studio
+                # Do not replace the live Studio canvas while the target is
+                # still being created and baked. The switch commits later.
+                project = _create_project_data(context, sync_ui=False, activate=False)
+            from .studio import open_or_switch_studio
 
-            enter_studio(context, project)
+            open_or_switch_studio(context, project)
         except Exception as exc:
             if created:
-                project = _project_for_object(context.scene, context.active_object)
-                if project is not None:
+                remove_index, created_project = _project_entry_for_object(context.scene, target_object)
+                if created_project is not None and remove_index is not None:
+                    project = created_project
                     runtime.remove_project_images(project)
-                    index = int(context.scene.quick_sdf_active_project_index)
-                    context.scene.quick_sdf_projects.remove(index)
-                    context.scene.quick_sdf_active_project_index = len(context.scene.quick_sdf_projects) - 1
+                    context.scene.quick_sdf_projects.remove(remove_index)
+                    if context.scene.quick_sdf_projects:
+                        context.scene.quick_sdf_active_project_index = max(
+                            0, min(previous_index, len(context.scene.quick_sdf_projects) - 1)
+                        )
+                    else:
+                        context.scene.quick_sdf_active_project_index = -1
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         return {"FINISHED"}
@@ -460,9 +495,9 @@ class QUICKSDF_OT_studio_enter(bpy.types.Operator):
         if project is None:
             return {"CANCELLED"}
         try:
-            from .studio import enter_studio
+            from .studio import open_or_switch_studio
 
-            enter_studio(context, project)
+            open_or_switch_studio(context, project)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}

@@ -212,6 +212,7 @@ def check() -> float | None:
         STATE["studio_clip_starts"] = dict(session.previous_clip_starts)
         view_area = next(area for area in bpy.context.window.screen.areas if area.type == "VIEW_3D")
         view_space = view_area.spaces.active
+        assert view_space.shading.type == "MATERIAL"
         assert float(view_space.clip_start) <= max(float(value) for value in obj.dimensions) * 1.0e-4 + 1.0e-8
         from quick_sdf_blender.tools import QSDF_WST_image_paint, QSDF_WST_view_paint
 
@@ -225,11 +226,30 @@ def check() -> float | None:
             assert tuple(float(value) for value in brush.color[:3]) == (1.0, 1.0, 1.0)
             studio.restore_stroke_brush(bpy.context)
             assert tuple(float(value) for value in brush.color[:3]) == original_color
+        project.paint_value = 0
+        session.stroke_from_view3d = True
+        studio.set_projection_hint(bpy.context, no_change=True)
+        assert "Shadow" in session.projection_hint
+        assert "Numpad 5" in session.projection_hint
+        project.paint_value = 1
+        studio.set_projection_hint(bpy.context, no_change=True)
+        assert "Light" in session.projection_hint
+        studio.set_projection_hint(bpy.context, no_change=False)
+        assert not session.projection_hint
+        project.paint_value = 0
         assert not project.base_needs_update
         canvas = runtime.resolve_angle_image(
             project, runtime.active_angle(project)
         )
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
+        # Selecting an edit key is the public synchronization point before a
+        # stroke. Recover Material Preview if Blender or the user left Solid,
+        # without changing the Canvas or Texture Paint mode.
+        view_space.shading.type = "SOLID"
+        assert bpy.ops.quicksdf.key_select(index=int(project.active_angle_index)) == {"FINISHED"}
+        assert view_space.shading.type == "MATERIAL"
+        assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
+        assert obj.mode == "TEXTURE_PAINT"
         project.onion_enabled = True
         from quick_sdf_blender.live_preview import ONION_PREVIEW_ROLE
 
@@ -342,6 +362,9 @@ def run() -> None:
         bpy.context.scene.quick_sdf_settings.resolution = 512
         bpy.context.scene.quick_sdf_settings.initialization = "NORMAL_SWEEP"
         bpy.context.scene.tool_settings.image_paint.use_normal_falloff = True
+        for area in bpy.context.window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.spaces.active.shading.type = "SOLID"
         assert bpy.ops.quicksdf.project_create() == {"FINISHED"}
         project = runtime.active_project()
         assert bpy.ops.quicksdf.studio_enter() == {"FINISHED"}

@@ -72,8 +72,15 @@ class _PendingEnter:
     state: str = "JOIN"
 
 
+@dataclass(slots=True)
+class _PendingSwitch:
+    project_uuid: str
+    attempts: int = 0
+
+
 _SESSION: StudioSession | None = None
 _PENDING: _PendingEnter | None = None
+_SWITCH_PENDING: _PendingSwitch | None = None
 _HANDLERS_REGISTERED = False
 
 
@@ -119,6 +126,64 @@ def resolve_session_project(session: StudioSession | None = None) -> Any | None:
             if str(getattr(project, "uuid", "")) == session.project_uuid:
                 return project
     return None
+
+
+def _resolve_project_uuid(project_uuid: str) -> Any | None:
+    for scene in bpy.data.scenes:
+        for project in getattr(scene, "quick_sdf_projects", ()):
+            if str(getattr(project, "uuid", "")) == str(project_uuid):
+                return project
+    return None
+
+
+def _project_location(project: Any) -> tuple[Any, int] | tuple[None, None]:
+    project_uuid = str(getattr(project, "uuid", ""))
+    if not project_uuid:
+        return None, None
+    for scene in bpy.data.scenes:
+        for index, candidate in enumerate(getattr(scene, "quick_sdf_projects", ())):
+            if str(getattr(candidate, "uuid", "")) == project_uuid:
+                return scene, index
+    return None, None
+
+
+def _activate_project(project: Any) -> tuple[Any, int]:
+    scene, index = _project_location(project)
+    if scene is None or index is None:
+        raise StudioError("The Quick SDF project is no longer part of a scene")
+    scene.quick_sdf_active_project_index = int(index)
+    return scene, int(index)
+
+
+def _preflight_studio_target(context: Any, project: Any) -> tuple[Any, int, Any, Any]:
+    """Resolve every structural dependency before changing the live session."""
+
+    scene, index = _project_location(project)
+    if scene is None or index is None:
+        raise StudioError("The Quick SDF project is no longer part of a scene")
+    context_scene = getattr(context, "scene", None)
+    if context_scene is None or scene.as_pointer() != context_scene.as_pointer():
+        raise StudioError("Open the target scene before editing this Quick SDF project")
+    obj = getattr(project, "target_object", None)
+    if obj is None or getattr(obj, "type", "") != "MESH":
+        raise StudioError("The Quick SDF target must be a local mesh")
+    if obj.name not in context.view_layer.objects:
+        raise StudioError("The Quick SDF target is not visible in the current View Layer")
+    slot_index = int(getattr(project, "material_slot_index", 0))
+    if not 0 <= slot_index < len(obj.material_slots):
+        raise StudioError("The Quick SDF material slot is unavailable")
+    uv_name = str(getattr(project, "uv_map_name", ""))
+    if not uv_name or getattr(obj.data, "uv_layers", None) is None or obj.data.uv_layers.get(uv_name) is None:
+        raise StudioError("The Quick SDF UV map is unavailable")
+    _index, item = _resolve_paint_key(project)
+    if item is None:
+        raise StudioError("The Quick SDF project has no paint angle")
+    from .runtime import resolve_display_image
+
+    image = resolve_display_image(project, item)
+    if image is None:
+        raise StudioError("The active angle image could not be used as a paint canvas")
+    return scene, int(index), obj, image
 
 
 def _side_signed_angle(project: Any, item: Any) -> float:
@@ -173,6 +238,7 @@ def select_paint_key(
     session = active_session(context)
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
         leave_export_adjustment_review(project, session=session)
+        ensure_studio_material_preview(context, session=session)
         session.view_mode = "EDIT"
         session.paint_key_uuid = str(getattr(item, "uuid", ""))
         session.paint_key_angle = angle
@@ -263,6 +329,7 @@ def seek_preview(context: Any, project: Any, angle: float) -> float:
     project.review_angle = sign * value
     session = active_session(context)
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        ensure_studio_material_preview(context, session=session)
         session.view_mode = "PREVIEW"
         session.seek_angle = value
     try:
@@ -317,6 +384,7 @@ def prepare_stroke_brush(context: Any, project: Any) -> None:
     session = active_session(context)
     if session is None:
         return
+    ensure_studio_material_preview(context, session=session)
     restore_stroke_brush(context)
     image_paint = context.scene.tool_settings.image_paint
     brush = getattr(image_paint, "brush", None)
@@ -358,8 +426,21 @@ def set_projection_hint(context: Any | None, *, no_change: bool) -> None:
     session = active_session(context or bpy.context)
     if session is None:
         return
-    if no_change and session.stroke_from_view3d:
-        session.projection_hint = "No paint reached the mesh · move back a little or press Numpad 5"
+    project = resolve_session_project(session)
+    if no_change:
+        from .i18n import tr
+
+        painting_light = bool(int(getattr(project, "paint_value", 0))) if project is not None else False
+        current = "Light" if painting_light else "Shadow"
+        opposite = "Shadow" if painting_light else "Light"
+        session.projection_hint = " · ".join(
+            (
+                tr("No visible change"),
+                tr(f"this area may already be {current}. Try {opposite}"),
+            )
+        )
+        if session.stroke_from_view3d:
+            session.projection_hint += f" · {tr('if the brush misses, move back or press Numpad 5')}"
     else:
         session.projection_hint = ""
     tag_studio_redraw()
@@ -563,6 +644,34 @@ def _studio_view_spaces(window: Any | None) -> tuple[Any, ...]:
         for area in window.screen.areas
         if area.type == "VIEW_3D" and hasattr(area.spaces.active, "clip_start")
     )
+
+
+def ensure_studio_material_preview(
+    context: Any | None = None,
+    *,
+    session: StudioSession | None = None,
+) -> bool:
+    """Keep the 3D paint surface visible after users change viewport shading.
+
+    Texture Paint can remain active while a View3D is switched back to Solid.
+    In that state Blender still edits the Image canvas, but the temporary Quick
+    SDF material is not displayed.  Studio owns its cloned workspace, so it is
+    safe to restore Material Preview whenever editing resumes.
+    """
+
+    session = session or active_session(context or bpy.context)
+    if session is None:
+        return False
+    window = find_window(session.window_pointer)
+    changed = False
+    for space in _studio_view_spaces(window):
+        shading = getattr(space, "shading", None)
+        if shading is not None and str(getattr(shading, "type", "")) != "MATERIAL":
+            shading.type = "MATERIAL"
+            changed = True
+    if changed:
+        tag_studio_redraw()
+    return True
 
 
 def _adaptive_clip_start(obj: Any | None) -> float:
@@ -867,6 +976,271 @@ def _continue_enter() -> float | None:
     return 0.03
 
 
+def _leave_object_mode(context: Any, window: Any, obj: Any | None) -> None:
+    if obj is None or str(getattr(obj, "mode", "OBJECT")) == "OBJECT":
+        return
+    view_area = next((area for area in window.screen.areas if area.type == "VIEW_3D"), None)
+    if view_area is None:
+        raise StudioError("Quick SDF Studio has no 3D View")
+    _set_active_object(context, obj)
+    _mode_set(context, window, view_area, "OBJECT")
+
+
+def _configure_session_target(
+    context: Any,
+    session: StudioSession,
+    project: Any,
+    *,
+    frame_content: bool,
+) -> Any:
+    """Synchronize an already-built Studio workspace to one project."""
+
+    scene, project_index, obj, _preflight_image = _preflight_studio_target(context, project)
+    window = find_window(session.window_pointer)
+    workspace = bpy.data.workspaces.get(session.workspace_name)
+    if window is None or workspace is None:
+        raise StudioError("The Quick SDF Studio workspace is no longer available")
+    window.workspace = workspace
+    workspace[WORKSPACE_PROJECT_TAG] = str(getattr(project, "uuid", ""))
+    workspace[WORKSPACE_VERSION_TAG] = WORKSPACE_LAYOUT_VERSION
+    scene.quick_sdf_active_project_index = project_index
+    session.project_uuid = str(getattr(project, "uuid", ""))
+    session.scene_name = scene.name
+
+    view_area, image_area, _timeline_area = studio_areas(window)
+    if view_area is None or image_area is None:
+        raise StudioError("Quick SDF Studio needs both a 3D View and an Image Editor")
+    _set_active_object(context, obj)
+    scene.tool_settings.image_paint.mode = "IMAGE"
+    if not select_paint_key(
+        context,
+        project,
+        key_uuid=str(getattr(project, "active_angle_uuid", "")),
+        index=int(getattr(project, "active_angle_index", 0)),
+    ):
+        raise StudioError("The active angle image could not be used as a paint canvas")
+    _mode_set(context, window, view_area, "TEXTURE_PAINT")
+    from .tools import activate_tools
+
+    activate_tools(context, window=window)
+    _apply_projection_settings(scene, session, window, obj)
+    ensure_studio_material_preview(context, session=session)
+    if frame_content:
+        _frame_studio_content(context, window, view_area, image_area)
+    try:
+        from .runtime import refresh_base_staleness
+
+        refresh_base_staleness(project, scene)
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
+    project.warning_message = ""
+    return project
+
+
+def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
+    """Focus the current target or atomically retarget the live Studio session."""
+
+    session = _SESSION
+    if session is None:
+        raise StudioError("Quick SDF Studio is not open")
+    window = find_window(session.window_pointer)
+    if window is None:
+        raise StudioError("The Quick SDF Studio window is no longer available")
+    context_window = getattr(context, "window", None)
+    if context_window is None or context_window.as_pointer() != session.window_pointer:
+        raise StudioError("Quick SDF Studio is open in another Blender window")
+
+    target_uuid = str(getattr(project, "uuid", ""))
+    if not target_uuid:
+        raise StudioError("The Quick SDF project has no UUID")
+    _preflight_studio_target(context, project)
+    caller_workspace = window.workspace
+    if session.project_uuid == target_uuid:
+        _activate_project(project)
+        _configure_session_target(context, session, project, frame_content=False)
+        tag_studio_redraw()
+        return session
+
+    old_project = resolve_session_project(session)
+    if old_project is None:
+        raise StudioError("The current Quick SDF Studio target is unavailable")
+    old_scene, old_index = _project_location(old_project)
+    workspace = bpy.data.workspaces.get(session.workspace_name)
+    if old_scene is None or old_index is None or workspace is None:
+        raise StudioError("The current Quick SDF Studio state could not be restored")
+
+    old_session_state = {
+        "project_uuid": session.project_uuid,
+        "scene_name": session.scene_name,
+        "view_mode": session.view_mode,
+        "paint_key_uuid": session.paint_key_uuid,
+        "paint_key_angle": session.paint_key_angle,
+        "seek_angle": session.seek_angle,
+        "show_first_stroke_hint": session.show_first_stroke_hint,
+        "first_hint_text": session.first_hint_text,
+        "projection_hint": session.projection_hint,
+        "export_review_active": session.export_review_active,
+    }
+    old_workspace_tag = str(workspace.get(WORKSPACE_PROJECT_TAG, ""))
+    target_obj = getattr(project, "target_object", None)
+    old_obj = getattr(old_project, "target_object", None)
+    switched = False
+    try:
+        window.workspace = workspace
+        _leave_object_mode(context, window, old_obj)
+        restore_stroke_brush(session=session)
+        _restore_preview(old_project)
+        try:
+            from .runtime import discard_paint_snapshot
+
+            discard_paint_snapshot(old_project)
+        except (AttributeError, ImportError, ReferenceError, RuntimeError):
+            pass
+        try:
+            from .live_preview import release_project
+
+            release_project(old_project)
+        except (ImportError, ReferenceError, RuntimeError):
+            pass
+
+        session.view_mode = "EDIT"
+        session.paint_key_uuid = ""
+        session.paint_key_angle = 0.0
+        session.seek_angle = 0.0
+        session.projection_hint = ""
+        session.export_review_active = False
+        session.show_first_stroke_hint = not bool(getattr(project, "first_stroke_complete", False))
+        session.first_hint_text = (
+            "A normal-based shadow guide is ready. Paint only the areas you want to adjust."
+            if str(getattr(project, "base_source", "LEGACY")) == "NORMAL_GUIDE"
+            else "Choose an angle · choose Light or Shadow · paint"
+        )
+        _configure_session_target(context, session, project, frame_content=True)
+        switched = True
+        tag_studio_redraw()
+        return session
+    except Exception as error:
+        # The target is disposable until the final synchronization succeeds.
+        _restore_preview(project)
+        try:
+            _leave_object_mode(context, window, target_obj)
+        except (ReferenceError, RuntimeError, StudioError):
+            pass
+        for name, value in old_session_state.items():
+            setattr(session, name, value)
+        workspace[WORKSPACE_PROJECT_TAG] = old_workspace_tag or session.project_uuid
+        old_scene.quick_sdf_active_project_index = int(old_index)
+        try:
+            window.workspace = workspace
+            _configure_session_target(context, session, old_project, frame_content=False)
+        except Exception as rollback_error:
+            # Never leave a half-switched paint session armed.
+            try:
+                exit_studio(context, reason="switch-rollback")
+            except Exception:
+                pass
+            raise StudioError(
+                f"Could not open this model, and Studio recovery failed: {rollback_error}"
+            ) from error
+        finally:
+            if caller_workspace.as_pointer() != workspace.as_pointer():
+                window.workspace = caller_workspace
+        raise StudioError(f"Could not open this model in Quick SDF Studio: {error}") from error
+    finally:
+        if not switched:
+            tag_studio_redraw()
+
+
+def _continue_switch() -> float | None:
+    """Complete a workspace focus/switch after Blender changes screens."""
+
+    global _SWITCH_PENDING
+    pending = _SWITCH_PENDING
+    session = _SESSION
+    if pending is None or session is None:
+        _SWITCH_PENDING = None
+        return None
+    project = _resolve_project_uuid(pending.project_uuid)
+    window = find_window(session.window_pointer)
+    workspace = bpy.data.workspaces.get(session.workspace_name)
+    if project is None or window is None or workspace is None:
+        _SWITCH_PENDING = None
+        return None
+    window.workspace = workspace
+    view, image, _timeline = studio_areas(window)
+    if view is None or image is None:
+        pending.attempts += 1
+        if pending.attempts < 60:
+            return 0.03
+        try:
+            project.diagnostic_message = "Could not focus the Quick SDF Studio workspace"
+        except (AttributeError, ReferenceError):
+            pass
+        _SWITCH_PENDING = None
+        return None
+    _SWITCH_PENDING = None
+    try:
+        _focus_or_switch_studio(bpy.context, project)
+    except Exception as error:
+        try:
+            project.diagnostic_message = str(error)
+            project.warning_message = str(error)
+        except (AttributeError, ReferenceError):
+            pass
+    return None
+
+
+def _queue_studio_switch(context: Any, project: Any) -> StudioSession:
+    global _SWITCH_PENDING
+    session = _SESSION
+    if session is None:
+        raise StudioError("Quick SDF Studio is not open")
+    context_window = getattr(context, "window", None)
+    if context_window is None or context_window.as_pointer() != session.window_pointer:
+        raise StudioError("Quick SDF Studio is open in another Blender window")
+    _preflight_studio_target(context, project)
+    window = find_window(session.window_pointer)
+    workspace = bpy.data.workspaces.get(session.workspace_name)
+    if window is None or workspace is None:
+        raise StudioError("The Quick SDF Studio workspace is no longer available")
+    _SWITCH_PENDING = _PendingSwitch(str(getattr(project, "uuid", "")))
+    window.workspace = workspace
+    if not bpy.app.timers.is_registered(_continue_switch):
+        bpy.app.timers.register(_continue_switch, first_interval=0.01)
+    return session
+
+
+def open_or_switch_studio(
+    context: Any,
+    project: Any,
+    *,
+    manage_preview: bool = True,
+) -> StudioSession:
+    """Artist-facing entry point: open, refocus, or switch in one action."""
+
+    global _PENDING
+    target_uuid = str(getattr(project, "uuid", ""))
+    if _PENDING is not None:
+        if _PENDING.session.project_uuid == target_uuid:
+            window = find_window(_PENDING.session.window_pointer)
+            workspace = bpy.data.workspaces.get(_PENDING.session.workspace_name)
+            if window is not None and workspace is not None:
+                window.workspace = workspace
+            return _PENDING.session
+        _rollback_pending()
+    if _SESSION is not None:
+        session = _SESSION
+        window = find_window(session.window_pointer)
+        workspace = bpy.data.workspaces.get(session.workspace_name)
+        if window is None or workspace is None:
+            raise StudioError("The Quick SDF Studio workspace is no longer available")
+        if window.workspace.as_pointer() != workspace.as_pointer():
+            return _queue_studio_switch(context, project)
+        return _focus_or_switch_studio(context, project)
+    _activate_project(project)
+    return enter_studio(context, project, manage_preview=manage_preview)
+
+
 def enter_studio(
     context: Any,
     project: Any,
@@ -876,16 +1250,15 @@ def enter_studio(
 ) -> StudioSession:
     """Atomically enter Studio and publish the singleton only after success."""
 
-    global _SESSION, _PENDING
+    global _SESSION, _PENDING, _SWITCH_PENDING
+    _SWITCH_PENDING = None
     if bpy.app.background or getattr(context, "window", None) is None:
         raise StudioUnavailableError("Quick SDF Studio requires an interactive Blender window")
     project_uuid = str(getattr(project, "uuid", ""))
     if not project_uuid:
         raise StudioError("The Quick SDF project has no UUID")
     if _SESSION is not None:
-        if is_studio_active(context, project_uuid):
-            return _SESSION
-        raise StudioBusyError("Exit the current Quick SDF Studio before opening another project")
+        return open_or_switch_studio(context, project, manage_preview=manage_preview)
     if _PENDING is not None:
         if _PENDING.session.project_uuid == project_uuid:
             return _PENDING.session
@@ -949,7 +1322,8 @@ def exit_studio(
 ) -> bool:
     """Leave Studio and restore the captured user workspace and paint state."""
 
-    global _SESSION, _PENDING
+    global _SESSION, _PENDING, _SWITCH_PENDING
+    _SWITCH_PENDING = None
     if _PENDING is not None:
         _rollback_pending()
         if _SESSION is None:
@@ -1068,7 +1442,8 @@ def _save_post(_unused: Any) -> None:
 
 @persistent
 def _load_pre(_unused: Any) -> None:
-    global _SESSION, _PENDING
+    global _SESSION, _PENDING, _SWITCH_PENDING
+    _SWITCH_PENDING = None
     try:
         from .operators import shutdown_export_job
 
@@ -1120,7 +1495,10 @@ def register_studio() -> None:
 
 
 def unregister_studio() -> None:
-    global _HANDLERS_REGISTERED, _SESSION, _PENDING
+    global _HANDLERS_REGISTERED, _SESSION, _PENDING, _SWITCH_PENDING
+    _SWITCH_PENDING = None
+    if bpy.app.timers.is_registered(_continue_switch):
+        bpy.app.timers.unregister(_continue_switch)
     if bpy.app.timers.is_registered(_continue_enter):
         bpy.app.timers.unregister(_continue_enter)
     if _PENDING is not None:
@@ -1147,7 +1525,8 @@ CLASSES: tuple[type, ...] = ()
 __all__ = [
     "CLASSES", "StudioBusyError", "StudioError", "StudioSession", "StudioUnavailableError",
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
-    "back_to_paint", "dismiss_first_stroke_hint", "enter_studio", "exit_studio",
+    "back_to_paint", "dismiss_first_stroke_hint", "ensure_studio_material_preview",
+    "enter_studio", "exit_studio", "open_or_switch_studio",
     "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
     "reconcile_view_state", "register_studio", "show_export_adjustment_review",
     "prepare_stroke_brush", "resolve_session_project", "restore_stroke_brush", "seek_preview",

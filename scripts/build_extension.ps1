@@ -9,8 +9,11 @@ $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $nativeBuild = Join-Path $repositoryRoot 'native\build.ps1'
 $smokeTest = Join-Path $repositoryRoot 'tests\blender_smoke.py'
+$previewRenderSmokeTest = Join-Path $repositoryRoot 'tests\blender_preview_render_probe.py'
 $migrationSmokeTest = Join-Path $repositoryRoot 'tests\blender_migration_smoke.py'
 $studioSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_smoke.py'
+$studioSwitchSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_switch_smoke.py'
+$projectionPaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_projection_paint_smoke.py'
 $savedStateSmokeTest = Join-Path $repositoryRoot 'tests\blender_saved_state_smoke.py'
 $installedSmokeTest = Join-Path $repositoryRoot 'tests\blender_installed_extension_smoke.py'
 $archiveVerification = Join-Path $repositoryRoot 'tests\verify_extension_archive.py'
@@ -24,6 +27,8 @@ $extensionVersion = $Matches[1]
 $extensionArchive = Join-Path $buildDirectory "quick_sdf_blender-$extensionVersion-windows-x64.zip"
 $studioResult = Join-Path $buildDirectory 'studio_smoke_result.txt'
 $studioSavedBlend = Join-Path $buildDirectory 'studio_adjusted_save.blend'
+$studioSwitchResult = Join-Path $buildDirectory 'studio_switch_smoke_result.txt'
+$projectionPaintResult = Join-Path $buildDirectory 'projection_paint_smoke_result.txt'
 
 if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
     throw "Blender executable was not found: $BlenderPath"
@@ -42,7 +47,7 @@ try {
         $repositoryRoot
     }
 
-    Write-Host '==> 1/9 Build Windows native core'
+    Write-Host '==> 1/12 Build Windows native core'
     $global:LASTEXITCODE = 0
     & $nativeBuild
     if ($LASTEXITCODE -ne 0) {
@@ -53,27 +58,34 @@ try {
         throw "Native build did not produce $nativeLibrary"
     }
 
-    Write-Host '==> 2/9 Run Python unit tests'
+    Write-Host '==> 2/12 Run Python unit tests'
     & $PythonPath -m unittest discover -s tests -p 'test_*.py'
     if ($LASTEXITCODE -ne 0) {
         throw "Unit tests failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 3/9 Run Blender 5.1 background smoke test'
+    Write-Host '==> 3/12 Run Blender 5.1 background smoke test'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $smokeTest -- --output-dir $buildDirectory
     if ($LASTEXITCODE -ne 0) {
         throw "Blender smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 4/9 Verify schema v1/v2 to v3 save/reload migration'
+    Write-Host '==> 4/12 Verify active Material Output and Canvas preview rendering'
+    & $BlenderPath --background --factory-startup --python-exit-code 1 `
+        --python $previewRenderSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender preview render smoke test failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host '==> 5/12 Verify schema v1/v2 to v3 save/reload migration'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $migrationSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender migration smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 5/9 Run Blender 5.1 interactive Studio lifecycle smoke test'
+    Write-Host '==> 6/12 Run Blender 5.1 interactive Studio lifecycle smoke test'
     if (Test-Path -LiteralPath $studioResult) {
         Remove-Item -Force -LiteralPath $studioResult
     }
@@ -92,7 +104,39 @@ try {
         throw 'Blender Studio smoke test did not produce its active-session save'
     }
 
-    Write-Host '==> 6/9 Verify active Studio save in a fresh Blender process'
+    Write-Host '==> 7/12 Verify one-click Studio model switching'
+    if (Test-Path -LiteralPath $studioSwitchResult) {
+        Remove-Item -Force -LiteralPath $studioSwitchResult
+    }
+    & $BlenderPath --factory-startup --python-exit-code 1 --python $studioSwitchSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender Studio switch smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $studioSwitchResult -PathType Leaf)) {
+        throw 'Blender Studio switch smoke test did not produce a result file'
+    }
+    $studioSwitchOutcome = (Get-Content -Raw -LiteralPath $studioSwitchResult).Trim()
+    if ($studioSwitchOutcome -ne 'PASS') {
+        throw "Blender Studio switch smoke test failed:`n$studioSwitchOutcome"
+    }
+
+    Write-Host '==> 8/12 Run a native 3D Projection Paint stroke through Quick SDF'
+    if (Test-Path -LiteralPath $projectionPaintResult) {
+        Remove-Item -Force -LiteralPath $projectionPaintResult
+    }
+    & $BlenderPath --factory-startup --python-exit-code 1 --python $projectionPaintSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender Projection Paint smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $projectionPaintResult -PathType Leaf)) {
+        throw 'Blender Projection Paint smoke test did not produce a result file'
+    }
+    $projectionPaintOutcome = (Get-Content -Raw -LiteralPath $projectionPaintResult).Trim()
+    if ($projectionPaintOutcome -ne 'PASS') {
+        throw "Blender Projection Paint smoke test failed:`n$projectionPaintOutcome"
+    }
+
+    Write-Host '==> 9/12 Verify active Studio save in a fresh Blender process'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $savedStateSmokeTest `
         -- --blend $studioSavedBlend
@@ -100,7 +144,7 @@ try {
         throw "Blender saved-state smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "==> 7/9 Build and validate Blender extension $extensionVersion"
+    Write-Host "==> 10/12 Build and validate Blender extension $extensionVersion"
     if (Test-Path -LiteralPath $extensionArchive) {
         Remove-Item -Force -LiteralPath $extensionArchive
     }
@@ -119,7 +163,7 @@ try {
         throw "Extension validation failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 8/9 Verify release ZIP contents byte-for-byte'
+    Write-Host '==> 11/12 Verify release ZIP contents byte-for-byte'
     & $PythonPath $archiveVerification `
         --archive $extensionArchive `
         --source $extensionSource `
@@ -128,7 +172,7 @@ try {
         throw "Extension archive verification failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 9/9 Install and exercise the ZIP in an isolated Blender user directory'
+    Write-Host '==> 12/12 Install and exercise the ZIP in an isolated Blender user directory'
     $isolatedUser = Join-Path $buildDirectory ("isolated-user-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $isolatedUser | Out-Null
     $previousUserResources = $env:BLENDER_USER_RESOURCES

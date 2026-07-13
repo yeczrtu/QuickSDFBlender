@@ -90,6 +90,15 @@ TRANSLATIONS["ja_JP"][(
     "Export adjustments are shown read-only; choose an angle to return",
 )] = "\u66f8\u304d\u51fa\u3057\u8abf\u6574\u3092\u8aad\u307f\u53d6\u308a\u5c02\u7528\u3067\u8868\u793a\u3057\u307e\u3057\u305f\u3002\u89d2\u5ea6\u3092\u9078\u3076\u3068\u30da\u30a4\u30f3\u30c8\u306b\u623b\u308a\u307e\u3059\u3002"
 
+# These messages are assembled at runtime so artists get an actionable reason
+# for a no-op stroke instead of a misleading projection-paint failure.
+TRANSLATIONS["ja_JP"].update({
+    ("*", "No visible change"): "\u898b\u305f\u76ee\u306e\u5909\u5316\u306f\u3042\u308a\u307e\u305b\u3093",
+    ("*", "this area may already be Light. Try Shadow"): "\u3053\u306e\u5834\u6240\u306f\u3059\u3067\u306bLight\u306e\u3088\u3046\u3067\u3059\u3002Shadow\u3092\u8a66\u3057\u3066\u304f\u3060\u3055\u3044",
+    ("*", "this area may already be Shadow. Try Light"): "\u3053\u306e\u5834\u6240\u306f\u3059\u3067\u306bShadow\u306e\u3088\u3046\u3067\u3059\u3002Light\u3092\u8a66\u3057\u3066\u304f\u3060\u3055\u3044",
+    ("*", "if the brush misses, move back or press Numpad 5"): "\u30d6\u30e9\u30b7\u304c\u5c4a\u304b\u306a\u3044\u5834\u5408\u306f\u5c11\u3057\u5f15\u304f\u304bNumpad 5\u3092\u62bc\u3057\u3066\u304f\u3060\u3055\u3044",
+})
+
 _REGISTERED = False
 
 
