@@ -14,6 +14,7 @@ $migrationSmokeTest = Join-Path $repositoryRoot 'tests\blender_migration_smoke.p
 $studioSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_smoke.py'
 $studioSwitchSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_switch_smoke.py'
 $projectionPaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_projection_paint_smoke.py'
+$icospherePaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_icosphere_paint_smoke.py'
 $savedStateSmokeTest = Join-Path $repositoryRoot 'tests\blender_saved_state_smoke.py'
 $installedSmokeTest = Join-Path $repositoryRoot 'tests\blender_installed_extension_smoke.py'
 $archiveVerification = Join-Path $repositoryRoot 'tests\verify_extension_archive.py'
@@ -29,6 +30,7 @@ $studioResult = Join-Path $buildDirectory 'studio_smoke_result.txt'
 $studioSavedBlend = Join-Path $buildDirectory 'studio_adjusted_save.blend'
 $studioSwitchResult = Join-Path $buildDirectory 'studio_switch_smoke_result.txt'
 $projectionPaintResult = Join-Path $buildDirectory 'projection_paint_smoke_result.txt'
+$icospherePaintResult = Join-Path $buildDirectory 'icosphere_paint_smoke_result.txt'
 
 if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
     throw "Blender executable was not found: $BlenderPath"
@@ -47,7 +49,7 @@ try {
         $repositoryRoot
     }
 
-    Write-Host '==> 1/12 Build Windows native core'
+    Write-Host '==> 1/13 Build Windows native core'
     $global:LASTEXITCODE = 0
     & $nativeBuild
     if ($LASTEXITCODE -ne 0) {
@@ -58,34 +60,34 @@ try {
         throw "Native build did not produce $nativeLibrary"
     }
 
-    Write-Host '==> 2/12 Run Python unit tests'
+    Write-Host '==> 2/13 Run Python unit tests'
     & $PythonPath -m unittest discover -s tests -p 'test_*.py'
     if ($LASTEXITCODE -ne 0) {
         throw "Unit tests failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 3/12 Run Blender 5.1 background smoke test'
+    Write-Host '==> 3/13 Run Blender 5.1 background smoke test'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $smokeTest -- --output-dir $buildDirectory
     if ($LASTEXITCODE -ne 0) {
         throw "Blender smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 4/12 Verify active Material Output and Canvas preview rendering'
+    Write-Host '==> 4/13 Verify active Material Output and Canvas preview rendering'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $previewRenderSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender preview render smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 5/12 Verify schema v1/v2 to v3 save/reload migration'
+    Write-Host '==> 5/13 Verify schema v1/v2 to v3 save/reload migration'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $migrationSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender migration smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 6/12 Run Blender 5.1 interactive Studio lifecycle smoke test'
+    Write-Host '==> 6/13 Run Blender 5.1 interactive Studio lifecycle smoke test'
     if (Test-Path -LiteralPath $studioResult) {
         Remove-Item -Force -LiteralPath $studioResult
     }
@@ -104,7 +106,7 @@ try {
         throw 'Blender Studio smoke test did not produce its active-session save'
     }
 
-    Write-Host '==> 7/12 Verify one-click Studio model switching'
+    Write-Host '==> 7/13 Verify one-click Studio model switching'
     if (Test-Path -LiteralPath $studioSwitchResult) {
         Remove-Item -Force -LiteralPath $studioSwitchResult
     }
@@ -120,7 +122,7 @@ try {
         throw "Blender Studio switch smoke test failed:`n$studioSwitchOutcome"
     }
 
-    Write-Host '==> 8/12 Run a native 3D Projection Paint stroke through Quick SDF'
+    Write-Host '==> 8/13 Run a native 3D Projection Paint stroke through Quick SDF'
     if (Test-Path -LiteralPath $projectionPaintResult) {
         Remove-Item -Force -LiteralPath $projectionPaintResult
     }
@@ -136,7 +138,24 @@ try {
         throw "Blender Projection Paint smoke test failed:`n$projectionPaintOutcome"
     }
 
-    Write-Host '==> 9/12 Verify active Studio save in a fresh Blender process'
+    Write-Host '==> 9/13 Verify repeated artist painting on a Normal Guide Icosphere'
+    if (Test-Path -LiteralPath $icospherePaintResult) {
+        Remove-Item -Force -LiteralPath $icospherePaintResult
+    }
+    & $BlenderPath --enable-event-simulate --factory-startup --python-exit-code 1 `
+        --python $icospherePaintSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender Icosphere paint smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $icospherePaintResult -PathType Leaf)) {
+        throw 'Blender Icosphere paint smoke test did not produce a result file'
+    }
+    $icospherePaintOutcome = (Get-Content -Raw -LiteralPath $icospherePaintResult).Trim()
+    if ($icospherePaintOutcome -ne 'PASS') {
+        throw "Blender Icosphere paint smoke test failed:`n$icospherePaintOutcome"
+    }
+
+    Write-Host '==> 10/13 Verify active Studio save in a fresh Blender process'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $savedStateSmokeTest `
         -- --blend $studioSavedBlend
@@ -144,7 +163,7 @@ try {
         throw "Blender saved-state smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "==> 10/12 Build and validate Blender extension $extensionVersion"
+    Write-Host "==> 11/13 Build and validate Blender extension $extensionVersion"
     if (Test-Path -LiteralPath $extensionArchive) {
         Remove-Item -Force -LiteralPath $extensionArchive
     }
@@ -163,7 +182,7 @@ try {
         throw "Extension validation failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 11/12 Verify release ZIP contents byte-for-byte'
+    Write-Host '==> 12/13 Verify release ZIP contents byte-for-byte'
     & $PythonPath $archiveVerification `
         --archive $extensionArchive `
         --source $extensionSource `
@@ -172,7 +191,7 @@ try {
         throw "Extension archive verification failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 12/12 Install and exercise the ZIP in an isolated Blender user directory'
+    Write-Host '==> 13/13 Install and exercise the ZIP in an isolated Blender user directory'
     $isolatedUser = Join-Path $buildDirectory ("isolated-user-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $isolatedUser | Out-Null
     $previousUserResources = $env:BLENDER_USER_RESOURCES

@@ -220,20 +220,42 @@ def check() -> float | None:
         assert "USE_BRUSHES" in QSDF_WST_image_paint.bl_options
         brush = bpy.context.scene.tool_settings.image_paint.brush
         if brush is not None:
-            original_color = tuple(float(value) for value in brush.color[:3])
+            original_brush = (
+                tuple(float(value) for value in brush.color[:3]),
+                tuple(float(value) for value in brush.secondary_color[:3]),
+            )
+            unified = bpy.context.scene.tool_settings.image_paint.unified_paint_settings
+            original_unified = (
+                bool(unified.use_unified_color),
+                tuple(float(value) for value in unified.color[:3]),
+                tuple(float(value) for value in unified.secondary_color[:3]),
+            )
             project.paint_value = 1
             studio.prepare_stroke_brush(bpy.context, project)
-            assert tuple(float(value) for value in brush.color[:3]) == (1.0, 1.0, 1.0)
+            assert (
+                tuple(float(value) for value in brush.color[:3]),
+                tuple(float(value) for value in brush.secondary_color[:3]),
+            ) == original_brush
+            assert bool(unified.use_unified_color)
+            assert tuple(float(value) for value in unified.color[:3]) == (1.0, 1.0, 1.0)
+            assert tuple(float(value) for value in unified.secondary_color[:3]) == (0.0, 0.0, 0.0)
             studio.restore_stroke_brush(bpy.context)
-            assert tuple(float(value) for value in brush.color[:3]) == original_color
+            assert (
+                bool(unified.use_unified_color),
+                tuple(float(value) for value in unified.color[:3]),
+                tuple(float(value) for value in unified.secondary_color[:3]),
+            ) == original_unified
+            assert (
+                tuple(float(value) for value in brush.color[:3]),
+                tuple(float(value) for value in brush.secondary_color[:3]),
+            ) == original_brush
         project.paint_value = 0
         session.stroke_from_view3d = True
         studio.set_projection_hint(bpy.context, no_change=True)
-        assert "Shadow" in session.projection_hint
-        assert "Numpad 5" in session.projection_hint
+        assert not session.projection_hint
         project.paint_value = 1
         studio.set_projection_hint(bpy.context, no_change=True)
-        assert "Light" in session.projection_hint
+        assert not session.projection_hint
         studio.set_projection_hint(bpy.context, no_change=False)
         assert not session.projection_hint
         project.paint_value = 0

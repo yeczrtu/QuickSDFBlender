@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 import traceback
 
 
@@ -37,8 +38,41 @@ def _plane() -> bpy.types.Object:
         uv_layer.data[loop.index].uv = (co.x * 0.5 + 0.5, co.y * 0.5 + 0.5)
     obj.data.uv_layers.active = uv_layer
     material = bpy.data.materials.new("Projection Paint Source")
+    material.use_nodes = True
+    material.node_tree.nodes.clear()
     obj.data.materials.append(material)
     return obj
+
+
+def _assert_preview_graph(obj, project, canvas) -> None:
+    material = obj.material_slots[int(project.material_slot_index)].material
+    stored = bpy.data.materials.get(str(project.preview_material_name))
+    assert material is not None and material == stored
+    assert material != project.original_material
+    nodes = material.node_tree.nodes
+    mix = nodes.get("QSDF Original Overlay")
+    group = nodes.get("QSDF Preview")
+    texture = nodes.get("QSDF Mask")
+    assert mix is not None and group is not None and texture is not None
+    assert texture.image == canvas
+    assert len(mix.inputs[1].links) == 1
+    assert len(mix.inputs[2].links) == 1
+    assert mix.inputs[1].links[0].from_node.as_pointer() != mix.as_pointer()
+    assert mix.inputs[2].links[0].from_node.as_pointer() == group.as_pointer()
+    assert not any(
+        link.from_node.as_pointer() == link.to_node.as_pointer()
+        for link in material.node_tree.links
+    )
+    outputs = [
+        node
+        for node in nodes
+        if node.bl_idname == "ShaderNodeOutputMaterial"
+        and bool(getattr(node, "is_active_output", False))
+    ]
+    assert len(outputs) == 1
+    surface_links = tuple(outputs[0].inputs["Surface"].links)
+    assert len(surface_links) == 1
+    assert surface_links[0].from_node.as_pointer() == mix.as_pointer()
 
 
 def _finish(error: BaseException | None = None) -> None:
@@ -58,7 +92,7 @@ def _finish(error: BaseException | None = None) -> None:
 
 def _paint() -> float | None:
     try:
-        from quick_sdf_blender import runtime, studio
+        from quick_sdf_blender import preview, runtime, studio
         from quick_sdf_blender.tools import VIEW_TOOL_ID
 
         project = STATE["project"]
@@ -110,10 +144,13 @@ def _paint() -> float | None:
         runtime.sync_canvas(bpy.context, project)
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
 
-        preview_material = obj.material_slots[0].material
-        assert preview_material is not None and preview_material.use_nodes
-        mask_node = preview_material.node_tree.nodes.get("QSDF Mask")
-        assert mask_node is not None and mask_node.image == canvas
+        # Reusing a preview graph must never connect the Mix Shader to itself.
+        preview.ensure_preview_material(project, canvas)
+        preview.ensure_preview_material(project, canvas)
+        assert bpy.ops.quicksdf.key_select(index=int(project.active_angle_index)) == {
+            "FINISHED"
+        }
+        _assert_preview_graph(obj, project, canvas)
 
         brush = bpy.context.scene.tool_settings.image_paint.brush
         assert brush is not None, "Factory-startup Texture Paint has no active Brush Asset"
@@ -168,17 +205,20 @@ def _paint() -> float | None:
             region=view_region,
         ):
             assert bpy.ops.quicksdf.range_paint.poll()
+            started = time.perf_counter()
             result = bpy.ops.quicksdf.range_paint(
                 "EXEC_DEFAULT",
                 PAINT_OT_image_paint={"stroke": stroke, "mode": "NORMAL"},
             )
+            elapsed = time.perf_counter() - started
         assert result == {"FINISHED"}, result
+        assert elapsed < 0.75, f"1024px paint macro took {elapsed:.3f}s"
 
         after = runtime.image_rgba(canvas)
         coverage_after = runtime.coverage_mask(coverage)
         changed = np.any(np.abs(after[..., :3] - before[..., :3]) > (0.5 / 255.0), axis=2)
         assert np.any(changed)
-        assert np.any(coverage_after & ~coverage_before)
+        np.testing.assert_array_equal(coverage_after, coverage_before)
         assert np.any(after[..., 0] < 0.5)
         assert project.first_stroke_complete
         assert project.dirty
@@ -189,7 +229,7 @@ def _paint() -> float | None:
         assert view_space.shading.type == "MATERIAL"
         assert obj.mode == "TEXTURE_PAINT"
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
-        assert mask_node.image == canvas
+        _assert_preview_graph(obj, project, canvas)
 
         assert bpy.ops.quicksdf.history_undo() == {"FINISHED"}
         restored = runtime.image_rgba(canvas)
@@ -198,9 +238,20 @@ def _paint() -> float | None:
         redone = runtime.image_rgba(canvas)
         np.testing.assert_array_equal(redone, after)
         assert view_space.shading.type == "MATERIAL"
-        assert mask_node.image == canvas
+        _assert_preview_graph(obj, project, canvas)
+
+        # Native-speed strokes defer coverage until an explicit rebuild. The
+        # Rebake operation must materialize that visible delta and preserve it.
+        project.guide_shadow_amount = 0.0
+        assert bpy.ops.quicksdf.bake_base() == {"FINISHED"}
+        rebaked = runtime.image_rgba(canvas)
+        np.testing.assert_array_equal(rebaked[..., :3][changed], after[..., :3][changed])
+        coverage_rebaked = runtime.coverage_mask(coverage)
+        assert np.all(coverage_rebaked[changed])
+        _assert_preview_graph(obj, project, canvas)
 
         print("PROJECTION_PAINT_CHANGED_PIXELS", int(np.count_nonzero(changed)))
+        print("PROJECTION_PAINT_SECONDS", f"{elapsed:.4f}")
         print("[Quick SDF projection paint smoke] PASS")
         _finish()
     except Exception as error:
@@ -219,7 +270,7 @@ def _run() -> None:
 
         obj = _plane()
         scene = bpy.context.scene
-        scene.quick_sdf_settings.resolution = 512
+        scene.quick_sdf_settings.resolution = 1024
         scene.quick_sdf_settings.initialization = "WHITE"
         assert bpy.ops.quicksdf.project_create() == {"FINISHED"}
         project = runtime.active_project(scene)

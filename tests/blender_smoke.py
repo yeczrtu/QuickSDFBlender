@@ -307,6 +307,36 @@ def run(output_directory: Path) -> None:
         assert display is not None and coverage is not None
         assert np.all(runtime.coverage_mask(coverage)[255:257, 255:257])
         assert np.all(runtime.image_rgba(display)[..., 3] == 1.0)
+    from quick_sdf_blender import operators as operator_module
+
+    history = operator_module._HISTORIES[str(project.uuid)]
+    transaction_before = {
+        name: runtime.image_rgba8(bpy.data.images[name]) for name in history.undo_keys
+    }
+    undo_count_before = history.undo_count
+    original_write_rgba8 = runtime.write_image_rgba8
+    write_calls = 0
+
+    def fail_second_history_write(image, rgba):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 2:
+            raise RuntimeError("simulated second-image write failure")
+        return original_write_rgba8(image, rgba)
+
+    runtime.write_image_rgba8 = fail_second_history_write
+    try:
+        try:
+            bpy.ops.quicksdf.history_undo()
+        except RuntimeError as exc:
+            assert "simulated second-image write failure" in str(exc)
+        else:
+            raise AssertionError("The simulated history write failure was not reported")
+    finally:
+        runtime.write_image_rgba8 = original_write_rgba8
+    assert history.undo_count == undo_count_before
+    for name, expected in transaction_before.items():
+        np.testing.assert_array_equal(runtime.image_rgba8(bpy.data.images[name]), expected)
     _expect_finished(bpy.ops.quicksdf.history_undo(), "history_undo")
     _expect_finished(bpy.ops.quicksdf.history_redo(), "history_redo")
 

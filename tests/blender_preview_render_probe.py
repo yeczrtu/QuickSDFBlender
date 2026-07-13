@@ -107,7 +107,7 @@ def _write_canvas(runtime, image: bpy.types.Image, value: float) -> None:
 
 assert bpy.app.background
 assert bpy.ops.preferences.addon_enable(module="quick_sdf_blender") == {"FINISHED"}
-from quick_sdf_blender import runtime  # noqa: E402
+from quick_sdf_blender import preview, runtime  # noqa: E402
 
 
 obj = _full_uv_plane()
@@ -133,6 +133,11 @@ assert canvas is not None
 runtime.sync_canvas(bpy.context, project)
 assert scene.tool_settings.image_paint.canvas == canvas
 
+# Reusing the material returns fresh RNA wrappers for existing nodes. Rebuild
+# twice to guard against an accidental Mix-Shader self-cycle.
+preview.ensure_preview_material(project, canvas)
+preview.ensure_preview_material(project, canvas)
+
 preview_material = obj.material_slots[0].material
 assert preview_material is not None and preview_material.use_nodes
 nodes = preview_material.node_tree.nodes
@@ -151,6 +156,13 @@ assert bool(active_output.get("preview_regression_expected_output", False)), [
 surface_links = active_output.inputs["Surface"].links
 assert len(surface_links) == 1
 assert surface_links[0].from_node.name == "QSDF Original Overlay"
+mix = nodes.get("QSDF Original Overlay")
+assert mix is not None and len(mix.inputs[1].links) == 1
+assert mix.inputs[1].links[0].from_node.as_pointer() != mix.as_pointer()
+assert not any(
+    link.from_node.as_pointer() == link.to_node.as_pointer()
+    for link in preview_material.node_tree.links
+)
 assert all(
     not node.inputs["Surface"].is_linked
     for node in outputs
