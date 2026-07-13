@@ -18,6 +18,7 @@ files = "Import masks and export 16-bit threshold textures"
 paths_exclude_pattern = [
   "__pycache__/",
   "/.git/",
+  "/bin/Release/",
   "/*.zip",
   "*.pyc",
 ]

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import sys
+import time
 import traceback
 
 
@@ -11,6 +13,26 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import bpy  # noqa: E402
+import numpy as np  # noqa: E402
+
+
+def _source_fingerprints(project, runtime):
+    records = []
+    for item in project.angles:
+        for image in (
+            runtime.resolve_display_image(project, item),
+            runtime.resolve_base_image(project, item),
+            runtime.resolve_coverage_image(project, item),
+        ):
+            assert image is not None
+            records.append(
+                (
+                    image.name,
+                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                    hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                )
+            )
+    return tuple(records)
 
 
 def _mesh() -> bpy.types.Object:
@@ -47,6 +69,26 @@ def check() -> float | None:
     try:
         from quick_sdf_blender import runtime, studio
 
+        if STATE.get("phase") == "STALE_EXPORTING":
+            project = STATE["project"]
+            STATE["stale_attempts"] = STATE.get("stale_attempts", 0) + 1
+            if bool(project.job_running):
+                if STATE["stale_attempts"] > 300:
+                    raise AssertionError(project.job_message or project.diagnostic_message)
+                return 0.05
+            assert project.export_failed
+            assert project.dirty
+            assert "project changed" in project.job_message
+            assert not STATE["stale_path"].exists()
+            export_path = ROOT / "build" / "studio_async_export.png"
+            export_path.unlink(missing_ok=True)
+            assert bpy.ops.quicksdf.export_texture(
+                filepath=str(export_path), overwrite=True
+            ) == {"FINISHED"}
+            assert project.job_running
+            STATE["export_path"] = export_path
+            STATE["phase"] = "EXPORTING"
+            return 0.1
         if STATE.get("phase") == "EXPORTING":
             project = STATE["project"]
             export_path = STATE["export_path"]
@@ -56,6 +98,53 @@ def check() -> float | None:
                     raise AssertionError(project.job_message or project.diagnostic_message)
                 return 0.1
             assert export_path.is_file()
+            assert project.job_message == "Adjusted angle continuity and exported"
+            assert project.export_adjustment_pixel_count > 0
+            assert project.export_adjustment_image is not None
+            assert _source_fingerprints(project, runtime) == STATE["source_fingerprints"]
+            assert studio.current_session().view_mode == "PREVIEW"
+            assert str(runtime.active_angle(project).uuid) == STATE["edit_uuid"]
+            assert bpy.context.scene.tool_settings.image_paint.canvas == STATE["canvas"]
+            image_area = next(
+                area for area in bpy.context.window.screen.areas if area.type == "IMAGE_EDITOR"
+            )
+            assert bpy.ops.quicksdf.review_export_adjustments() == {"FINISHED"}
+            assert image_area.spaces.active.image == project.export_adjustment_image
+            assert image_area.spaces.active.ui_mode == "VIEW"
+            assert studio.current_session().export_review_active
+            image_region = next(
+                region for region in image_area.regions if region.type == "WINDOW"
+            )
+            with bpy.context.temp_override(
+                window=bpy.context.window,
+                screen=bpy.context.window.screen,
+                area=image_area,
+                region=image_region,
+            ):
+                assert not bpy.ops.quicksdf.range_paint.poll()
+            # A key selection is the explicit exit from read-only review.
+            assert bpy.ops.quicksdf.key_select(index=int(project.active_angle_index)) == {"FINISHED"}
+            assert image_area.spaces.active.ui_mode == "PAINT"
+            assert image_area.spaces.active.image == STATE["canvas"]
+            assert not studio.current_session().export_review_active
+            assert bpy.ops.quicksdf.seek_set(angle=22.5) == {"FINISHED"}
+            assert studio.current_session().view_mode == "PREVIEW"
+            assert bpy.ops.quicksdf.review_export_adjustments() == {"FINISHED"}
+            assert image_area.spaces.active.ui_mode == "VIEW"
+            adjusted_save = ROOT / "build" / "studio_adjusted_save.blend"
+            adjusted_save.unlink(missing_ok=True)
+            assert bpy.ops.wm.save_as_mainfile(filepath=str(adjusted_save)) == {"FINISHED"}
+            assert project.export_adjustment_image is None
+            assert project.export_adjustment_pixel_count == 0
+            assert not any(
+                image.get(runtime.ROLE_KEY) == runtime.EXPORT_ADJUSTMENT_ROLE
+                for image in bpy.data.images
+            )
+            assert image_area.spaces.active.image != project.export_adjustment_image
+            assert image_area.spaces.active.ui_mode == "PAINT"
+            assert not studio.current_session().export_review_active
+            assert studio.current_session().view_mode == "PREVIEW"
+            assert bpy.context.scene.tool_settings.image_paint.canvas == STATE["canvas"]
             assert bpy.ops.quicksdf.studio_exit() == {"FINISHED"}
             STATE["phase"] = "EXITED"
             return 0.1
@@ -188,14 +277,51 @@ def check() -> float | None:
         assert preview_material.node_tree.nodes["QSDF Mask"].image == canvas
         runtime.discard_paint_snapshot(project)
         assert bpy.ops.quicksdf.seek_set(angle=22.5) == {"FINISHED"}
-        export_path = ROOT / "build" / "studio_async_export.png"
-        export_path.unlink(missing_ok=True)
+        invalid_values = (True, False, True, True, True, True, True)
+        for index, (item, value) in enumerate(zip(project.angles, invalid_values)):
+            display = runtime.resolve_display_image(project, item)
+            coverage = runtime.resolve_coverage_image(project, item)
+            display_rgba = runtime.image_rgba(display)
+            coverage_rgba = runtime.image_rgba(coverage)
+            display_rgba[90, 90, :3] = float(value)
+            display_rgba[90, 90, 3] = 1.0
+            coverage_rgba[90, 90, :3] = float(index == 0)
+            coverage_rgba[90, 90, 3] = 1.0
+            runtime.write_image_rgba(display, display_rgba)
+            runtime.write_image_rgba(coverage, coverage_rgba)
+        STATE["source_fingerprints"] = _source_fingerprints(project, runtime)
+        STATE["edit_uuid"] = edit_uuid
+        STATE["canvas"] = canvas
+        from quick_sdf_blender import operators
+
+        cancelled_path = ROOT / "build" / "studio_cancelled_export.png"
+        cancelled_path.unlink(missing_ok=True)
         assert bpy.ops.quicksdf.export_texture(
-            filepath=str(export_path), overwrite=True
+            filepath=str(cancelled_path), overwrite=True
         ) == {"FINISHED"}
         assert project.job_running
-        STATE["export_path"] = export_path
-        STATE["phase"] = "EXPORTING"
+        cancel_started = time.perf_counter()
+        assert bpy.ops.quicksdf.cancel_job() == {"FINISHED"}
+        assert time.perf_counter() - cancel_started < 1.0
+        assert not project.job_running
+        assert operators._EXPORT_JOB is None
+        assert not bpy.app.timers.is_registered(operators._poll_export_job)
+        assert not cancelled_path.exists()
+        stale_path = ROOT / "build" / "studio_stale_export.png"
+        stale_path.unlink(missing_ok=True)
+        assert bpy.ops.quicksdf.export_texture(
+            filepath=str(stale_path), overwrite=True
+        ) == {"FINISHED"}
+        assert project.job_running
+        # A no-op pixel rewrite changes the image revision after the worker's
+        # snapshot. The stale result must never be written or mark this edit clean.
+        stale_image = runtime.resolve_display_image(project, project.angles[0])
+        stale_rgba = runtime.image_rgba(stale_image)
+        runtime.write_image_rgba(stale_image, stale_rgba)
+        project.dirty = True
+        STATE["source_fingerprints"] = _source_fingerprints(project, runtime)
+        STATE["stale_path"] = stale_path
+        STATE["phase"] = "STALE_EXPORTING"
         return 0.1
     except Exception as error:
         finish(error)

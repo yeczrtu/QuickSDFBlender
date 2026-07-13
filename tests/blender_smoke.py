@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import hashlib
 from pathlib import Path
 import struct
 import sys
@@ -124,6 +125,52 @@ def _assert_canvas(project: object) -> None:
     assert image.get(runtime.ANGLE_UUID_KEY) == angle_item.uuid
 
 
+def _assert_export_worker_side_contracts() -> None:
+    from quick_sdf_blender import operators
+    from quick_sdf_blender.core import generate_threshold_pair
+    from quick_sdf_blender.symmetry import IslandPair, mirror_side_stack
+
+    angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float64)
+    right_transition = np.asarray([[0, 1, 3, 2], [3, 2, 1, 0]])
+    left_transition = np.asarray([[3, 1, 2, 0], [1, 3, 0, 2]])
+    right = np.arange(3)[:, None, None] >= right_transition[None, ...]
+    left = np.arange(3)[:, None, None] >= left_transition[None, ...]
+    coverage = np.zeros_like(right)
+    independent = operators._compute_export_result(
+        {
+            "linked": False,
+            "right": (right, angles, ~right, coverage),
+            "left": (left, angles, np.roll(left, 1, axis=0), coverage),
+        }
+    )
+    np.testing.assert_array_equal(
+        independent["rgba"], generate_threshold_pair(right, angles, left, angles)
+    )
+    assert independent["changed_pixel_count"] == 0
+
+    full = np.ones(right.shape[1:], dtype=np.bool_)
+    for mode, pairs in (
+        ("OVERLAPPED", None),
+        ("TEXTURE_MIRROR", None),
+        ("ISLAND_PAIR", [IslandPair(full, full)]),
+    ):
+        mirrored = mirror_side_stack(left, mode, island_pairs=pairs)
+        linked_left = operators._compute_export_result(
+            {
+                "linked": True,
+                "author_side": "LEFT",
+                "source": (left, angles, ~left, coverage),
+                "mirror_mode": mode,
+                "island_pairs": pairs,
+            }
+        )
+        np.testing.assert_array_equal(
+            linked_left["rgba"],
+            generate_threshold_pair(mirrored, angles, left, angles),
+        )
+        assert linked_left["changed_pixel_count"] == 0
+
+
 def run(output_directory: Path) -> None:
     assert bpy.app.version[:2] == (5, 1), (
         f"this smoke test targets Blender 5.1, got {bpy.app.version_string}"
@@ -132,10 +179,13 @@ def run(output_directory: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     blend_path = output_directory / "quick_sdf_smoke.blend"
     png_path = output_directory / "quick_sdf_smoke_rgba16.png"
+    repaired_png_path = output_directory / "quick_sdf_smoke_repaired_rgba16.png"
     if blend_path.exists():
         blend_path.unlink()
     if png_path.exists():
         png_path.unlink()
+    if repaired_png_path.exists():
+        repaired_png_path.unlink()
 
     print("[Quick SDF smoke] enable through Blender preferences")
     # This is deliberately not a direct ``register()`` call.  Blender wraps
@@ -307,6 +357,7 @@ def run(output_directory: Path) -> None:
     assert signed_report.is_valid, signed_report.offending_transitions
 
     print("[Quick SDF smoke] validate, generate, and export RGBA16 PNG")
+    _assert_export_worker_side_contracts()
     _expect_finished(bpy.ops.quicksdf.validate(), "validate")
     assert not project.has_violations
     assert project.validation_message == "OK"
@@ -314,6 +365,11 @@ def run(output_directory: Path) -> None:
     assert project.generated_image is not None
     assert project.generated_image.get(runtime.PROJECT_UUID_KEY) == project.uuid
     assert project.generated_image.get(runtime.ROLE_KEY) == runtime.THRESHOLD_ROLE
+    from quick_sdf_blender import operators
+
+    strict_expected = operators._compute_threshold_rgba(
+        operators._prepare_strict_threshold_inputs(project)
+    )
     _expect_finished(
         bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
         "export_texture",
@@ -333,6 +389,182 @@ def run(output_directory: Path) -> None:
     assert np.all(pixels[..., 3] == 65535)
     assert np.all((pixels[..., 0] >= 0) & (pixels[..., 0] <= 65535))
     assert np.all((pixels[..., 1] >= 0) & (pixels[..., 1] <= 65535))
+    np.testing.assert_array_equal(pixels, strict_expected)
+    assert project.export_adjustment_pixel_count == 0
+    assert project.export_adjustment_image is None
+    valid_png_bytes = png_path.read_bytes()
+
+    print("[Quick SDF smoke] auto-repair an invalid paint stack without changing source images")
+    from quick_sdf_blender.core import generate_threshold_pair, repair_side_monotonic
+    from quick_sdf_blender.symmetry import mirror_side_stack
+
+    test_y, test_x = 100, 100
+    invalid_values = (True, False, True, True, True, True, True)
+    original_pixels = {}
+    for item, value in zip(project.angles, invalid_values):
+        display = runtime.resolve_display_image(project, item)
+        coverage = runtime.resolve_coverage_image(project, item)
+        assert display is not None and coverage is not None
+        display_rgba = runtime.image_rgba(display)
+        coverage_rgba = runtime.image_rgba(coverage)
+        original_pixels[(item.uuid, "display")] = display_rgba[test_y, test_x].copy()
+        original_pixels[(item.uuid, "coverage")] = coverage_rgba[test_y, test_x].copy()
+        display_rgba[test_y, test_x, :3] = float(value)
+        display_rgba[test_y, test_x, 3] = 1.0
+        coverage_rgba[test_y, test_x, :3] = 1.0
+        coverage_rgba[test_y, test_x, 3] = 1.0
+        runtime.write_image_rgba(display, display_rgba)
+        runtime.write_image_rgba(coverage, coverage_rgba)
+
+    def source_fingerprints():
+        records = []
+        for item in project.angles:
+            for image in (
+                runtime.resolve_display_image(project, item),
+                runtime.resolve_base_image(project, item),
+                runtime.resolve_coverage_image(project, item),
+            ):
+                assert image is not None
+                records.append(
+                    (
+                        image.name,
+                        int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                        hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                    )
+                )
+        return tuple(records)
+
+    before_repair_export = source_fingerprints()
+    try:
+        strict_result = bpy.ops.quicksdf.generate()
+    except RuntimeError as error:
+        assert "wrong direction" in str(error)
+    else:
+        assert strict_result == {"CANCELLED"}
+    prepared = operators._prepare_threshold_inputs(project)
+    assert prepared["linked"]
+    source_display, source_angles, source_base, source_coverage = prepared["source"]
+    repair = repair_side_monotonic(source_display, source_base, source_coverage)
+    assert repair.changed_pixel_count > 0
+    assert repair.protected_changed_pixel_count > 0
+    from quick_sdf_blender import live_preview
+
+    canvas_before_seek = scene.tool_settings.image_paint.canvas
+    seek_image = live_preview.update_seek_preview(project, float(source_angles[1]))
+    assert seek_image is not None
+    np.testing.assert_array_equal(runtime.image_mask(seek_image), repair.masks[1])
+    assert scene.tool_settings.image_paint.canvas == canvas_before_seek
+    mirrored = mirror_side_stack(
+        repair.masks,
+        prepared["mirror_mode"],
+        island_pairs=prepared["island_pairs"],
+    )
+    if prepared["author_side"] == "RIGHT":
+        expected_repaired = generate_threshold_pair(
+            repair.masks, source_angles, mirrored, source_angles
+        )
+    else:
+        expected_repaired = generate_threshold_pair(
+            mirrored, source_angles, repair.masks, source_angles
+        )
+    _expect_finished(
+        bpy.ops.quicksdf.export_texture(filepath=str(repaired_png_path), overwrite=True),
+        "repairing export_texture",
+    )
+    assert repaired_png_path.is_file()
+    _repair_header, repaired_pixels = _decode_rgba16(repaired_png_path)
+    np.testing.assert_array_equal(repaired_pixels, expected_repaired)
+    assert source_fingerprints() == before_repair_export
+    assert project.export_adjustment_pixel_count == repair.changed_pixel_count
+    assert project.export_adjustment_sample_count == repair.changed_sample_count
+    assert (
+        project.export_adjustment_protected_pixel_count
+        == repair.protected_changed_pixel_count
+    )
+    assert project.export_adjustment_image is not None
+    assert project.export_adjustment_image.get(runtime.ROLE_KEY) == runtime.EXPORT_ADJUSTMENT_ROLE
+    assert project.job_message == "Adjusted angle continuity and exported"
+
+    print("[Quick SDF smoke] preserve successful derived state on I/O failure")
+    second_y, second_x = 101, 101
+    second_values = (False, True, False, True, True, True, True)
+    for item, value in zip(project.angles, second_values):
+        display = runtime.resolve_display_image(project, item)
+        coverage = runtime.resolve_coverage_image(project, item)
+        display_rgba = runtime.image_rgba(display)
+        coverage_rgba = runtime.image_rgba(coverage)
+        original_pixels[(item.uuid, "display2")] = display_rgba[second_y, second_x].copy()
+        original_pixels[(item.uuid, "coverage2")] = coverage_rgba[second_y, second_x].copy()
+        display_rgba[second_y, second_x, :3] = float(value)
+        display_rgba[second_y, second_x, 3] = 1.0
+        runtime.write_image_rgba(display, display_rgba)
+    project.dirty = True
+    adjustment_image = project.export_adjustment_image
+    previous_derived = (
+        project.generated_image.name,
+        hashlib.sha256(runtime.image_rgba(project.generated_image).tobytes()).hexdigest(),
+        adjustment_image.name,
+        hashlib.sha256(runtime.image_rgba(adjustment_image).tobytes()).hexdigest(),
+        int(project.export_adjustment_pixel_count),
+        int(project.export_adjustment_sample_count),
+        int(project.export_adjustment_protected_pixel_count),
+        str(project.validation_message),
+    )
+    blocker = output_directory / "export_blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    retry_path = blocker / "face_shadow.png"
+    retry_source = source_fingerprints()
+    try:
+        failed_result = bpy.ops.quicksdf.export_texture(
+            filepath=str(retry_path), overwrite=True
+        )
+    except RuntimeError as error:
+        assert "export_blocker" in str(error)
+    else:
+        assert failed_result == {"CANCELLED"}
+    assert project.export_failed
+    assert project.dirty
+    assert str(project.output_path) == str(retry_path)
+    assert project.job_message.startswith("Export failed:")
+    assert source_fingerprints() == retry_source
+    assert previous_derived == (
+        project.generated_image.name,
+        hashlib.sha256(runtime.image_rgba(project.generated_image).tobytes()).hexdigest(),
+        project.export_adjustment_image.name,
+        hashlib.sha256(runtime.image_rgba(project.export_adjustment_image).tobytes()).hexdigest(),
+        int(project.export_adjustment_pixel_count),
+        int(project.export_adjustment_sample_count),
+        int(project.export_adjustment_protected_pixel_count),
+        str(project.validation_message),
+    )
+    assert blocker.read_text(encoding="utf-8") == "not a directory"
+    blocker.unlink()
+
+    # Restore the test pixel, then verify a normal stack remains byte-identical
+    # through the repair-enabled export path.
+    for item in project.angles:
+        display = runtime.resolve_display_image(project, item)
+        coverage = runtime.resolve_coverage_image(project, item)
+        display_rgba = runtime.image_rgba(display)
+        coverage_rgba = runtime.image_rgba(coverage)
+        display_rgba[test_y, test_x] = original_pixels[(item.uuid, "display")]
+        coverage_rgba[test_y, test_x] = original_pixels[(item.uuid, "coverage")]
+        display_rgba[second_y, second_x] = original_pixels[(item.uuid, "display2")]
+        coverage_rgba[second_y, second_x] = original_pixels[(item.uuid, "coverage2")]
+        runtime.write_image_rgba(display, display_rgba)
+        runtime.write_image_rgba(coverage, coverage_rgba)
+    _expect_finished(
+        bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
+        "clean re-export",
+    )
+    assert png_path.read_bytes() == valid_png_bytes
+    assert project.export_adjustment_pixel_count == 0
+    assert project.export_adjustment_image is None
+
+    project.output_path = str(png_path)
+    project.export_failed = False
+    project.job_message = ""
+    project.diagnostic_message = ""
 
     print("[Quick SDF smoke] save/reload and repair UUID-backed references")
     project_uuid = project.uuid

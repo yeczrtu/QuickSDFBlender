@@ -10,8 +10,20 @@ $buildDirectory = Join-Path $repositoryRoot 'build'
 $nativeBuild = Join-Path $repositoryRoot 'native\build.ps1'
 $smokeTest = Join-Path $repositoryRoot 'tests\blender_smoke.py'
 $migrationSmokeTest = Join-Path $repositoryRoot 'tests\blender_migration_smoke.py'
+$studioSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_smoke.py'
+$savedStateSmokeTest = Join-Path $repositoryRoot 'tests\blender_saved_state_smoke.py'
+$installedSmokeTest = Join-Path $repositoryRoot 'tests\blender_installed_extension_smoke.py'
+$archiveVerification = Join-Path $repositoryRoot 'tests\verify_extension_archive.py'
 $extensionSource = Join-Path $repositoryRoot 'quick_sdf_blender'
-$extensionArchive = Join-Path $buildDirectory 'quick_sdf_blender.zip'
+$manifestPath = Join-Path $extensionSource 'blender_manifest.toml'
+$manifestText = Get-Content -Raw -LiteralPath $manifestPath
+if ($manifestText -notmatch '(?m)^version\s*=\s*"([^"]+)"\s*$') {
+    throw "Could not read the extension version from $manifestPath"
+}
+$extensionVersion = $Matches[1]
+$extensionArchive = Join-Path $buildDirectory "quick_sdf_blender-$extensionVersion-windows-x64.zip"
+$studioResult = Join-Path $buildDirectory 'studio_smoke_result.txt'
+$studioSavedBlend = Join-Path $buildDirectory 'studio_adjusted_save.blend'
 
 if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
     throw "Blender executable was not found: $BlenderPath"
@@ -30,7 +42,7 @@ try {
         $repositoryRoot
     }
 
-    Write-Host '==> 1/5 Build Windows native core'
+    Write-Host '==> 1/9 Build Windows native core'
     $global:LASTEXITCODE = 0
     & $nativeBuild
     if ($LASTEXITCODE -ne 0) {
@@ -41,25 +53,54 @@ try {
         throw "Native build did not produce $nativeLibrary"
     }
 
-    Write-Host '==> 2/5 Run Python unit tests'
+    Write-Host '==> 2/9 Run Python unit tests'
     & $PythonPath -m unittest discover -s tests -p 'test_*.py'
     if ($LASTEXITCODE -ne 0) {
         throw "Unit tests failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 3/5 Run Blender 5.1 background smoke test'
-    & $BlenderPath --background --factory-startup --python $smokeTest -- --output-dir $buildDirectory
+    Write-Host '==> 3/9 Run Blender 5.1 background smoke test'
+    & $BlenderPath --background --factory-startup --python-exit-code 1 `
+        --python $smokeTest -- --output-dir $buildDirectory
     if ($LASTEXITCODE -ne 0) {
         throw "Blender smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 4/5 Verify schema v1 to v2 save/reload migration'
-    & $BlenderPath --background --factory-startup --python $migrationSmokeTest
+    Write-Host '==> 4/9 Verify schema v1/v2 to v3 save/reload migration'
+    & $BlenderPath --background --factory-startup --python-exit-code 1 `
+        --python $migrationSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender migration smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 5/5 Build Blender extension archive'
+    Write-Host '==> 5/9 Run Blender 5.1 interactive Studio lifecycle smoke test'
+    if (Test-Path -LiteralPath $studioResult) {
+        Remove-Item -Force -LiteralPath $studioResult
+    }
+    & $BlenderPath --factory-startup --python-exit-code 1 --python $studioSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender Studio smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $studioResult -PathType Leaf)) {
+        throw 'Blender Studio smoke test did not produce a result file'
+    }
+    $studioOutcome = (Get-Content -Raw -LiteralPath $studioResult).Trim()
+    if ($studioOutcome -ne 'PASS') {
+        throw "Blender Studio smoke test failed:`n$studioOutcome"
+    }
+    if (-not (Test-Path -LiteralPath $studioSavedBlend -PathType Leaf)) {
+        throw 'Blender Studio smoke test did not produce its active-session save'
+    }
+
+    Write-Host '==> 6/9 Verify active Studio save in a fresh Blender process'
+    & $BlenderPath --background --factory-startup --python-exit-code 1 `
+        --python $savedStateSmokeTest `
+        -- --blend $studioSavedBlend
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender saved-state smoke test failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "==> 7/9 Build and validate Blender extension $extensionVersion"
     if (Test-Path -LiteralPath $extensionArchive) {
         Remove-Item -Force -LiteralPath $extensionArchive
     }
@@ -78,7 +119,45 @@ try {
         throw "Extension validation failed with exit code $LASTEXITCODE"
     }
 
+    Write-Host '==> 8/9 Verify release ZIP contents byte-for-byte'
+    & $PythonPath $archiveVerification `
+        --archive $extensionArchive `
+        --source $extensionSource `
+        --expected-version $extensionVersion
+    if ($LASTEXITCODE -ne 0) {
+        throw "Extension archive verification failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host '==> 9/9 Install and exercise the ZIP in an isolated Blender user directory'
+    $isolatedUser = Join-Path $buildDirectory ("isolated-user-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $isolatedUser | Out-Null
+    $previousUserResources = $env:BLENDER_USER_RESOURCES
+    try {
+        $env:PYTHONPATH = $null
+        $env:BLENDER_USER_RESOURCES = $isolatedUser
+        & $BlenderPath --background --factory-startup --command extension install-file `
+            -r user_default -e $extensionArchive
+        if ($LASTEXITCODE -ne 0) {
+            throw "Isolated extension install failed with exit code $LASTEXITCODE"
+        }
+        & $BlenderPath --background --python-exit-code 1 --python $installedSmokeTest `
+            -- --expected-version $extensionVersion --isolated-root $isolatedUser
+        if ($LASTEXITCODE -ne 0) {
+            throw "Installed extension smoke test failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        $env:BLENDER_USER_RESOURCES = $previousUserResources
+        $env:PYTHONPATH = if ($previousPythonPath) {
+            "$repositoryRoot;$previousPythonPath"
+        } else {
+            $repositoryRoot
+        }
+    }
+
+    $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $extensionArchive).Hash.ToLowerInvariant()
     Write-Host "Build complete: $extensionArchive"
+    Write-Host "SHA256: $archiveHash"
 }
 finally {
     $env:PYTHONPATH = $previousPythonPath
