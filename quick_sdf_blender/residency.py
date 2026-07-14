@@ -123,6 +123,8 @@ def _release_cpu(image: Any) -> bool:
     if not callable(free):
         return False
     free()
+    if bpy.app.background:
+        return True
     name = str(image.name)
     _PENDING_RELEASE.pop(name, None)
     _PENDING_RELEASE[name] = None
@@ -132,7 +134,10 @@ def _release_cpu(image: Any) -> bool:
 
 def _release_gpu(image: Any) -> bool:
     if _image_in_use(image):
-        return False
+        # The image became active between CPU release and this deferred event.
+        # Keep its GPU texture and drop this request; a later eviction will
+        # enqueue a fresh release after it leaves the editors again.
+        return True
     free = getattr(image, "gl_free", None)
     if callable(free):
         free()
@@ -179,7 +184,9 @@ def _keep_names(project: Any, primary_image: Any | None) -> set[str]:
     used = 0
     for image in keep:
         width, height = map(int, image.size[:])
-        cost = width * height * 4
+        # Blender exposes every byte Image to Python through a float RGBA
+        # buffer (16 bytes/pixel), which is the actual CPU residency cost.
+        cost = width * height * 16
         if result and used + cost > DISPLAY_RESIDENT_BUDGET:
             continue
         result.add(str(image.name))
@@ -204,7 +211,8 @@ def reconcile_project(project: Any, primary_image: Any | None = None) -> None:
         if _packed_revision(image) != _revision(image):
             mark_changed(image)
             continue
-        _release_cpu(image)
+        if bool(getattr(image, "has_data", True)):
+            _release_cpu(image)
 
 
 def activate(project: Any, image: Any | None) -> Any | None:
@@ -214,9 +222,10 @@ def activate(project: Any, image: Any | None) -> Any | None:
     return image
 
 
-def flush_dirty(project_uuid: str = "") -> None:
+def flush_dirty(project_uuid: str = "") -> tuple[str, ...]:
     """Synchronously pack queued authoring images, normally before Save."""
 
+    failed: list[str] = []
     for name in tuple(_DIRTY):
         image = bpy.data.images.get(name)
         if image is None:
@@ -229,13 +238,20 @@ def flush_dirty(project_uuid: str = "") -> None:
         except (OSError, ReferenceError, RuntimeError):
             # Saving must remain Blender's decision. A stale packed revision is
             # retained so the next validation can report the missing layer.
-            pass
+            failed.append(name)
+    return tuple(failed)
 
 
 def forget_image(image_or_name: Any) -> None:
     name = str(getattr(image_or_name, "name", image_or_name))
     _DIRTY.pop(name, None)
     _PENDING_RELEASE.pop(name, None)
+    try:
+        from .runtime import invalidate_gray_cache
+
+        invalidate_gray_cache(name)
+    except ImportError:
+        pass
 
 
 def _idle_step() -> float | None:
@@ -250,7 +266,10 @@ def _idle_step() -> float | None:
                 if project is not None and int(getattr(project, "resolution", 0)) >= RESIDENCY_MIN_RESOLUTION:
                     reconcile_project(project)
             except (OSError, ReferenceError, RuntimeError):
-                pass
+                # A transient pack failure must not silently make the stale
+                # recovery source eligible for Save or buffer eviction.
+                _DIRTY[name] = None
+                return 0.25
         return 0.02
     if _PENDING_RELEASE:
         name, _value = _PENDING_RELEASE.popitem(last=False)

@@ -44,6 +44,7 @@ BASE_BITPLANE_KEY = "_qsdf_base_bitplane"
 COVERAGE_BITPLANE_KEY = "_qsdf_coverage_bitplane"
 _BITPLANE_CACHE = DecodedBitplaneCache()
 _GRAY_CACHE_NAME = ""
+_GRAY_CACHE_IDENTITY = 0
 _GRAY_CACHE_REVISION = -1
 _GRAY_CACHE_VALUE: Any | None = None
 _GRAY_UPLOAD_BUFFER: Any | None = None
@@ -965,23 +966,66 @@ def image_rgba8(image: bpy.types.Image) -> Any:
 
 
 def _clear_gray_cache(image_name: str = "") -> None:
-    global _GRAY_CACHE_NAME, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
+    global _GRAY_CACHE_NAME, _GRAY_CACHE_IDENTITY, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
 
     if image_name and image_name != _GRAY_CACHE_NAME:
         return
     _GRAY_CACHE_NAME = ""
+    _GRAY_CACHE_IDENTITY = 0
     _GRAY_CACHE_REVISION = -1
     _GRAY_CACHE_VALUE = None
 
 
+def invalidate_gray_cache(image_or_name: Any | None = None) -> None:
+    """Release the session gray cache after lifecycle or datablock changes."""
+
+    if image_or_name is None:
+        _clear_gray_cache()
+        return
+    _clear_gray_cache(str(getattr(image_or_name, "name", image_or_name)))
+
+
+def _image_identity(image: bpy.types.Image) -> int:
+    try:
+        # Blender may immediately recycle an RNA memory address after an Image
+        # is removed. ID.session_uid remains unique for the whole file session
+        # and therefore distinguishes same-name replacement datablocks.
+        session_uid = int(getattr(image, "session_uid", 0))
+        return session_uid if session_uid else int(image.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError):
+        return 0
+
+
+def _is_paint_canvas(image: bpy.types.Image) -> bool:
+    for scene in bpy.data.scenes:
+        paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
+        if paint is not None and getattr(paint, "canvas", None) == image:
+            return True
+    return False
+
+
 def _store_gray_cache(image: bpy.types.Image, values: Any) -> None:
-    global _GRAY_CACHE_NAME, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
+    global _GRAY_CACHE_NAME, _GRAY_CACHE_IDENTITY, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
 
     import numpy as np
 
     _GRAY_CACHE_NAME = str(image.name)
+    _GRAY_CACHE_IDENTITY = _image_identity(image)
     _GRAY_CACHE_REVISION = int(image.get(IMAGE_REVISION_KEY, 0))
     _GRAY_CACHE_VALUE = np.array(values, copy=True, order="C")
+
+
+def cache_image_gray8(image: bpy.types.Image, values: Any) -> None:
+    """Retain a finalized native-paint result for the next Active snapshot."""
+
+    import numpy as np
+
+    gray = np.asarray(values)
+    width, height = map(int, image.size[:])
+    if gray.shape != (height, width) or gray.dtype != np.uint8:
+        raise ValueError("Display gray cache must be a matching uint8 image")
+    if _is_paint_canvas(image):
+        _store_gray_cache(image, gray)
 
 
 def image_gray8(image: bpy.types.Image, *, use_cache: bool = False) -> Any:
@@ -993,8 +1037,10 @@ def image_gray8(image: bpy.types.Image, *, use_cache: bool = False) -> Any:
     if (
         use_cache
         and str(image.name) == _GRAY_CACHE_NAME
+        and _image_identity(image) == _GRAY_CACHE_IDENTITY
         and revision == _GRAY_CACHE_REVISION
         and _GRAY_CACHE_VALUE is not None
+        and _GRAY_CACHE_VALUE.shape == (int(image.size[1]), int(image.size[0]))
     ):
         return np.array(_GRAY_CACHE_VALUE, copy=True, order="C")
     from .pixel_buffer import blender_float_rgba_to_top_down_gray8
@@ -1034,7 +1080,10 @@ def write_image_gray8(image: bpy.types.Image, values: Any) -> None:
         upload = np.empty(required, dtype=np.float32)
     top_down_gray8_to_blender_float_rgba(gray, out=upload)
     _write_blender_flat(image, upload)
-    _store_gray_cache(image, gray)
+    # Propagation writes several non-active keys.  Retaining the final one
+    # would evict the useful pre-stroke Active snapshot and force a full float
+    # read on the next stroke.
+    cache_image_gray8(image, gray)
 
 
 def capture_paint_snapshot(project: Any) -> None:
@@ -1395,6 +1444,159 @@ def project_side_export_layers(project: Any, side: str) -> tuple[Any, Any, Any, 
         np.ascontiguousarray(np.stack(base_layers, axis=0), dtype=np.bool_),
         np.ascontiguousarray(np.stack(coverage_layers, axis=0), dtype=np.bool_),
     )
+
+
+def insert_display_bit(
+    image: bpy.types.Image,
+    bit_index: int,
+    out: Any,
+    *,
+    rows_per_chunk: int = 64,
+) -> None:
+    """Insert one Display threshold directly into an ABI-7 uint16 bit field."""
+
+    import numpy as np
+
+    from .residency import ensure_loaded
+
+    destination = np.asarray(out)
+    width, height = map(int, image.size[:])
+    if destination.shape != (height, width) or destination.dtype != np.uint16:
+        raise ValueError("Packed Display destination must match the image as uint16")
+    index = int(bit_index)
+    if not 0 <= index < 16:
+        raise ValueError("Packed Display bit index must be in 0..15")
+    ensure_loaded(image)
+    flat = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(flat)
+    red = flat.reshape(height, width, 4)[..., 0]
+    bit = np.uint16(1 << index)
+    chunk = max(1, int(rows_per_chunk))
+    for top_start in range(0, height, chunk):
+        top_end = min(height, top_start + chunk)
+        source = red[height - top_end : height - top_start][::-1]
+        light = source >= np.float32(0.5)
+        destination[top_start:top_end] |= light.astype(np.uint16) * bit
+
+
+class PackedLaneSnapshot:
+    """Incrementally snapshot one bpy-backed side without retaining ID refs."""
+
+    def __init__(self, project: Any, side: str) -> None:
+        import numpy as np
+
+        self.project_uuid = str(getattr(project, "uuid", ""))
+        self.side = str(side).upper()
+        selected = sorted(
+            (
+                item
+                for item in getattr(project, "angles", ())
+                if str(getattr(item, "side", "RIGHT")) == self.side
+            ),
+            key=lambda item: float(getattr(item, "angle", 0.0)),
+        )
+        if not 2 <= len(selected) <= 16:
+            raise ValueError(f"{self.side.title()} export requires 2..16 keys")
+        angles = np.asarray([float(item.angle) for item in selected], dtype=np.float64)
+        if (
+            not np.isclose(angles[0], 0.0, atol=1.0e-7, rtol=0.0)
+            or not np.isclose(angles[-1], 90.0, atol=1.0e-7, rtol=0.0)
+            or np.any(np.diff(angles) <= 1.0e-7)
+        ):
+            raise ValueError(f"{self.side.title()} export keys must span 0..90 uniquely")
+        resolution = int(getattr(project, "resolution", 0))
+        if resolution <= 0:
+            raise ValueError("Project resolution is invalid")
+        self.entries = tuple(
+            (
+                str(item.uuid),
+                str(getattr(item, "display_image_name", "")),
+                float(item.angle),
+            )
+            for item in selected
+        )
+        self.angles = angles
+        shape = (resolution, resolution)
+        self.display_bits = np.zeros(shape, dtype=np.uint16)
+        self.base_bits = np.zeros(shape, dtype=np.uint16)
+        self.coverage_bits = np.zeros(shape, dtype=np.uint16)
+        self.index = 0
+
+    @property
+    def done(self) -> bool:
+        return self.index >= len(self.entries)
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+    def step(self, project: Any) -> bool:
+        """Snapshot one key and return whether the lane is complete."""
+
+        if self.done:
+            return True
+        if str(getattr(project, "uuid", "")) != self.project_uuid:
+            raise RuntimeError("Export project changed during snapshot")
+        uuid_value, _image_name, _angle = self.entries[self.index]
+        item = next(
+            (
+                candidate
+                for candidate in getattr(project, "angles", ())
+                if str(getattr(candidate, "uuid", "")) == uuid_value
+            ),
+            None,
+        )
+        if item is None:
+            raise RuntimeError("An angle key was removed during export snapshot")
+        image = resolve_display_image(project, item)
+        if image is None:
+            raise ValueError(f"Missing {self.side.title()} Display at {float(item.angle):g} degrees")
+        insert_display_bit(image, self.index, self.display_bits)
+        from .bitplane import BitplaneRole, insert_bitplane_into_uint16
+
+        insert_bitplane_into_uint16(
+            bitplane_blob(item, BitplaneRole.BASE),
+            self.index,
+            self.base_bits,
+            expected_role=BitplaneRole.BASE,
+        )
+        insert_bitplane_into_uint16(
+            bitplane_blob(item, BitplaneRole.COVERAGE),
+            self.index,
+            self.coverage_bits,
+            expected_role=BitplaneRole.COVERAGE,
+        )
+        self.index += 1
+        try:
+            from .residency import reconcile_project
+
+            active = active_angle(project)
+            active_image = resolve_display_image(project, active) if active is not None else None
+            reconcile_project(project, active_image)
+        except (ImportError, ReferenceError, RuntimeError):
+            pass
+        return self.done
+
+    def finish(self) -> Any:
+        if not self.done:
+            raise RuntimeError("Packed lane snapshot is incomplete")
+        from .core import PackedLane
+
+        return PackedLane(
+            angles=self.angles,
+            display_bits=self.display_bits,
+            base_bits=self.base_bits,
+            coverage_bits=self.coverage_bits,
+        )
+
+
+def project_side_packed_lane(project: Any, side: str) -> Any:
+    """Synchronously build a compact lane for script/background callers."""
+
+    snapshot = PackedLaneSnapshot(project, side)
+    while not snapshot.done:
+        snapshot.step(project)
+    return snapshot.finish()
 
 
 def project_side_stacks(project: Any, *, island_pairs: Any | None = None) -> tuple[Any, Any, Any, Any]:
@@ -1888,6 +2090,7 @@ def unregister_runtime() -> None:
     cleanup_export_adjustment_previews()
     _PAINT_SNAPSHOTS.clear()
     _INTERACTIVE_PAINT_SNAPSHOTS.clear()
+    _AUX_PAINT_SNAPSHOTS.clear()
     try:
         from .operators import clear_histories
 

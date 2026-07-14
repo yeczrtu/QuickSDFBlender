@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+import ctypes
 from pathlib import Path
 import struct
 import tempfile
@@ -480,6 +481,17 @@ class PngTests(unittest.TestCase):
             self.assertFalse(temporary.exists())
             _, decoded = decode_png(path.read_bytes())
             np.testing.assert_array_equal(decoded, pixels)
+
+    def test_cancelled_worker_png_removes_partial_temporary(self) -> None:
+        pixels = np.zeros((32, 37, 4), dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cancelled.png"
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                write_png_rgba16_temporary(
+                    path, pixels, cancel_requested=ctypes.c_int(1)
+                )
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
     def test_rejects_non_uint16_or_wrong_shape(self) -> None:
         with self.assertRaises(TypeError):

@@ -40,6 +40,15 @@ def _validated_rgba16(rgba: np.ndarray | Sequence[object]) -> np.ndarray:
 _IDAT_TARGET_BYTES = 256 * 1024
 
 
+def _cancelled(token: object | None) -> bool:
+    if token is None:
+        return False
+    is_set = getattr(token, "is_set", None)
+    if callable(is_set):
+        return bool(is_set())
+    return bool(getattr(token, "value", token))
+
+
 def _filtered_scanlines(pixels: np.ndarray) -> Iterator[bytes]:
     """Yield PNG scanlines using None for row zero and Up thereafter."""
 
@@ -56,11 +65,13 @@ def _filtered_scanlines(pixels: np.ndarray) -> Iterator[bytes]:
 
 
 def _compressed_idat_payloads(
-    pixels: np.ndarray, compress_level: int
+    pixels: np.ndarray, compress_level: int, cancel_requested: object | None = None
 ) -> Iterator[bytes]:
     compressor = zlib.compressobj(compress_level)
     pending = bytearray()
     for scanline in _filtered_scanlines(pixels):
+        if _cancelled(cancel_requested):
+            raise RuntimeError("PNG encoding was cancelled")
         pending.extend(compressor.compress(scanline))
         while len(pending) >= _IDAT_TARGET_BYTES:
             yield bytes(pending[:_IDAT_TARGET_BYTES])
@@ -72,12 +83,19 @@ def _compressed_idat_payloads(
         del pending[:size]
 
 
-def _write_png_stream(stream: BinaryIO, pixels: np.ndarray, compress_level: int) -> None:
+def _write_png_stream(
+    stream: BinaryIO,
+    pixels: np.ndarray,
+    compress_level: int,
+    cancel_requested: object | None = None,
+) -> None:
     height, width, _channels = pixels.shape
     stream.write(PNG_SIGNATURE)
     header = struct.pack(">IIBBBBB", width, height, 16, 6, 0, 0, 0)
     stream.write(_chunk(b"IHDR", header))
-    for payload in _compressed_idat_payloads(pixels, compress_level):
+    for payload in _compressed_idat_payloads(
+        pixels, compress_level, cancel_requested
+    ):
         stream.write(_chunk(b"IDAT", payload))
     stream.write(_chunk(b"IEND", b""))
 
@@ -102,6 +120,7 @@ def write_png_rgba16_temporary(
     rgba: np.ndarray | Sequence[object],
     *,
     compress_level: int = 1,
+    cancel_requested: object | None = None,
 ) -> Path:
     """Write and fsync a complete temporary PNG beside ``path``.
 
@@ -125,7 +144,9 @@ def write_png_rgba16_temporary(
             delete=False,
         ) as temporary:
             temporary_name = temporary.name
-            _write_png_stream(temporary, pixels, compress_level)
+            _write_png_stream(
+                temporary, pixels, compress_level, cancel_requested
+            )
             temporary.flush()
             os.fsync(temporary.fileno())
         return Path(temporary_name)
@@ -167,6 +188,7 @@ def write_png_rgba16(
     *,
     overwrite: bool = False,
     compress_level: int = 1,
+    cancel_requested: object | None = None,
 ) -> Path:
     """Atomically write RGBA16 PNG data in the target directory.
 
@@ -180,7 +202,10 @@ def write_png_rgba16(
     temporary_path: Path | None = None
     try:
         temporary_path = write_png_rgba16_temporary(
-            destination, rgba, compress_level=compress_level
+            destination,
+            rgba,
+            compress_level=compress_level,
+            cancel_requested=cancel_requested,
         )
         result = commit_png_temporary(
             temporary_path, destination, overwrite=overwrite

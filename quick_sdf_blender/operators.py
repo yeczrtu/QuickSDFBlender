@@ -998,19 +998,33 @@ def _packing_channel(project, output_channel: str):
     return packing_channel_for(project, str(output_channel).upper())
 
 
-def _record_aux_image_change(project, item, image, before, label: str) -> bool:
+def _record_aux_image_change(
+    project,
+    item,
+    image,
+    before,
+    label: str,
+    *,
+    after=None,
+) -> bool:
     """Publish one static-mask edit to Quick SDF history and export revision."""
 
     import numpy as np
 
-    after = runtime.image_gray8(image)
+    after = runtime.image_gray8(image) if after is None else np.asarray(after)
     if before.shape == after.shape and np.array_equal(before, after):
         return False
     history = _HISTORIES.setdefault(str(project.uuid), History(compression_level=1))
-    if history.can_redo:
+    had_redo = history.can_redo
+    transaction = history.begin_transaction(label)
+    transaction.add_delta(image.name, before, after)
+    if transaction.needs_rollback or not transaction.commit():
+        if history.active_transaction is transaction:
+            transaction.rollback()
+        runtime.write_image_gray8(image, before)
+        raise RuntimeError("This mask edit is too large for the Quick SDF Undo history")
+    if had_redo:
         _purge_history_orphans(str(project.uuid))
-    if not history.push(label, {image.name: before}, {image.name: after}):
-        history.clear()
     _UNDO_FENCES.add(str(project.uuid))
     from .model import mark_aux_mask_changed
 
@@ -1771,7 +1785,7 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             except (ImportError, AttributeError, ReferenceError, RuntimeError):
                 pass
 
-        def complete_active_stroke(active_item, source_image) -> None:
+        def complete_active_stroke(active_item, source_image, gray=None) -> None:
             source_image[runtime.IMAGE_REVISION_KEY] = int(
                 source_image.get(runtime.IMAGE_REVISION_KEY, 0)
             ) + 1
@@ -1785,6 +1799,8 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 mark_changed(source_image, synchronous=True)
             except (ImportError, OSError, ReferenceError, RuntimeError):
                 pass
+            if gray is not None:
+                runtime.cache_image_gray8(source_image, gray)
             try:
                 from .live_preview import invalidate
 
@@ -1828,7 +1844,9 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     image,
                     before_rgba,
                     "Paint Additional Mask",
+                    after=current,
                 )
+                runtime.cache_image_gray8(image, current)
                 try:
                     from .studio import tag_studio_redraw
 
@@ -1837,12 +1855,15 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     pass
                 return {"FINISHED"}
             except Exception as exc:
-                clear_histories(str(project.uuid))
+                restored = False
                 if image is not None:
                     try:
                         runtime.write_image_gray8(image, before_rgba)
+                        restored = True
                     except Exception:
                         pass
+                if not restored:
+                    clear_histories(str(project.uuid))
                 self.report({"ERROR"}, f"Could not finish the mask stroke: {exc}")
                 return {"CANCELLED"}
             finally:
@@ -2015,41 +2036,51 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 from .studio import finish_provisional_stroke
 
                 finish_provisional_stroke(context, project, changed=True)
-                complete_active_stroke(active_item, source_image)
+                complete_active_stroke(active_item, source_image, source_gray)
                 return {"FINISHED"}
             except Exception as exc:
+                rollback_errors: tuple[str, ...] = ()
+                rollback_safe = False
                 try:
                     if (
                         transaction is not None
                         and history is not None
                         and history.active_transaction is transaction
                     ):
-                        for key in transaction.keys:
-                            current = _history_values(project, (key,)).get(key)
-                            if current is None:
-                                continue
-                            restored = transaction.restore_before(key, current)
-                            _write_history_values(project, {key: restored})
-                        transaction.rollback()
+                        rollback_errors = _rollback_history_transaction(
+                            project, transaction
+                        )
+                        rollback_safe = not rollback_errors
                     elif source_image is not None:
                         runtime.write_image_gray8(source_image, before_gray)
                 except Exception:
                     pass
-                clear_histories(str(project.uuid))
                 for item_uuid, flags in metadata_before.items():
                     candidate = next(
                         (item for item in project.angles if str(item.uuid) == item_uuid),
                         None,
                     )
-                    if candidate is not None:
-                        candidate.is_manual, candidate.dirty = flags
+                    if candidate is None:
+                        rollback_safe = False
+                    else:
+                        try:
+                            candidate.is_manual, candidate.dirty = flags
+                        except (AttributeError, ReferenceError):
+                            rollback_safe = False
                 try:
                     from .studio import finish_provisional_stroke
 
                     finish_provisional_stroke(context, project, changed=False)
                 except (ImportError, ReferenceError, RuntimeError):
-                    pass
-                self.report({"ERROR"}, f"Could not finish the paint stroke: {exc}")
+                    rollback_safe = False
+                if not rollback_safe:
+                    clear_histories(str(project.uuid))
+                suffix = (
+                    f" Rollback also failed for: {', '.join(rollback_errors)}"
+                    if rollback_errors
+                    else ""
+                )
+                self.report({"ERROR"}, f"Could not finish the paint stroke: {exc}{suffix}")
                 return {"CANCELLED"}
             finally:
                 finish_stroke(no_change=interactive_no_change)
@@ -2169,10 +2200,13 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             history = _HISTORIES.setdefault(
                 str(project.uuid), History(compression_level=1)
             )
-            if history.can_redo:
-                _purge_history_orphans(str(project.uuid))
+            had_redo = history.can_redo
             if not history.push("Smart Paint", before_history, after_history):
-                history.clear()
+                raise RuntimeError(
+                    "This stroke is too large for the Quick SDF Undo history"
+                )
+            if had_redo:
+                _purge_history_orphans(str(project.uuid))
             try:
                 from .live_preview import invalidate
 
@@ -2414,6 +2448,26 @@ def _write_history_values(project, values) -> None:
             if image is None:
                 raise ValueError(f"The history image {name!r} is missing")
             runtime.write_image_gray8(image, value)
+
+
+def _rollback_history_transaction(project, transaction) -> tuple[str, ...]:
+    """Best-effort streamed rollback which does not stop after one bad key."""
+
+    errors: list[str] = []
+    for key in transaction.keys:
+        try:
+            current = _history_values(project, (key,)).get(key)
+            if current is None:
+                raise ValueError("the current layer is missing")
+            restored = transaction.restore_before(key, current)
+            _write_history_values(project, {key: restored})
+        except Exception as error:
+            errors.append(f"{key} ({error})")
+    try:
+        transaction.rollback()
+    except Exception as error:
+        errors.append(f"transaction ({error})")
+    return tuple(errors)
 
 
 def _mark_history_images_changed(project, image_names) -> None:
@@ -2704,6 +2758,94 @@ def _prepare_threshold_inputs(project):
     }
 
 
+def _prepare_packed_export_plan(project):
+    """Prepare ABI-7 metadata and incremental bpy snapshot builders."""
+
+    packing = _snapshot_packing_inputs(project)
+    previous_status = (
+        str(getattr(project, "validation_message", "")),
+        str(getattr(project, "warning_message", "")),
+        str(getattr(project, "diagnostic_message", "")),
+        bool(getattr(project, "has_violations", False)),
+    )
+    try:
+        errors, _warnings, _report = runtime.validate_project(
+            project, include_monotonic=False
+        )
+    finally:
+        (
+            project.validation_message,
+            project.warning_message,
+            project.diagnostic_message,
+            project.has_violations,
+        ) = previous_status
+    if errors:
+        raise ValueError(errors[0])
+    mirror_mode = str(getattr(project, "symmetry_mode", "AUTO"))
+    if mirror_mode == "AUTO":
+        mirror_mode = str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR"))
+    linked = bool(getattr(project, "mirror_enabled", True)) and mirror_mode != "INDEPENDENT"
+    result = {
+        "packed": True,
+        "linked": linked,
+        "packing": packing,
+        "snapshot_builders": [],
+    }
+    if not linked:
+        result["snapshot_builders"] = [
+            ("right", runtime.PackedLaneSnapshot(project, "RIGHT")),
+            ("left", runtime.PackedLaneSnapshot(project, "LEFT")),
+        ]
+        return result
+
+    available = {
+        str(getattr(item, "side", "RIGHT")) for item in getattr(project, "angles", ())
+    }
+    author_side = str(getattr(project, "authoring_side", "RIGHT"))
+    if author_side not in available:
+        author_side = "RIGHT" if "RIGHT" in available else "LEFT"
+    mode_map = {
+        "OVERLAPPED_UV": "OVERLAPPED",
+        "TEXTURE_MIRROR": "TEXTURE_MIRROR",
+        "ISLAND_PAIR": "ISLAND_PAIR",
+    }
+    selected_mode = mode_map.get(mirror_mode, "TEXTURE_MIRROR")
+    pairs = None
+    if selected_mode == "ISLAND_PAIR":
+        resolution = int(project.resolution)
+        pairs = _symmetry_island_pairs(project, (resolution, resolution))
+    result.update(
+        {
+            "author_side": author_side,
+            "mirror_mode": selected_mode,
+            "island_pairs": pairs,
+            "snapshot_builders": [
+                ("source", runtime.PackedLaneSnapshot(project, author_side))
+            ],
+        }
+    )
+    return result
+
+
+def _finish_packed_export_plan(plan):
+    builders = list(plan.pop("snapshot_builders", ()))
+    for name, builder in builders:
+        if not builder.done:
+            raise RuntimeError("Export snapshot is incomplete")
+        plan[name] = builder.finish()
+    return plan
+
+
+def _prepare_packed_threshold_inputs(project):
+    """Synchronous ABI-7 snapshot for scripts and background Blender."""
+
+    plan = _prepare_packed_export_plan(project)
+    for _name, builder in plan["snapshot_builders"]:
+        while not builder.done:
+            builder.step(project)
+    return _finish_packed_export_plan(plan)
+
+
 def _snapshot_packing_inputs(project):
     """Copy the project-local recipe and all referenced masks on the main thread."""
 
@@ -2748,7 +2890,8 @@ def _snapshot_packing_inputs(project):
                 raise ValueError(
                     f"Packing {output}: mask size {tuple(image.size[:])} does not match {expected[::-1]}"
                 )
-            signals[mask_uuid] = runtime.image_channel_u16(image, 0)
+            if mask_uuid not in signals:
+                signals[mask_uuid] = runtime.image_channel_u16(image, 0)
         try:
             specs.append(
                 PackingChannelSpec(
@@ -2831,6 +2974,8 @@ def _export_revision_token(project):
         int(getattr(project, "material_slot_index", 0)),
         str(getattr(project, "uv_map_name", "")),
         int(getattr(project, "resolution", 0)),
+        str(getattr(project, "base_signature", "")),
+        bool(getattr(project, "base_needs_update", False)),
         bool(getattr(project, "mirror_enabled", True)),
         str(getattr(project, "symmetry_mode", "AUTO")),
         str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR")),
@@ -2941,8 +3086,201 @@ def _change_heatmap(changed_mask):
     return np.count_nonzero(changed, axis=0).astype(np.float32) / float(changed.shape[0])
 
 
-def _compute_export_result(inputs, cancel_flag=None):
+def _repair_packed_export_lane(lane, cancel_flag=None):
+    try:
+        from . import native
+
+        return native.repair_packed_lane(lane, cancel_flag=cancel_flag)
+    except (ImportError, OSError, AttributeError):
+        from .core import repair_packed_lane
+
+        return repair_packed_lane(lane)
+
+
+def _generate_transition_channel(
+    transition_indices,
+    angles,
+    destination,
+    channel,
+    cancel_flag=None,
+    progress=None,
+):
+    try:
+        from . import native
+
+        return native.generate_threshold_transitions(
+            transition_indices,
+            angles,
+            out=destination,
+            channel=channel,
+            cancel_flag=cancel_flag,
+            progress=progress,
+        )
+    except (ImportError, OSError, AttributeError):
+        from .core import generate_threshold_transitions
+
+        return generate_threshold_transitions(
+            transition_indices,
+            angles,
+            out=destination,
+            channel=channel,
+        )
+
+
+def _compute_packed_export_result(inputs, cancel_flag=None, progress=None):
+    """Repair and generate directly from ABI-7 bit fields."""
+
+    import numpy as np
+
+    from .packing import PackingSource, pack_rgba16
+    from .symmetry import mirror_side_layer
+
+    def cancelled():
+        return bool(cancel_flag is not None and int(getattr(cancel_flag, "value", 0)))
+
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    specs = inputs["packing"]["specs"]
+    sources = {
+        str(getattr(spec.source, "value", spec.source)).upper() for spec in specs
+    }
+    need_right = PackingSource.RIGHT_THRESHOLD.value in sources
+    need_left = PackingSource.LEFT_THRESHOLD.value in sources
+    repairs = []
+    if bool(inputs["linked"]):
+        source = inputs["source"]
+        repair = _repair_packed_export_lane(source, cancel_flag)
+        repairs.append(repair)
+        height, width = source.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint16)
+        author_right = str(inputs["author_side"]) == "RIGHT"
+        source_channel = 0 if author_right else 1
+        mirror_channel = 1 - source_channel
+        need_source = need_right if author_right else need_left
+        need_mirror = need_left if author_right else need_right
+        mode = str(inputs["mirror_mode"])
+        pairs = inputs.get("island_pairs")
+        if mode == "ISLAND_PAIR":
+            if need_source:
+                _generate_transition_channel(
+                    repair.transition_indices,
+                    source.angles,
+                    rgba,
+                    source_channel,
+                    cancel_flag,
+                    progress,
+                )
+            if need_mirror:
+                mirrored_transition = mirror_side_layer(
+                    repair.transition_indices,
+                    mode,
+                    island_pairs=pairs,
+                    # Legacy stack mirroring starts the opposite lane as
+                    # all-Shadow outside paired target islands.  In compact
+                    # transition form that sentinel is ``key_count``, not 0
+                    # (which means always Light).
+                    target_template=np.full_like(
+                        repair.transition_indices, source.count
+                    ),
+                )
+                _generate_transition_channel(
+                    mirrored_transition,
+                    source.angles,
+                    rgba,
+                    mirror_channel,
+                    cancel_flag,
+                    progress,
+                )
+        elif need_source or need_mirror:
+            _generate_transition_channel(
+                repair.transition_indices,
+                source.angles,
+                rgba,
+                source_channel,
+                cancel_flag,
+                progress,
+            )
+            if need_mirror:
+                rgba[..., mirror_channel] = mirror_side_layer(
+                    rgba[..., source_channel],
+                    mode,
+                    island_pairs=pairs,
+                )
+        source_heatmap = repair.changed_count.astype(np.float32) / float(source.count)
+        heatmap = np.maximum(
+            source_heatmap,
+            mirror_side_layer(
+                source_heatmap,
+                mode,
+                island_pairs=pairs,
+            ),
+        )
+    else:
+        right_lane = inputs["right"]
+        left_lane = inputs["left"]
+        right = _repair_packed_export_lane(right_lane, cancel_flag)
+        left = _repair_packed_export_lane(left_lane, cancel_flag)
+        repairs.extend((right, left))
+        height, width = right_lane.shape
+        if left_lane.shape != (height, width):
+            raise ValueError("Right and Left packed lanes must share a resolution")
+        rgba = np.zeros((height, width, 4), dtype=np.uint16)
+        if need_right:
+            _generate_transition_channel(
+                right.transition_indices,
+                right_lane.angles,
+                rgba,
+                0,
+                cancel_flag,
+                progress,
+            )
+        if need_left:
+            _generate_transition_channel(
+                left.transition_indices,
+                left_lane.angles,
+                rgba,
+                1,
+                cancel_flag,
+                progress,
+            )
+        heatmap = np.maximum(
+            right.changed_count.astype(np.float32) / float(right_lane.count),
+            left.changed_count.astype(np.float32) / float(left_lane.count),
+        )
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    signals = dict(inputs["packing"]["signals"])
+    if need_right:
+        signals[PackingSource.RIGHT_THRESHOLD] = rgba[..., 0]
+    if need_left:
+        signals[PackingSource.LEFT_THRESHOLD] = rgba[..., 1]
+    pack_rgba16(
+        signals,
+        specs,
+        shape=inputs["packing"].get("shape", rgba.shape[:2]),
+        out=rgba,
+    )
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    return {
+        "rgba": rgba,
+        "heatmap": np.ascontiguousarray(heatmap, dtype=np.float32),
+        "changed_sample_count": sum(item.changed_sample_count for item in repairs),
+        "changed_pixel_count": sum(item.changed_pixel_count for item in repairs),
+        "protected_changed_sample_count": sum(
+            item.protected_changed_sample_count for item in repairs
+        ),
+        "protected_changed_pixel_count": sum(
+            item.protected_changed_pixel_count for item in repairs
+        ),
+    }
+
+
+def _compute_export_result(inputs, cancel_flag=None, progress=None):
     """Repair copied stacks, then generate a byte-compatible threshold image."""
+
+    if bool(inputs.get("packed", False)):
+        return _compute_packed_export_result(inputs, cancel_flag, progress)
 
     import numpy as np
 
@@ -3010,8 +3348,65 @@ def _compute_export_result(inputs, cancel_flag=None):
     }
 
 
+def _bounded_export_preview(rgba, maximum: int = 512):
+    import numpy as np
+
+    values = np.asarray(rgba, dtype=np.uint16)
+    height, width = values.shape[:2]
+    if max(height, width) <= int(maximum):
+        return np.ascontiguousarray(values)
+    scale = float(maximum) / float(max(height, width))
+    target_height = max(1, int(round(height * scale)))
+    target_width = max(1, int(round(width * scale)))
+    rows = np.rint(np.linspace(0, height - 1, target_height)).astype(np.intp)
+    columns = np.rint(np.linspace(0, width - 1, target_width)).astype(np.intp)
+    return np.ascontiguousarray(values[rows[:, None], columns[None, :]])
+
+
+def _compute_export_file_result(
+    inputs,
+    path,
+    cancel_flag=None,
+    progress=None,
+    temporary_holder=None,
+):
+    """Generate, fsync a temporary PNG, and return only bounded review data."""
+
+    from .png16 import write_png_rgba16_temporary
+    from .preview_cache import max_pool
+
+    result = _compute_export_result(inputs, cancel_flag, progress)
+    rgba = result.pop("rgba")
+    temporary = None
+    try:
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Export cancelled")
+        result["preview_rgba"] = _bounded_export_preview(rgba)
+        result["heatmap"] = max_pool(result["heatmap"], 512)
+        temporary = write_png_rgba16_temporary(
+            path, rgba, cancel_requested=cancel_flag
+        )
+        if temporary_holder is not None:
+            temporary_holder["path"] = str(temporary)
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Export cancelled")
+        result["temporary_path"] = str(temporary)
+        temporary = None
+        return result
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink()
+            except FileNotFoundError:
+                pass
+            if temporary_holder is not None:
+                temporary_holder.pop("path", None)
+
+
 def _publish_export_result(project, result) -> None:
-    rgba = result["rgba"]
+    rgba = result.get("preview_rgba", result.get("rgba"))
+    if rgba is None:
+        raise ValueError("Export result has no review preview")
     runtime.update_threshold_preview(project, rgba)
     changed_pixels = int(result["changed_pixel_count"])
     project.export_adjustment_pixel_count = changed_pixels
@@ -3047,6 +3442,13 @@ def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) 
     manager = job.get("manager")
     if manager is not None:
         manager.shutdown(wait=wait)
+    temporary_holder = job.get("temporary_holder") or {}
+    temporary_path = temporary_holder.pop("path", None) or job.get("temporary_path")
+    if temporary_path:
+        try:
+            Path(temporary_path).unlink()
+        except FileNotFoundError:
+            pass
     project = _project_by_uuid(str(job.get("project_uuid", "")))
     if project is not None:
         project.job_running = False
@@ -3071,34 +3473,95 @@ def _poll_export_job() -> float | None:
     if "settled_message" in job:
         _finish_export_job(str(job["settled_message"]))
         return None
-    from .jobs import JobState
-
-    manager = job["manager"]
     project = _project_by_uuid(str(job["project_uuid"]))
     if project is None:
         shutdown_export_job(
             message="Export cancelled because the project was removed", wait=True
         )
         return None
+    if _export_revision_token(project) != job.get("revision_token"):
+        cancel_flag = job.get("cancel_flag")
+        if cancel_flag is not None:
+            cancel_flag.value = 1
+        _finish_export_job(
+            "Export paused because the project changed; retry to save the latest paint",
+            error=True,
+        )
+        return None
+
+    if str(job.get("stage", "SNAPSHOT")) == "SNAPSHOT":
+        try:
+            if int(getattr(job.get("cancel_flag"), "value", 0)):
+                raise RuntimeError("Export cancelled")
+            builders = job["plan"]["snapshot_builders"]
+            cursor = int(job.get("snapshot_cursor", 0))
+            while cursor < len(builders) and builders[cursor][1].done:
+                cursor += 1
+            if cursor < len(builders):
+                builders[cursor][1].step(project)
+                job["snapshot_done"] = int(job.get("snapshot_done", 0)) + 1
+                job["snapshot_cursor"] = cursor
+                total = max(1, int(job.get("snapshot_total", 1)))
+                project.job_progress = 0.02 + 0.18 * min(
+                    1.0, float(job["snapshot_done"]) / float(total)
+                )
+                project.job_message = "Preparing export data…"
+                return 0.01
+
+            from .jobs import GenerationJobManager
+
+            inputs = _finish_packed_export_plan(job.pop("plan"))
+            manager = GenerationJobManager()
+            manager.submit(
+                _compute_export_file_result,
+                inputs,
+                job["path"],
+                job["cancel_flag"],
+                job["native_progress"],
+                job["temporary_holder"],
+            )
+            job["manager"] = manager
+            job["stage"] = "WORKER"
+            project.job_progress = 0.2
+            project.job_message = "Generating face shadow texture…"
+            return 0.05
+        except Exception as exc:
+            _finish_export_job(f"Export failed: {exc}", error=True)
+            return None
+
+    from .jobs import JobState
+
+    manager = job.get("manager")
+    if manager is None:
+        _finish_export_job("Export failed: worker was not started", error=True)
+        return None
     state = manager.poll()
     if state in {JobState.PENDING, JobState.RUNNING}:
-        project.job_progress = min(0.92, float(project.job_progress) + 0.015)
+        completed = max(0, int(getattr(job.get("native_progress"), "value", 0)))
+        progress_total = max(1, int(job.get("native_progress_total", 16)))
+        project.job_progress = max(
+            float(project.job_progress),
+            min(0.90, 0.2 + 0.7 * float(completed) / float(progress_total)),
+        )
         project.job_message = "Generating face shadow texture…"
-        return 0.1
+        return 0.05
     try:
         result = manager.take_result()
         project.job_progress = 0.95
+        job["temporary_path"] = str(result["temporary_path"])
         if _export_revision_token(project) != job.get("revision_token"):
-            _finish_export_job(
-                "Export paused because the project changed; retry to save the latest paint",
-                error=True,
+            raise RuntimeError(
+                "Project changed during export; retry to save the latest paint"
             )
-            return None
-        from .png16 import write_png_rgba16
+        from .png16 import commit_png_temporary
 
-        written = write_png_rgba16(
-            job["path"], result["rgba"], overwrite=bool(job["overwrite"])
+        written = commit_png_temporary(
+            job["temporary_path"],
+            job["path"],
+            overwrite=bool(job["overwrite"]),
         )
+        job["temporary_path"] = ""
+        job["temporary_holder"].pop("path", None)
         project.output_path = str(written)
     except Exception as exc:
         _finish_export_job(f"Export failed: {exc}", error=True)
@@ -3128,28 +3591,41 @@ def _poll_export_job() -> float | None:
     return 0.5
 
 
-def _start_export_job(project, inputs, path: Path, overwrite: bool) -> None:
+def _start_export_job(project, plan, path: Path, overwrite: bool) -> None:
     global _EXPORT_JOB
     if _EXPORT_JOB is not None:
         raise RuntimeError("Another Quick SDF export is already running")
-    from .jobs import GenerationJobManager
     import ctypes
 
     revision_token = _export_revision_token(project)
-    manager = GenerationJobManager()
     cancel_flag = ctypes.c_int(0)
-    manager.submit(_compute_export_result, inputs, cancel_flag)
+    native_progress = ctypes.c_int(0)
+    snapshot_total = sum(
+        int(builder.count) for _name, builder in plan.get("snapshot_builders", ())
+    )
     _EXPORT_JOB = {
-        "manager": manager,
+        "manager": None,
+        "stage": "SNAPSHOT",
+        "plan": plan,
         "project_uuid": str(project.uuid),
         "path": Path(path),
         "overwrite": bool(overwrite),
         "cancel_flag": cancel_flag,
+        "native_progress": native_progress,
+        "native_progress_total": max(
+            int(builder.count)
+            for _name, builder in plan.get("snapshot_builders", ())
+        ),
         "revision_token": revision_token,
+        "snapshot_cursor": 0,
+        "snapshot_done": 0,
+        "snapshot_total": snapshot_total,
+        "temporary_path": "",
+        "temporary_holder": {},
     }
     project.job_running = True
     project.job_progress = 0.01
-    project.job_message = "Generating face shadow texture…"
+    project.job_message = "Preparing export data…"
     if not bpy.app.timers.is_registered(_poll_export_job):
         bpy.app.timers.register(_poll_export_job, first_interval=0.05)
 
@@ -3192,7 +3668,7 @@ def _generate(project, context):
 
 
 def _generate_export(project, context):
-    inputs = _prepare_threshold_inputs(project)
+    inputs = _prepare_packed_threshold_inputs(project)
     window_manager = context.window_manager
     window_manager.progress_begin(0, 2)
     try:
@@ -3328,8 +3804,8 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
             return {"CANCELLED"}
         if not bpy.app.background and getattr(context, "window", None) is not None:
             try:
-                inputs = _prepare_threshold_inputs(project)
-                _start_export_job(project, inputs, path, allow_overwrite)
+                plan = _prepare_packed_export_plan(project)
+                _start_export_job(project, plan, path, allow_overwrite)
                 self.report({"INFO"}, "Generating face shadow texture")
                 return {"FINISHED"}
             except (OSError, ValueError, RuntimeError) as exc:

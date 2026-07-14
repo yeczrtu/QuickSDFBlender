@@ -139,6 +139,12 @@ def _test_direction_and_history(project) -> None:
     _select(project, active)
     before = _state(project)
     assert _paint_texel(project, 0) == {"FINISHED"}
+    active_image = runtime.resolve_display_image(project, active)
+    assert active_image is not None
+    assert runtime._GRAY_CACHE_NAME == active_image.name
+    assert runtime._GRAY_CACHE_REVISION == int(
+        active_image.get(runtime.IMAGE_REVISION_KEY, 0)
+    )
     _assert_direction(project, float(active.angle), light=False)
     after = _state(project)
 
@@ -202,6 +208,71 @@ def _test_failed_propagation_rolls_back(project) -> None:
     history = operators._HISTORIES.get(str(project.uuid))
     assert history is None or not history.can_undo
     assert runtime.consume_interactive_paint_snapshot(project) is None
+
+
+def _test_hard_history_cap_rolls_back(project) -> None:
+    operators.clear_histories(str(project.uuid))
+    _fill_lane(project, 255)
+    active = _lane(project)[5]
+    _select(project, active)
+    before = _state(project)
+    history = History(
+        byte_budget=128,
+        soft_byte_budget=128,
+        compression_level=0,
+    )
+    assert history.push("older action", {}, {}, metadata={"marker": "keep"})
+    operators._HISTORIES[str(project.uuid)] = history
+
+    _expect_finished(bpy.ops.quicksdf.paint_snapshot(), "hard-cap snapshot")
+    source = runtime.resolve_display_image(project, active)
+    assert source is not None
+    gray = runtime.image_gray8(source)
+    gray[PIXEL] = 0
+    runtime.write_image_gray8(source, gray)
+    try:
+        result = bpy.ops.quicksdf.propagate_overrides()
+    except RuntimeError as error:
+        assert "too large" in str(error)
+    else:
+        assert result == {"CANCELLED"}, result
+    _assert_state(project, before)
+    retained = operators._HISTORIES.get(str(project.uuid))
+    assert retained is history
+    assert retained.active_transaction is None
+    assert retained.can_undo
+    assert retained.undo_label == "older action"
+
+
+def _test_aux_history_hard_cap_rolls_back(project) -> None:
+    operators.clear_histories(str(project.uuid))
+    item = project.aux_masks[0]
+    image = runtime.resolve_aux_mask_image(project, item)
+    assert image is not None
+    before = runtime.image_gray8(image)
+    yy, xx = np.indices(before.shape)
+    after = (((xx * 37 + yy * 61) & 255)).astype(np.uint8)
+    runtime.write_image_gray8(image, after)
+
+    history = History(byte_budget=64, soft_byte_budget=64, compression_level=0)
+    assert history.push("older action", {}, {}, metadata={"marker": "keep"})
+    operators._HISTORIES[str(project.uuid)] = history
+    try:
+        operators._record_aux_image_change(
+            project,
+            item,
+            image,
+            before,
+            "oversize aux",
+            after=after,
+        )
+    except RuntimeError as error:
+        assert "too large" in str(error)
+    else:
+        raise AssertionError("oversize Aux history action unexpectedly succeeded")
+    np.testing.assert_array_equal(runtime.image_gray8(image), before)
+    assert history.active_transaction is None
+    assert history.can_undo and history.undo_label == "older action"
 
 
 def _test_structural_history(project) -> None:
@@ -302,6 +373,8 @@ def run() -> None:
         assert project is not None and len(_lane(project)) == 8
         _test_direction_and_history(project)
         _test_failed_propagation_rolls_back(project)
+        _test_hard_history_cap_rolls_back(project)
+        _test_aux_history_hard_cap_rolls_back(project)
         _test_structural_history(project)
         print("[Quick SDF interactive paint smoke] PASS")
     finally:
