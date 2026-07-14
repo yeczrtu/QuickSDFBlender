@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from quick_sdf_blender.history import History
+from quick_sdf_blender.history import History, HistoryActionResult
 
 
 class HistoryTests(unittest.TestCase):
@@ -56,6 +56,67 @@ class HistoryTests(unittest.TestCase):
         np.testing.assert_array_equal(current, unchanged_input)
         self.assertEqual(history.redo_keys, ("image",))
 
+    def test_mixed_rgba_uint8_and_bool_planes(self) -> None:
+        display_before = np.zeros((6, 7, 4), dtype=np.uint8)
+        display_after = display_before.copy()
+        display_after[2, 3] = 255
+        grayscale_before = np.zeros((6, 7), dtype=np.uint8)
+        grayscale_after = grayscale_before.copy()
+        grayscale_after[1:3, 4] = 127
+        coverage_before = np.zeros((6, 7), dtype=np.bool_)
+        coverage_after = coverage_before.copy()
+        coverage_after[5, 6] = True
+
+        history = History()
+        self.assertTrue(
+            history.push(
+                "mixed planes",
+                {
+                    "display": display_before,
+                    "grayscale": grayscale_before,
+                    "coverage": coverage_before,
+                },
+                {
+                    "display": display_after,
+                    "grayscale": grayscale_after,
+                    "coverage": coverage_after,
+                },
+            )
+        )
+        restored = history.undo(
+            {
+                "display": display_after,
+                "grayscale": grayscale_after,
+                "coverage": coverage_after,
+            }
+        )
+        np.testing.assert_array_equal(restored["display"], display_before)
+        np.testing.assert_array_equal(restored["grayscale"], grayscale_before)
+        np.testing.assert_array_equal(restored["coverage"], coverage_before)
+        self.assertEqual(restored["grayscale"].dtype, np.uint8)
+        self.assertEqual(restored["coverage"].dtype, np.bool_)
+
+        reapplied = history.redo(restored)
+        np.testing.assert_array_equal(reapplied["display"], display_after)
+        np.testing.assert_array_equal(reapplied["grayscale"], grayscale_after)
+        np.testing.assert_array_equal(reapplied["coverage"], coverage_after)
+
+    def test_sparse_2d_plane_preserves_unrelated_current_pixels(self) -> None:
+        before = np.zeros((32, 33), dtype=np.uint8)
+        after = before.copy()
+        after[1, 1] = 50
+        after[-2, -2] = 200
+        history = History(compression_level=1)
+        self.assertTrue(history.push("two marks", {"plane": before}, {"plane": after}))
+        self.assertLess(history.bytes_used, 256)
+
+        current = after.copy()
+        current[14, 15] = 99
+        restored = history.undo({"plane": current})["plane"]
+        self.assertEqual(restored[1, 1], 0)
+        self.assertEqual(restored[-2, -2], 0)
+        self.assertEqual(restored[14, 15], 99)
+
     def test_push_copies_data_and_ignores_noop(self) -> None:
         before = np.zeros((2, 3, 4), dtype=np.uint16)
         after = before.copy()
@@ -70,6 +131,72 @@ class HistoryTests(unittest.TestCase):
         after[:] = 100
         restored = history.undo({"a": after})["a"]
         np.testing.assert_array_equal(restored[0, 1], expected_before[0, 1])
+
+    def test_action_metadata_supports_bytes_and_is_independently_copied(self) -> None:
+        before = np.zeros((2, 2), dtype=np.bool_)
+        after = before.copy()
+        after[0, 1] = True
+        metadata = {
+            "kind": "create_angle_key",
+            "key": {
+                "uuid": "new-key",
+                "angle": 42.0,
+                "side": "RIGHT",
+                "base_blob": b"\x00\x01base",
+                "coverage_blob": b"\x80coverage",
+                "revisions": [1, 2],
+            },
+        }
+        history = History()
+        self.assertTrue(
+            history.push("Auto Key", {"coverage": before}, {"coverage": after}, metadata=metadata)
+        )
+
+        # The input mapping is not retained by reference.
+        metadata["key"]["uuid"] = "mutated-input"
+        self.assertEqual(history.undo_metadata["key"]["uuid"], "new-key")
+        peek = history.undo_metadata
+        peek["key"]["uuid"] = "mutated-peek"
+        self.assertEqual(history.undo_metadata["key"]["uuid"], "new-key")
+
+        result = history.undo_action({"coverage": after})
+        self.assertIsInstance(result, HistoryActionResult)
+        assert result is not None
+        self.assertEqual(result.label, "Auto Key")
+        self.assertEqual(result.metadata["key"]["base_blob"], b"\x00\x01base")
+        np.testing.assert_array_equal(result.images["coverage"], before)
+
+        result.metadata["key"]["uuid"] = "mutated-result"
+        self.assertEqual(history.redo_metadata["key"]["uuid"], "new-key")
+        redone = history.redo_action({"coverage": before})
+        assert redone is not None
+        self.assertEqual(redone.metadata["key"]["uuid"], "new-key")
+        np.testing.assert_array_equal(redone.images["coverage"], after)
+
+    def test_metadata_only_structural_action(self) -> None:
+        history = History()
+        self.assertTrue(
+            history.push(
+                "Create key",
+                {},
+                {},
+                metadata={"kind": "create_angle_key", "uuid": "key-1"},
+            )
+        )
+        self.assertEqual(history.undo_keys, ())
+        result = history.undo_action({})
+        assert result is not None
+        self.assertEqual(result.images, {})
+        self.assertEqual(result.metadata, {"kind": "create_angle_key", "uuid": "key-1"})
+        redone = history.redo_action({})
+        assert redone is not None
+        self.assertEqual(redone.metadata["uuid"], "key-1")
+
+    def test_noop_without_metadata_remains_ignored(self) -> None:
+        plane = np.zeros((2, 2), dtype=np.uint8)
+        history = History()
+        self.assertFalse(history.push("noop", {"plane": plane}, {"plane": plane.copy()}))
+        self.assertFalse(history.can_undo)
 
     def test_sparse_pixels_do_not_store_the_random_bounding_rectangle(self) -> None:
         rng = np.random.default_rng(42)
@@ -128,6 +255,14 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(history.bytes_used, 0)
         self.assertFalse(history.can_undo)
 
+    def test_metadata_counts_toward_budget(self) -> None:
+        history = History(byte_budget=32)
+        self.assertFalse(
+            history.push("blob", {}, {}, metadata={"base_blob": bytes(range(128))})
+        )
+        self.assertEqual(history.bytes_used, 0)
+        self.assertFalse(history.can_undo)
+
     def test_clear(self) -> None:
         before = np.zeros((2, 2, 4), dtype=np.uint8)
         after = np.ones_like(before)
@@ -146,6 +281,33 @@ class HistoryTests(unittest.TestCase):
             History().push("bad", {"a": rgba}, {"a": np.zeros((2, 2, 3), np.uint8)})
         with self.assertRaisesRegex(TypeError, "dtype"):
             History().push("bad", {"a": rgba}, {"a": rgba.astype(np.float32)})
+        with self.assertRaisesRegex(TypeError, "bool or uint8"):
+            History().push(
+                "bad", {"a": np.zeros((2, 2), np.float32)}, {"a": np.ones((2, 2), np.float32)}
+            )
+        with self.assertRaisesRegex(ValueError, "shape"):
+            History().push("bad", {"a": np.zeros((2,), np.uint8)}, {"a": np.ones((2,), np.uint8)})
+
+    def test_metadata_validation(self) -> None:
+        with self.assertRaisesRegex(TypeError, "metadata must be a mapping"):
+            History().push("bad", {}, {}, metadata=["not", "mapping"])
+        with self.assertRaisesRegex(TypeError, "mapping keys must be strings"):
+            History().push("bad", {}, {}, metadata={1: "value"})
+        with self.assertRaisesRegex(ValueError, "NaN or infinity"):
+            History().push("bad", {}, {}, metadata={"angle": float("nan")})
+        with self.assertRaisesRegex(TypeError, "unsupported set"):
+            History().push("bad", {}, {}, metadata={"keys": {"one", "two"}})
+        cyclic: dict[str, object] = {}
+        cyclic["self"] = cyclic
+        with self.assertRaisesRegex(ValueError, "reference cycle"):
+            History().push("bad", {}, {}, metadata=cyclic)
+
+    def test_empty_action_apis(self) -> None:
+        history = History()
+        self.assertIsNone(history.undo_action({}))
+        self.assertIsNone(history.redo_action({}))
+        self.assertIsNone(history.undo_metadata)
+        self.assertIsNone(history.redo_metadata)
 
     def test_failed_undo_does_not_consume_entry(self) -> None:
         before = np.zeros((2, 2, 4), dtype=np.float32)
