@@ -42,6 +42,51 @@ class QuantizeUnorm16Tests(unittest.TestCase):
 
 
 class PackRgba16Tests(unittest.TestCase):
+    def test_out_parameter_packs_in_place_without_replacing_native_channels(self) -> None:
+        output = np.full((3, 5, 4), 777, dtype=np.uint16)
+        right = np.arange(15, dtype=np.uint16).reshape(3, 5)
+        left = np.flip(right, axis=1).copy()
+        result = pack_rgba16(
+            {
+                PackingSource.RIGHT_THRESHOLD: right,
+                PackingSource.LEFT_THRESHOLD: left,
+            },
+            (
+                PackingChannelSpec(PackingSource.RIGHT_THRESHOLD),
+                PackingChannelSpec(PackingSource.LEFT_THRESHOLD),
+                PackingChannelSpec(PackingSource.CONSTANT, constant_value=0.0),
+                PackingChannelSpec(PackingSource.CONSTANT, constant_value=1.0),
+            ),
+            out=output,
+        )
+        self.assertIs(result, output)
+        np.testing.assert_array_equal(output[..., 0], right)
+        np.testing.assert_array_equal(output[..., 1], left)
+        self.assertFalse(np.any(output[..., 2]))
+        self.assertTrue(np.all(output[..., 3] == 65535))
+
+    def test_out_parameter_safely_permutes_channels_that_alias_output(self) -> None:
+        output = np.zeros((1, 4, 4), dtype=np.uint16)
+        output[..., 0] = [1, 2, 3, 4]
+        output[..., 1] = [10, 20, 30, 40]
+        right_before = output[..., 0].copy()
+        left_before = output[..., 1].copy()
+        pack_rgba16(
+            {
+                PackingSource.RIGHT_THRESHOLD: output[..., 0],
+                PackingSource.LEFT_THRESHOLD: output[..., 1],
+            },
+            (
+                PackingChannelSpec(PackingSource.LEFT_THRESHOLD),
+                PackingChannelSpec(PackingSource.RIGHT_THRESHOLD),
+                PackingChannelSpec(PackingSource.CONSTANT),
+                PackingChannelSpec(PackingSource.CONSTANT, constant_value=1.0),
+            ),
+            out=output,
+        )
+        np.testing.assert_array_equal(output[..., 0], left_before)
+        np.testing.assert_array_equal(output[..., 1], right_before)
+
     def test_liltoon_defaults_pack_thresholds_area_and_strength(self) -> None:
         right = np.asarray([[0, 1], [32768, 65535]], dtype=np.uint16)
         left = np.asarray([[65535, 32768], [1, 0]], dtype=np.uint16)

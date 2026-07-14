@@ -147,11 +147,51 @@ def _quantize_constant(value: object) -> np.uint16:
     return np.uint16(np.floor(number * float(UNORM16_MAX) + 0.5))
 
 
+def _validated_signal_plane(values: np.ndarray | Sequence[object]) -> np.ndarray:
+    """Validate a signal without creating a full-size quantized copy."""
+
+    array = np.asarray(values)
+    if array.ndim != 2:
+        raise ValueError("packing signal planes must be two-dimensional")
+    if not (
+        np.issubdtype(array.dtype, np.bool_)
+        or np.issubdtype(array.dtype, np.integer)
+        or np.issubdtype(array.dtype, np.floating)
+    ):
+        raise TypeError("packing signal planes must contain real numeric values")
+    if array.dtype != np.uint16 and not np.issubdtype(array.dtype, np.bool_):
+        # Validate a row at a time so a 4K float mask does not create another
+        # full-size temporary solely for np.isfinite.
+        for row in array:
+            if not np.all(np.isfinite(row)):
+                raise ValueError("packing signal planes must contain only finite values")
+    return array
+
+
+def _write_quantized_plane(destination: np.ndarray, source: np.ndarray) -> None:
+    if source.dtype == np.uint16:
+        destination[...] = source
+        return
+    if np.issubdtype(source.dtype, np.bool_):
+        destination[...] = source
+        np.multiply(destination, UNORM16_MAX, out=destination)
+        return
+    # Quantize scanline-by-scanline.  This bounds temporary memory to O(width)
+    # while retaining the public round-half-up behavior exactly.
+    for row_index, row in enumerate(source):
+        normalized = np.asarray(row, dtype=np.float64)
+        normalized = np.clip(normalized, 0.0, 1.0)
+        destination[row_index] = np.floor(
+            normalized * float(UNORM16_MAX) + 0.5
+        ).astype(np.uint16)
+
+
 def pack_rgba16(
     signals: Mapping[str | PackingSource, np.ndarray | Sequence[object]],
     channel_specs: Sequence[PackingChannelSpec | Mapping[str, Any]],
     *,
     shape: Sequence[int] | None = None,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     """Pack four channel specifications into a contiguous RGBA16 image.
 
@@ -161,7 +201,10 @@ def pack_rgba16(
     clamped. Inversion is evaluated after quantization as ``65535 - value``.
 
     ``shape`` is only needed when every output is a constant and no signal is
-    supplied from which the image dimensions can be inferred.
+    supplied from which the image dimensions can be inferred.  ``out`` may be
+    a writable C-contiguous ``HxWx4 uint16`` image; it is filled in-place so a
+    native threshold generator can write R/G into the final export allocation
+    without allocating another RGBA image.
     """
 
     if len(channel_specs) != 4:
@@ -175,6 +218,21 @@ def pack_rgba16(
     source_values = tuple(_coerce_source(spec.source) for spec in specs)
     normalized_signals = _normalized_signal_map(signals)
     output_shape = _validated_shape(shape)
+    output: np.ndarray | None = None
+    if out is not None:
+        output = np.asarray(out)
+        if output.ndim != 3 or output.shape[2] != 4:
+            raise ValueError("packing output must have shape HxWx4")
+        if output.dtype != np.uint16:
+            raise TypeError("packing output must use uint16")
+        if not output.flags.writeable or not output.flags.c_contiguous:
+            raise ValueError("packing output must be writeable and C-contiguous")
+        out_shape = (int(output.shape[0]), int(output.shape[1]))
+        if output_shape is not None and output_shape != out_shape:
+            raise ValueError(
+                f"packing output has shape {out_shape}, expected {output_shape}"
+            )
+        output_shape = out_shape
     resolved: list[np.ndarray | np.uint16] = []
 
     for source, spec in zip(source_values, specs):
@@ -188,7 +246,7 @@ def pack_rgba16(
             raise ValueError(
                 f"packing source {source.value!r} references missing signal {name!r}"
             ) from error
-        plane = quantize_unorm16(raw_plane)
+        plane = _validated_signal_plane(raw_plane)
         if output_shape is None:
             output_shape = plane.shape
         elif plane.shape != output_shape:
@@ -201,18 +259,36 @@ def pack_rgba16(
         # All output channels are constants, but callers may still provide a
         # canonical threshold plane solely to define the export dimensions.
         first_name, first_plane = next(iter(normalized_signals.items()))
-        output_shape = quantize_unorm16(first_plane).shape
+        output_shape = _validated_signal_plane(first_plane).shape
     if output_shape is None:
         raise ValueError("packing output shape cannot be inferred from constants alone")
 
-    output = np.empty((*output_shape, 4), dtype=np.uint16)
+    if output is None:
+        output = np.empty((*output_shape, 4), dtype=np.uint16)
+    else:
+        # Preserve arbitrary channel permutations when canonical native signals
+        # are views into ``out`` itself.  A source already in its destination
+        # channel is safe and remains zero-copy; cross-channel dependencies are
+        # snapshotted before the first write.
+        for index, value in enumerate(resolved):
+            if not isinstance(value, np.ndarray) or not np.shares_memory(value, output):
+                continue
+            target = output[..., index]
+            exact_target = (
+                value.shape == target.shape
+                and value.dtype == target.dtype
+                and value.ctypes.data == target.ctypes.data
+                and value.strides == target.strides
+            )
+            if not exact_target:
+                resolved[index] = np.ascontiguousarray(value)
     for index, (value, spec) in enumerate(zip(resolved, specs)):
         if isinstance(value, np.ndarray):
             if value.shape != output_shape:
                 raise ValueError(
                     f"packing channel {index} has shape {value.shape}, expected {output_shape}"
                 )
-            output[..., index] = value
+            _write_quantized_plane(output[..., index], value)
         else:
             output[..., index] = value
         if bool(spec.invert):

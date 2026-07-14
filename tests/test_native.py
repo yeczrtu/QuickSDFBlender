@@ -14,6 +14,9 @@ from quick_sdf_blender.core import (
     generate_threshold_channels as reference_threshold_channels,
     generate_threshold_pair_channels as reference_threshold_pair,
     interpolate_binary_masks as reference_interpolation,
+    generate_threshold_transitions as reference_transition_threshold,
+    pack_lane_bits,
+    repair_packed_lane as reference_packed_repair,
     repair_side_monotonic as reference_repair,
 )
 
@@ -27,12 +30,41 @@ def reference_signed_threshold_channels(
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
 class NativeCoreTests(unittest.TestCase):
-    def test_version_six_interpolation_abi(self):
-        self.assertEqual(native.version(), 6)
+    def test_version_seven_packed_lane_abi(self):
+        self.assertEqual(native.version(), 7)
         self.assertTrue(native.native_threshold_available())
         self.assertTrue(native.native_guide_bake_available())
         self.assertTrue(native.native_interpolation_available())
         self.assertTrue(native.native_repair_available())
+        self.assertTrue(native.native_packed_lane_available())
+
+    def test_packed_repair_and_transition_threshold_are_byte_exact(self):
+        rng = np.random.default_rng(7019)
+        for count in (2, 3, 8, 16):
+            angles = np.linspace(0.0, 90.0, count)
+            transitions = rng.integers(0, count + 1, size=(31, 27), dtype=np.uint8)
+            masks = np.arange(count)[:, None, None] >= transitions[None, ...]
+            base = rng.random(masks.shape) > 0.5
+            coverage = rng.random(masks.shape) > 0.83
+            lane = pack_lane_bits(masks, angles, base, coverage)
+            expected_repair = reference_packed_repair(lane)
+            actual_repair = native.repair_packed_lane(lane)
+            np.testing.assert_array_equal(
+                actual_repair.transition_indices, expected_repair.transition_indices
+            )
+            np.testing.assert_array_equal(
+                actual_repair.changed_count, expected_repair.changed_count
+            )
+            expected = reference_transition_threshold(transitions, angles)
+            output = np.full((31, 27, 4), 123, dtype=np.uint16)
+            progress = ctypes.c_int(0)
+            result = native.generate_threshold_transitions(
+                transitions, angles, out=output, channel=2, progress=progress
+            )
+            self.assertIs(result, output)
+            self.assertEqual(progress.value, count)
+            np.testing.assert_array_equal(output[..., 2], expected)
+            self.assertTrue(np.all(output[..., (0, 1, 3)] == 123))
 
     def test_native_binary_interpolation_matches_python_byte_exact(self):
         rng = np.random.default_rng(6102)

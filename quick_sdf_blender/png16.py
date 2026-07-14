@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 import struct
 import tempfile
-from typing import Sequence
+from collections.abc import Iterator
+from typing import BinaryIO, Sequence
 import zlib
 
 import numpy as np
@@ -36,30 +37,128 @@ def _validated_rgba16(rgba: np.ndarray | Sequence[object]) -> np.ndarray:
     return np.ascontiguousarray(pixels)
 
 
+_IDAT_TARGET_BYTES = 256 * 1024
+
+
+def _filtered_scanlines(pixels: np.ndarray) -> Iterator[bytes]:
+    """Yield PNG scanlines using None for row zero and Up thereafter."""
+
+    previous: np.ndarray | None = None
+    for row_index, row in enumerate(pixels):
+        network = np.frombuffer(row.astype(">u2", copy=False).tobytes(), dtype=np.uint8)
+        if row_index == 0:
+            yield b"\0" + network.tobytes()
+        else:
+            # PNG filters operate on bytes modulo 256, not uint16 samples.
+            filtered = np.subtract(network, previous, dtype=np.uint8)
+            yield b"\2" + filtered.tobytes()
+        previous = network
+
+
+def _compressed_idat_payloads(
+    pixels: np.ndarray, compress_level: int
+) -> Iterator[bytes]:
+    compressor = zlib.compressobj(compress_level)
+    pending = bytearray()
+    for scanline in _filtered_scanlines(pixels):
+        pending.extend(compressor.compress(scanline))
+        while len(pending) >= _IDAT_TARGET_BYTES:
+            yield bytes(pending[:_IDAT_TARGET_BYTES])
+            del pending[:_IDAT_TARGET_BYTES]
+    pending.extend(compressor.flush())
+    while pending:
+        size = min(len(pending), _IDAT_TARGET_BYTES)
+        yield bytes(pending[:size])
+        del pending[:size]
+
+
+def _write_png_stream(stream: BinaryIO, pixels: np.ndarray, compress_level: int) -> None:
+    height, width, _channels = pixels.shape
+    stream.write(PNG_SIGNATURE)
+    header = struct.pack(">IIBBBBB", width, height, 16, 6, 0, 0, 0)
+    stream.write(_chunk(b"IHDR", header))
+    for payload in _compressed_idat_payloads(pixels, compress_level):
+        stream.write(_chunk(b"IDAT", payload))
+    stream.write(_chunk(b"IEND", b""))
+
+
 def encode_png_rgba16(
-    rgba: np.ndarray | Sequence[object], *, compress_level: int = 6
+    rgba: np.ndarray | Sequence[object], *, compress_level: int = 1
 ) -> bytes:
     """Encode an HxWx4 uint16 array as a non-interlaced RGBA16 PNG."""
 
     if compress_level < 0 or compress_level > 9:
         raise ValueError("compress_level must be between 0 and 9")
     pixels = _validated_rgba16(rgba)
-    height, width, _ = pixels.shape
-    # PNG stores 16-bit samples in network byte order.  Filter type zero keeps
-    # the writer small and, for threshold maps, still compresses effectively.
-    network = pixels.astype(">u2", copy=False).view(np.uint8).reshape(height, width * 8)
-    raw = bytearray(height * (width * 8 + 1))
-    stride = width * 8 + 1
-    for y in range(height):
-        start = y * stride
-        raw[start] = 0
-        raw[start + 1 : start + stride] = network[y].tobytes()
+    from io import BytesIO
 
-    header = struct.pack(">IIBBBBB", width, height, 16, 6, 0, 0, 0)
-    compressed = zlib.compress(bytes(raw), level=compress_level)
-    return b"".join(
-        (PNG_SIGNATURE, _chunk(b"IHDR", header), _chunk(b"IDAT", compressed), _chunk(b"IEND", b""))
-    )
+    output = BytesIO()
+    _write_png_stream(output, pixels, compress_level)
+    return output.getvalue()
+
+
+def write_png_rgba16_temporary(
+    path: str | os.PathLike[str],
+    rgba: np.ndarray | Sequence[object],
+    *,
+    compress_level: int = 1,
+) -> Path:
+    """Write and fsync a complete temporary PNG beside ``path``.
+
+    The returned file is intentionally not published.  Export workers can
+    return this small path token to Blender's main thread, which can re-check
+    the project revision before calling :func:`commit_png_temporary`.
+    """
+
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pixels = _validated_rgba16(rgba)
+    if compress_level < 0 or compress_level > 9:
+        raise ValueError("compress_level must be between 0 and 9")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            _write_png_stream(temporary, pixels, compress_level)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        return Path(temporary_name)
+    except BaseException:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def commit_png_temporary(
+    temporary_path: str | os.PathLike[str],
+    path: str | os.PathLike[str],
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Atomically publish a complete temporary PNG in the target directory."""
+
+    temporary = Path(temporary_path)
+    destination = Path(path).expanduser()
+    if temporary.parent.resolve() != destination.parent.resolve():
+        raise ValueError("temporary PNG must be in the destination directory")
+    if overwrite:
+        os.replace(temporary, destination)
+    else:
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            raise FileExistsError(destination) from None
+        os.unlink(temporary)
+    return destination
 
 
 def write_png_rgba16(
@@ -67,7 +166,7 @@ def write_png_rgba16(
     rgba: np.ndarray | Sequence[object],
     *,
     overwrite: bool = False,
-    compress_level: int = 6,
+    compress_level: int = 1,
 ) -> Path:
     """Atomically write RGBA16 PNG data in the target directory.
 
@@ -78,54 +177,28 @@ def write_png_rgba16(
 
     destination = Path(path).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    pixels = _validated_rgba16(rgba)
-    if compress_level < 0 or compress_level > 9:
-        raise ValueError("compress_level must be between 0 and 9")
-    height, width, _channels = pixels.shape
-    temporary_name: str | None = None
+    temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent, delete=False
-        ) as temporary:
-            temporary_name = temporary.name
-            temporary.write(PNG_SIGNATURE)
-            header = struct.pack(">IIBBBBB", width, height, 16, 6, 0, 0, 0)
-            temporary.write(_chunk(b"IHDR", header))
-            compressor = zlib.compressobj(compress_level)
-            for row in pixels:
-                # Converting one scanline at a time avoids the 128 MiB endian
-                # and raw-buffer copies that a 4K RGBA16 image would otherwise
-                # require.
-                network_row = row.astype(">u2", copy=False).tobytes()
-                payload = compressor.compress(b"\0" + network_row)
-                if payload:
-                    temporary.write(_chunk(b"IDAT", payload))
-            payload = compressor.flush()
-            if payload:
-                temporary.write(_chunk(b"IDAT", payload))
-            temporary.write(_chunk(b"IEND", b""))
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        if overwrite:
-            os.replace(temporary_name, destination)
-        else:
-            # The temporary lives beside the destination, so a hard-link
-            # reservation is an atomic create-if-absent operation on Windows.
-            # It closes the exists()/replace() race without exposing a partial
-            # PNG if another process creates the requested path concurrently.
-            try:
-                os.link(temporary_name, destination)
-            except FileExistsError:
-                raise FileExistsError(destination) from None
-            os.unlink(temporary_name)
-        temporary_name = None
+        temporary_path = write_png_rgba16_temporary(
+            destination, rgba, compress_level=compress_level
+        )
+        result = commit_png_temporary(
+            temporary_path, destination, overwrite=overwrite
+        )
+        temporary_path = None
+        return result
     finally:
-        if temporary_name is not None:
+        if temporary_path is not None:
             try:
-                os.unlink(temporary_name)
+                os.unlink(temporary_path)
             except FileNotFoundError:
                 pass
-    return destination
 
 
-__all__ = ["encode_png_rgba16", "write_png_rgba16"]
+__all__ = [
+    "PNG_SIGNATURE",
+    "commit_png_temporary",
+    "encode_png_rgba16",
+    "write_png_rgba16",
+    "write_png_rgba16_temporary",
+]

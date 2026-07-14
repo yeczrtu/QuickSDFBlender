@@ -163,6 +163,174 @@ bool signed_distance(const uint8_t* light_mask, int width, int height,
     return true;
 }
 
+constexpr uint32_t QSDF_DISTANCE_INFINITY =
+    std::numeric_limits<uint32_t>::max() / uint32_t(4);
+
+void dt_1d_squared_u32(const uint32_t* f, uint32_t* d, int n,
+                       std::vector<int>& v, std::vector<double>& z) {
+    int k = 0;
+    v[0] = 0;
+    z[0] = -std::numeric_limits<double>::infinity();
+    z[1] = std::numeric_limits<double>::infinity();
+    for (int q = 1; q < n; ++q) {
+        double s = 0.0;
+        for (;;) {
+            const int vk = v[k];
+            s = ((double(f[q]) + double(q) * q) -
+                 (double(f[vk]) + double(vk) * vk)) /
+                (2.0 * (q - vk));
+            if (s > z[k] || k == 0) break;
+            --k;
+        }
+        ++k;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = std::numeric_limits<double>::infinity();
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < q) ++k;
+        const int64_t delta = int64_t(q - v[k]);
+        const uint64_t value = uint64_t(f[v[k]]) + uint64_t(delta * delta);
+        d[q] = uint32_t(std::min<uint64_t>(value, QSDF_DISTANCE_INFINITY));
+    }
+}
+
+bool binary_squared_distance(const uint8_t* light_mask, bool feature_is_light,
+                             int width, int height, std::vector<uint32_t>& output,
+                             const int* cancel_requested) {
+    const size_t pixels = size_t(width) * size_t(height);
+    output.assign(pixels, QSDF_DISTANCE_INFINITY);
+    bool has_feature = false;
+    for (size_t pixel = 0; pixel < pixels; ++pixel) {
+        const bool is_light = light_mask[pixel] != 0;
+        has_feature |= is_light == feature_is_light;
+    }
+    if (!has_feature) return true;
+
+    // Vertical distance to the closest feature is a pair of linear sweeps.
+    const size_t vertical_worker_count = std::max<size_t>(
+        1, std::min<size_t>({size_t(16), (size_t(width) + 31) / 32,
+                            size_t(std::max(1u, std::thread::hardware_concurrency()))}));
+    auto transform_columns = [&](int begin, int end) {
+        for (int x = begin; x < end; ++x) {
+            if (cancel_requested && *cancel_requested) return;
+            int closest = -height - 1;
+            for (int y = 0; y < height; ++y) {
+                const size_t pixel = size_t(y) * width + x;
+                if ((light_mask[pixel] != 0) == feature_is_light) closest = y;
+                if (closest >= 0) {
+                    const uint32_t delta = uint32_t(y - closest);
+                    output[pixel] = delta * delta;
+                }
+            }
+            closest = height * 2;
+            for (int y = height - 1; y >= 0; --y) {
+                const size_t pixel = size_t(y) * width + x;
+                if ((light_mask[pixel] != 0) == feature_is_light) closest = y;
+                if (closest < height) {
+                    const uint32_t delta = uint32_t(closest - y);
+                    output[pixel] = std::min(output[pixel], delta * delta);
+                }
+            }
+        }
+    };
+    std::vector<std::thread> vertical_threads;
+    try {
+        vertical_threads.reserve(vertical_worker_count - 1);
+        for (size_t worker = 1; worker < vertical_worker_count; ++worker) {
+            const int begin = int(size_t(width) * worker / vertical_worker_count);
+            const int end = int(size_t(width) * (worker + 1) / vertical_worker_count);
+            vertical_threads.emplace_back(transform_columns, begin, end);
+        }
+        transform_columns(0, int(size_t(width) / vertical_worker_count));
+        for (auto& thread : vertical_threads) thread.join();
+    } catch (...) {
+        for (auto& thread : vertical_threads) if (thread.joinable()) thread.join();
+        throw;
+    }
+    if (cancel_requested && *cancel_requested) return false;
+
+    // The horizontal lower-envelope pass is independent per row.  Use a
+    // bounded number of workers and one scratch workspace per worker.
+    const size_t minimum_rows_per_worker = 32;
+    const size_t useful_workers =
+        (size_t(height) + minimum_rows_per_worker - 1) / minimum_rows_per_worker;
+    const size_t worker_count = std::max<size_t>(
+        1, std::min<size_t>({size_t(16), useful_workers,
+                            size_t(std::max(1u, std::thread::hardware_concurrency()))}));
+    auto transform_rows = [&](int begin, int end) {
+        std::vector<uint32_t> source(static_cast<size_t>(width));
+        std::vector<uint32_t> distance(static_cast<size_t>(width));
+        std::vector<int> envelope(static_cast<size_t>(width));
+        std::vector<double> intersections(static_cast<size_t>(width) + 1);
+        for (int y = begin; y < end; ++y) {
+            if (cancel_requested && *cancel_requested) return;
+            const size_t offset = size_t(y) * width;
+            std::copy_n(output.data() + offset, width, source.data());
+            dt_1d_squared_u32(source.data(), distance.data(), width,
+                              envelope, intersections);
+            std::copy_n(distance.data(), width, output.data() + offset);
+        }
+    };
+    std::vector<std::thread> threads;
+    try {
+        threads.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker = 1; worker < worker_count; ++worker) {
+            const int begin = int(size_t(height) * worker / worker_count);
+            const int end = int(size_t(height) * (worker + 1) / worker_count);
+            threads.emplace_back(transform_rows, begin, end);
+        }
+        transform_rows(0, int(size_t(height) / worker_count));
+        for (auto& thread : threads) thread.join();
+    } catch (...) {
+        for (auto& thread : threads) if (thread.joinable()) thread.join();
+        throw;
+    }
+    return !(cancel_requested && *cancel_requested);
+}
+
+struct BinaryDistanceField {
+    std::vector<uint32_t> to_shadow;
+    std::vector<uint32_t> to_light;
+    bool has_light = false;
+    bool has_shadow = false;
+};
+
+bool binary_distance_field(const uint8_t* light_mask, int width, int height,
+                           BinaryDistanceField& output,
+                           const int* cancel_requested) {
+    const size_t pixels = size_t(width) * size_t(height);
+    output.has_light = false;
+    output.has_shadow = false;
+    for (size_t pixel = 0; pixel < pixels; ++pixel) {
+        if ((pixel & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
+        const bool light = light_mask[pixel] != 0;
+        output.has_light |= light;
+        output.has_shadow |= !light;
+    }
+    if (output.has_shadow &&
+        !binary_squared_distance(light_mask, false, width, height,
+                                 output.to_shadow, cancel_requested))
+        return false;
+    if (output.has_light &&
+        !binary_squared_distance(light_mask, true, width, height,
+                                 output.to_light, cancel_requested))
+        return false;
+    if (!output.has_shadow) output.to_shadow.clear();
+    if (!output.has_light) output.to_light.clear();
+    return true;
+}
+
+double binary_signed_magnitude(const BinaryDistanceField& field, size_t pixel) {
+    if (!field.has_light || !field.has_shadow)
+        return std::numeric_limits<double>::infinity();
+    const double to_light = std::sqrt(double(field.to_light[pixel]));
+    const double to_shadow = std::sqrt(double(field.to_shadow[pixel]));
+    return std::abs(to_light - to_shadow);
+}
+
 double finite_signed_distance(double value, double diagonal) {
     if (std::isnan(value)) return 0.0;
     if (std::isinf(value)) return std::signbit(value) ? -diagonal : diagonal;
@@ -231,6 +399,64 @@ bool generate_channel(const uint8_t* masks, const double* angles,
             }
         }
         previous_sdf.swap(current_sdf);
+    }
+    return true;
+}
+
+bool generate_channel_from_transitions(
+    const uint8_t* transitions, const double* angles, int count,
+    int width, int height, uint16_t* output, int pixel_stride,
+    const int* cancel_requested, int* progress_completed) {
+    const size_t pixels = size_t(width) * size_t(height);
+    std::vector<uint8_t> previous(pixels), current(pixels);
+    for (size_t pixel = 0; pixel < pixels; ++pixel) {
+        if ((pixel & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+            return false;
+        previous[pixel] = transitions[pixel] == 0 ? 1 : 0;
+        output[pixel * size_t(pixel_stride)] = previous[pixel] ? 65535 : 0;
+    }
+    BinaryDistanceField previous_distance, current_distance;
+    if (!binary_distance_field(previous.data(), width, height, previous_distance,
+                               cancel_requested))
+        return false;
+    if (progress_completed) *progress_completed = 1;
+    for (int index = 1; index < count; ++index) {
+        if (cancel_requested && *cancel_requested) return false;
+        bool has_transition = false;
+        bool masks_equal = true;
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            current[pixel] = transitions[pixel] <= index ? 1 : 0;
+            const bool changed = previous[pixel] == 0 && current[pixel] != 0;
+            has_transition |= changed;
+            masks_equal &= current[pixel] == previous[pixel];
+        }
+        if (!masks_equal && !binary_distance_field(current.data(), width, height,
+                                          current_distance, cancel_requested)) {
+            return false;
+        }
+        if (has_transition) {
+            const double angle0 = std::abs(angles[index - 1]) / 90.0;
+            const double angle1 = std::abs(angles[index]) / 90.0;
+            for (size_t pixel = 0; pixel < pixels; ++pixel) {
+                if ((pixel & size_t(65535)) == 0 &&
+                    cancel_requested && *cancel_requested)
+                    return false;
+                if (previous[pixel] == 0 && current[pixel] != 0) {
+                    const double d0 = binary_signed_magnitude(previous_distance, pixel);
+                    const double d1 = binary_signed_magnitude(current_distance, pixel);
+                    const double denominator = d0 + d1;
+                    const double ratio =
+                        std::isfinite(denominator) && denominator > 0.0
+                            ? d0 / denominator
+                            : 0.5;
+                    output[pixel * size_t(pixel_stride)] =
+                        encode_transition(angle0 + (angle1 - angle0) * ratio);
+                }
+            }
+        }
+        previous.swap(current);
+        if (!masks_equal) previous_distance = std::move(current_distance);
+        if (progress_completed) *progress_completed = index + 1;
     }
     return true;
 }
@@ -417,7 +643,7 @@ int rasterize_guide_normals(const float* triangle_uvs, const float* corner_norma
 
 }  // namespace
 
-QSDF_API int qsdf_version() { return 6; }
+QSDF_API int qsdf_version() { return 7; }
 
 QSDF_API int qsdf_interpolate_binary_masks(
     const uint8_t* first_mask, const uint8_t* second_mask,
@@ -588,6 +814,128 @@ QSDF_API int qsdf_bake_face_shadow_guide(
     }
 }
 
+QSDF_API int qsdf_repair_lane_bits(
+    const uint16_t* display_bits, const uint16_t* base_bits,
+    const uint16_t* coverage_bits, int count, int width, int height,
+    uint8_t* output_transition, uint8_t* output_changed_count,
+    int* changed_samples, int* changed_pixels,
+    int* protected_changed_samples, int* protected_changed_pixels,
+    const int* cancel_requested) {
+    if (!display_bits || !base_bits || !coverage_bits || !output_transition ||
+        !output_changed_count || !changed_samples || !changed_pixels ||
+        !protected_changed_samples || !protected_changed_pixels ||
+        count < 1 || count > 16 || width < 1 || height < 1)
+        return QSDF_INVALID_ARGUMENT;
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    const size_t pixels = size_t(width) * size_t(height);
+    struct RepairCounts {
+        int changed_samples = 0;
+        int changed_pixels = 0;
+        int protected_changed_samples = 0;
+        int protected_changed_pixels = 0;
+    };
+    auto repair_range = [&](size_t begin, size_t end, RepairCounts& counts) {
+        for (size_t pixel = begin; pixel < end; ++pixel) {
+            if ((pixel & size_t(4095)) == 0 && cancel_requested && *cancel_requested)
+                return;
+            const uint16_t display_word = display_bits[pixel];
+            const uint16_t base_word = base_bits[pixel];
+            const uint16_t coverage_word = coverage_bits[pixel];
+            int protected_cost = 0;
+            int display_cost = 0;
+            int base_cost = 0;
+            for (int sample = 0; sample < count; ++sample) {
+                const uint16_t bit = uint16_t(1u << sample);
+                const bool display = (display_word & bit) != 0;
+                const bool base = (base_word & bit) != 0;
+                const bool protected_value =
+                    (coverage_word & bit) != 0 || display != base;
+                if (!display) {
+                    ++display_cost;
+                    if (protected_value) ++protected_cost;
+                }
+                if (!base) ++base_cost;
+            }
+            int best_protected = protected_cost;
+            int best_display = display_cost;
+            int best_base = base_cost;
+            int best_transition = 0;
+            for (int transition = 1; transition <= count; ++transition) {
+                const uint16_t bit = uint16_t(1u << (transition - 1));
+                const bool display = (display_word & bit) != 0;
+                const bool base = (base_word & bit) != 0;
+                const bool protected_value =
+                    (coverage_word & bit) != 0 || display != base;
+                const int display_delta = display ? 1 : -1;
+                if (protected_value) protected_cost += display_delta;
+                display_cost += display_delta;
+                base_cost += base ? 1 : -1;
+                if (protected_cost < best_protected ||
+                    (protected_cost == best_protected &&
+                     (display_cost < best_display ||
+                      (display_cost == best_display && base_cost < best_base)))) {
+                    best_protected = protected_cost;
+                    best_display = display_cost;
+                    best_base = base_cost;
+                    best_transition = transition;
+                }
+            }
+            output_transition[pixel] = uint8_t(best_transition);
+            uint8_t pixel_changed_count = 0;
+            uint8_t protected_pixel_changed_count = 0;
+            for (int sample = 0; sample < count; ++sample) {
+                const uint16_t bit = uint16_t(1u << sample);
+                const bool display = (display_word & bit) != 0;
+                const bool base = (base_word & bit) != 0;
+                const bool repaired = sample >= best_transition;
+                const bool changed = repaired != display;
+                const bool protected_value =
+                    (coverage_word & bit) != 0 || display != base;
+                if (changed) {
+                    ++pixel_changed_count;
+                    if (protected_value) ++protected_pixel_changed_count;
+                }
+            }
+            output_changed_count[pixel] = pixel_changed_count;
+            counts.changed_samples += pixel_changed_count;
+            counts.protected_changed_samples += protected_pixel_changed_count;
+            if (pixel_changed_count) ++counts.changed_pixels;
+            if (protected_pixel_changed_count) ++counts.protected_changed_pixels;
+        }
+    };
+    const size_t minimum_pixels_per_worker = 65536;
+    const size_t useful_workers =
+        (pixels + minimum_pixels_per_worker - 1) / minimum_pixels_per_worker;
+    const size_t worker_count = std::max<size_t>(
+        1, std::min<size_t>({size_t(16), useful_workers,
+                            size_t(std::max(1u, std::thread::hardware_concurrency()))}));
+    std::vector<RepairCounts> counts(worker_count);
+    std::vector<std::thread> threads;
+    try {
+        threads.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker = 1; worker < worker_count; ++worker) {
+            const size_t begin = pixels * worker / worker_count;
+            const size_t end = pixels * (worker + 1) / worker_count;
+            threads.emplace_back(repair_range, begin, end, std::ref(counts[worker]));
+        }
+        repair_range(0, pixels / worker_count, counts[0]);
+        for (auto& thread : threads) thread.join();
+    } catch (...) {
+        for (auto& thread : threads) if (thread.joinable()) thread.join();
+        return QSDF_OUT_OF_MEMORY;
+    }
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    *changed_samples = *changed_pixels = 0;
+    *protected_changed_samples = *protected_changed_pixels = 0;
+    for (const auto& value : counts) {
+        *changed_samples += value.changed_samples;
+        *changed_pixels += value.changed_pixels;
+        *protected_changed_samples += value.protected_changed_samples;
+        *protected_changed_pixels += value.protected_changed_pixels;
+    }
+    return QSDF_OK;
+}
+
 QSDF_API int qsdf_repair_side_monotonic(
     const uint8_t* masks, const uint8_t* base_masks,
     const uint8_t* coverage_masks, int count, int width, int height,
@@ -730,6 +1078,35 @@ QSDF_API int qsdf_validate_monotonic(const uint8_t* masks, const double* angles,
     return *violation_pixels ? QSDF_NON_MONOTONIC : QSDF_OK;
 }
 
+QSDF_API int qsdf_generate_threshold_transitions(
+    const uint8_t* transitions, const double* angles, int count,
+    int width, int height, uint16_t* output, int pixel_stride,
+    int channel_offset, const int* cancel_requested, int* progress_completed) {
+    if (!transitions || !angles || !output || count < 2 || count > 16 ||
+        width < 1 || height < 1 || pixel_stride < 1 || channel_offset < 0 ||
+        channel_offset >= pixel_stride)
+        return QSDF_INVALID_ARGUMENT;
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    if (progress_completed) *progress_completed = 0;
+    std::vector<int> sequence;
+    if (!build_side_sequence(angles, count, sequence)) return QSDF_INVALID_ARGUMENT;
+    for (int index = 0; index < count; ++index)
+        if (sequence[size_t(index)] != index) return QSDF_INVALID_ARGUMENT;
+    const size_t pixels = size_t(width) * size_t(height);
+    for (size_t pixel = 0; pixel < pixels; ++pixel)
+        if (transitions[pixel] > count) return QSDF_INVALID_ARGUMENT;
+    try {
+        if (!generate_channel_from_transitions(
+                transitions, angles, count, width, height,
+                output + channel_offset, pixel_stride, cancel_requested,
+                progress_completed))
+            return QSDF_CANCELLED;
+        return QSDF_OK;
+    } catch (const std::bad_alloc&) {
+        return QSDF_OUT_OF_MEMORY;
+    }
+}
+
 QSDF_API int qsdf_generate_threshold(const uint8_t* masks, const double* angles,
                                      int count, int width, int height,
                                      uint16_t* output_rg, int* violation_pixels) {
@@ -779,10 +1156,34 @@ QSDF_API int qsdf_generate_threshold_pair_cancelable(
         if (*left_violation_pixels < 0) return QSDF_CANCELLED;
         if (*right_violation_pixels || *left_violation_pixels)
             return QSDF_NON_MONOTONIC;
-        if (!generate_channel(right_masks, right_angles, right_sequence, width, height,
-                              output_rg, 2, cancel_requested) ||
-            !generate_channel(left_masks, left_angles, left_sequence, width, height,
-                              output_rg + 1, 2, cancel_requested))
+        // ABI-5 compatibility adapter: compact each valid stack to its first
+        // Light sample and run the ABI-7 binary-distance implementation.
+        std::vector<uint8_t> transitions(pixels);
+        std::vector<double> sorted_angles(size_t(std::max(right_count, left_count)));
+        auto compact = [&](const uint8_t* masks, const double* angles,
+                           const std::vector<int>& sequence, int count) {
+            for (int sample = 0; sample < count; ++sample)
+                sorted_angles[size_t(sample)] = angles[sequence[size_t(sample)]];
+            for (size_t pixel = 0; pixel < pixels; ++pixel) {
+                uint8_t transition = uint8_t(count);
+                for (int sample = 0; sample < count; ++sample) {
+                    if (masks[size_t(sequence[size_t(sample)]) * pixels + pixel]) {
+                        transition = uint8_t(sample);
+                        break;
+                    }
+                }
+                transitions[pixel] = transition;
+            }
+        };
+        compact(right_masks, right_angles, right_sequence, right_count);
+        if (!generate_channel_from_transitions(
+                transitions.data(), sorted_angles.data(), right_count,
+                width, height, output_rg, 2, cancel_requested, nullptr))
+            return QSDF_CANCELLED;
+        compact(left_masks, left_angles, left_sequence, left_count);
+        if (!generate_channel_from_transitions(
+                transitions.data(), sorted_angles.data(), left_count,
+                width, height, output_rg + 1, 2, cancel_requested, nullptr))
             return QSDF_CANCELLED;
         return QSDF_OK;
     } catch (const std::bad_alloc&) {
