@@ -54,7 +54,7 @@ test("keeps the guide factual in Japanese and English", async () => {
   assert.doesNotMatch(copy, /instead of painting every shadow|only what looks wrong|Only four things to remember|Your first export/i);
 });
 
-test("shows the Kipfel credit before the operation guide", async () => {
+test("shows the Kipfel credit immediately after its first character image", async () => {
   const [html, page] = await Promise.all([
     readFile(new URL("../out/index.html", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -67,8 +67,12 @@ test("shows the Kipfel credit before the operation guide", async () => {
   assert.match(html, /https:\/\/mochiyama\.com\/kipfel_manual_jp/);
   assert.match(html, /公式・公認プロジェクトではありません/);
   assert.ok(
-    html.indexOf('id="model-credit-title"') < html.indexOf('id="basics-title"'),
-    "the character credit must appear before the basic controls",
+    page.indexOf("quick-sdf-create-and-edit.png") < page.indexOf('className="model-credit model-credit-inline"'),
+    "the first character image must appear before its credit",
+  );
+  assert.ok(
+    html.indexOf('id="model-credit-title"') < html.indexOf('id="step-2"'),
+    "the character credit must remain attached to the first illustrated step",
   );
   assert.ok((html.match(/©もち山金魚/g) ?? []).length >= 2);
 
