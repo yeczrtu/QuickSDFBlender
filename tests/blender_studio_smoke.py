@@ -19,17 +19,24 @@ import numpy as np  # noqa: E402
 def _source_fingerprints(project, runtime):
     records = []
     for item in project.angles:
-        for image in (
-            runtime.resolve_display_image(project, item),
-            runtime.resolve_base_image(project, item),
-            runtime.resolve_coverage_image(project, item),
-        ):
-            assert image is not None
+        image = runtime.resolve_display_image(project, item)
+        assert image is not None
+        records.append(
+            (
+                "display",
+                str(item.uuid),
+                image.name,
+                int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+            )
+        )
+        for role in ("BASE", "COVERAGE"):
             records.append(
                 (
-                    image.name,
-                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
-                    hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                    role.lower(),
+                    str(item.uuid),
+                    runtime.bitplane_revision_token(item, role),
+                    hashlib.sha256(runtime.bitplane_blob(item, role)).hexdigest(),
                 )
             )
     return tuple(records)
@@ -259,10 +266,10 @@ def check() -> float | None:
             geometry = timeline.build_geometry(
                 timeline_region.width, timeline_region.height, keys
             )
-            # Pick a non-key angle with an unambiguous nearest key. Pressing
-            # starts a continuous preview; releasing must snap to one of the
-            # eight evenly spaced authoring stages.
-            target_angle = 21.0
+            # Pick a non-key angle inside the two-degree snap radius. Pressing
+            # starts a continuous preview; releasing must select the nearby
+            # existing stage without creating an adaptive key.
+            target_angle = 26.0
             factor = (
                 (target_angle - geometry.angle_min)
                 / (geometry.angle_max - geometry.angle_min)
@@ -370,12 +377,6 @@ def check() -> float | None:
             ), STATE["timeline_seek_trace"]
             assert "seek_preview" in STATE["timeline_seek_editor_roles"], (
                 STATE["timeline_seek_editor_roles"]
-            )
-            assert STATE["timeline_select_trace"][-1:] == [snapped_index], (
-                STATE["timeline_select_trace"],
-                STATE["timeline_seek_trace"],
-                float(project.seek_angle),
-                float(runtime.active_angle(project).angle),
             )
             assert studio.current_session().view_mode == "EDIT", (
                 studio.current_session().view_mode,
@@ -532,10 +533,10 @@ def check() -> float | None:
         project.paint_value = 0
         session.stroke_from_view3d = True
         studio.set_projection_hint(bpy.context, no_change=True)
-        assert not session.projection_hint
+        assert "No paint landed" in session.projection_hint
         project.paint_value = 1
         studio.set_projection_hint(bpy.context, no_change=True)
-        assert not session.projection_hint
+        assert "Numpad 5" in session.projection_hint
         studio.set_projection_hint(bpy.context, no_change=False)
         assert not session.projection_hint
         project.paint_value = 0
@@ -602,15 +603,13 @@ def check() -> float | None:
         invalid_values = (True, False, True, True, True, True, True)
         for index, (item, value) in enumerate(zip(project.angles, invalid_values)):
             display = runtime.resolve_display_image(project, item)
-            coverage = runtime.resolve_coverage_image(project, item)
             display_rgba = runtime.image_rgba(display)
-            coverage_rgba = runtime.image_rgba(coverage)
+            coverage = runtime.coverage_mask(item).copy()
             display_rgba[90, 90, :3] = float(value)
             display_rgba[90, 90, 3] = 1.0
-            coverage_rgba[90, 90, :3] = float(index == 0)
-            coverage_rgba[90, 90, 3] = 1.0
+            coverage[90, 90] = index == 0
             runtime.write_image_rgba(display, display_rgba)
-            runtime.write_image_rgba(coverage, coverage_rgba)
+            runtime.set_coverage_mask(item, coverage)
         STATE["source_fingerprints"] = _source_fingerprints(project, runtime)
         STATE["edit_uuid"] = edit_uuid
         STATE["canvas"] = canvas

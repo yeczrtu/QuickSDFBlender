@@ -139,8 +139,8 @@ def _paint() -> float | None:
         project.preview_mode = "MASK"
         project.paint_value = 0  # Shadow over the all-white initialization.
         canvas = runtime.resolve_display_image(project, runtime.active_angle(project))
-        coverage = runtime.resolve_coverage_image(project, runtime.active_angle(project))
-        assert canvas is not None and coverage is not None
+        angle_item = runtime.active_angle(project)
+        assert canvas is not None and angle_item is not None
         runtime.sync_canvas(bpy.context, project)
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
 
@@ -159,7 +159,7 @@ def _paint() -> float | None:
         brush.blend = "MIX"
 
         before = runtime.image_rgba(canvas)
-        coverage_before = runtime.coverage_mask(coverage)
+        coverage_before = runtime.coverage_mask(angle_item)
         assert np.all(before[..., :3] == 1.0)
         assert not np.any(coverage_before)
 
@@ -215,10 +215,10 @@ def _paint() -> float | None:
         assert elapsed < 0.75, f"1024px paint macro took {elapsed:.3f}s"
 
         after = runtime.image_rgba(canvas)
-        coverage_after = runtime.coverage_mask(coverage)
+        coverage_after = runtime.coverage_mask(angle_item)
         changed = np.any(np.abs(after[..., :3] - before[..., :3]) > (0.5 / 255.0), axis=2)
         assert np.any(changed)
-        np.testing.assert_array_equal(coverage_after, coverage_before)
+        assert np.all(coverage_after[changed])
         assert np.any(after[..., 0] < 0.5)
         assert project.first_stroke_complete
         assert project.dirty
@@ -240,13 +240,13 @@ def _paint() -> float | None:
         assert view_space.shading.type == "MATERIAL"
         _assert_preview_graph(obj, project, canvas)
 
-        # Native-speed strokes defer coverage until an explicit rebuild. The
-        # Rebake operation must materialize that visible delta and preserve it.
+        # The typed history path records Coverage as a 1-bit plane at stroke
+        # completion. Rebake must preserve both that footprint and its RGB.
         project.guide_shadow_amount = 0.0
         assert bpy.ops.quicksdf.bake_base() == {"FINISHED"}
         rebaked = runtime.image_rgba(canvas)
         np.testing.assert_array_equal(rebaked[..., :3][changed], after[..., :3][changed])
-        coverage_rebaked = runtime.coverage_mask(coverage)
+        coverage_rebaked = runtime.coverage_mask(angle_item)
         assert np.all(coverage_rebaked[changed])
         _assert_preview_graph(obj, project, canvas)
 

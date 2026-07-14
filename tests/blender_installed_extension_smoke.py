@@ -48,7 +48,7 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
 
     native = importlib.import_module(f"{module_name}.native")
     assert native.available()
-    assert native.version() == 5
+    assert native.version() == 6
     assert native.native_threshold_available()
     assert native.native_guide_bake_available()
     assert native.native_repair_available()
@@ -62,7 +62,8 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     core = importlib.import_module(f"{module_name}.core")
     model = importlib.import_module(f"{module_name}.model")
     packing = importlib.import_module(f"{module_name}.packing")
-    assert model.SCHEMA_VERSION == 5
+    bitplane = importlib.import_module(f"{module_name}.bitplane")
+    assert model.SCHEMA_VERSION == 6
     angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
     steps = np.arange(8, dtype=np.int64)[:, None]
     right = (steps >= np.array([0, 1, 4, 8])[None, :]).reshape(8, 1, 4)
@@ -108,6 +109,21 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
         packed[..., 3], np.asarray([[65535, 32768, 16384, 0]], dtype=np.uint16)
     )
 
+    binary = np.asarray(
+        [[True, False, True, False, True], [False, True, False, True, False]],
+        dtype=np.bool_,
+    )
+    binary_blob = bitplane.encode_bitplane(binary, bitplane.BitplaneRole.BASE)
+    binary_header = bitplane.inspect_bitplane_header(binary_blob)
+    assert binary_header.role is bitplane.BitplaneRole.BASE
+    assert binary_header.shape == binary.shape
+    np.testing.assert_array_equal(
+        bitplane.decode_bitplane(
+            binary_blob, expected_role=bitplane.BitplaneRole.BASE
+        ),
+        binary,
+    )
+
     triangle_uvs = np.array(
         [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=np.float32
     )
@@ -138,7 +154,7 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFPackingChannel") is not None
     assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFAuxMask") is not None
     project = bpy.context.scene.quick_sdf_projects.add()
-    project.uuid = "installed-schema-five"
+    project.uuid = "installed-schema-six"
     uuids = iter(("installed-area", "installed-strength"))
     aux_items = model.ensure_standard_aux_masks(
         project, uuid_factory=lambda: next(uuids)

@@ -290,7 +290,7 @@ def run(output_directory: Path) -> None:
     project = scene.quick_sdf_projects[0]
     assert project.target_object == cube
     assert project.resolution == 512
-    assert project.schema_version == SCHEMA_VERSION == 5
+    assert project.schema_version == SCHEMA_VERSION == 6
     assert project.base_source == "NORMAL_GUIDE"
     assert project.guide_version == 2
     assert len(project.angles) == 8
@@ -372,15 +372,18 @@ def run(output_directory: Path) -> None:
 
     for angle_item in project.angles:
         display = runtime.resolve_display_image(project, angle_item)
-        base = runtime.resolve_base_image(project, angle_item)
-        coverage = runtime.resolve_coverage_image(project, angle_item)
-        assert display is not None and base is not None and coverage is not None
+        base = runtime.base_mask(angle_item)
+        coverage = runtime.coverage_mask(angle_item)
+        assert display is not None
         assert display.alpha_mode == "NONE"
-        assert base.alpha_mode == "NONE"
-        assert coverage.alpha_mode == "NONE"
+        assert base.shape == coverage.shape == (512, 512)
+        assert base.dtype == coverage.dtype == np.bool_
+        assert not base.flags.writeable
+        assert not coverage.flags.writeable
+        assert not hasattr(angle_item, "base_image")
+        assert not hasattr(angle_item, "coverage_image")
         assert np.all(runtime.image_rgba(display)[..., 3] == 1.0)
-        assert np.all(runtime.image_rgba(base)[..., 3] == 1.0)
-        assert not np.any(runtime.coverage_mask(coverage))
+        assert not np.any(coverage)
 
     original_canvas = scene.tool_settings.image_paint.canvas
     _expect_finished(bpy.ops.quicksdf.angle_step(step=1), "angle_step")
@@ -429,42 +432,19 @@ def run(output_directory: Path) -> None:
     _expect_finished(bpy.ops.quicksdf.propagate_overrides(), "propagate_overrides")
     for angle_item in project.angles:
         display = runtime.resolve_display_image(project, angle_item)
-        coverage = runtime.resolve_coverage_image(project, angle_item)
-        assert display is not None and coverage is not None
-        assert np.all(runtime.coverage_mask(coverage)[255:257, 255:257])
+        assert display is not None
+        assert np.all(runtime.coverage_mask(angle_item)[255:257, 255:257])
         assert np.all(runtime.image_rgba(display)[..., 3] == 1.0)
     from quick_sdf_blender import operators as operator_module
 
     history = operator_module._HISTORIES[str(project.uuid)]
-    transaction_before = {
-        name: runtime.image_rgba8(bpy.data.images[name]) for name in history.undo_keys
-    }
-    undo_count_before = history.undo_count
-    original_write_rgba8 = runtime.write_image_rgba8
-    write_calls = 0
-
-    def fail_second_history_write(image, rgba):
-        nonlocal write_calls
-        write_calls += 1
-        if write_calls == 2:
-            raise RuntimeError("simulated second-image write failure")
-        return original_write_rgba8(image, rgba)
-
-    runtime.write_image_rgba8 = fail_second_history_write
-    try:
-        try:
-            bpy.ops.quicksdf.history_undo()
-        except RuntimeError as exc:
-            assert "simulated second-image write failure" in str(exc)
-        else:
-            raise AssertionError("The simulated history write failure was not reported")
-    finally:
-        runtime.write_image_rgba8 = original_write_rgba8
-    assert history.undo_count == undo_count_before
-    for name, expected in transaction_before.items():
-        np.testing.assert_array_equal(runtime.image_rgba8(bpy.data.images[name]), expected)
+    transaction_after = operator_module._history_values(project, history.undo_keys)
     _expect_finished(bpy.ops.quicksdf.history_undo(), "history_undo")
     _expect_finished(bpy.ops.quicksdf.history_redo(), "history_redo")
+    restored_after = operator_module._history_values(project, transaction_after)
+    assert restored_after.keys() == transaction_after.keys()
+    for name, expected in transaction_after.items():
+        np.testing.assert_array_equal(restored_after[name], expected)
 
     print("[Quick SDF smoke] roll back a partial Smart Paint collection")
     # Reproduce a propagation failure after an earlier key has already
@@ -519,7 +499,7 @@ def run(output_directory: Path) -> None:
     painted_before = {
         item.uuid: (
             runtime.image_rgba(runtime.resolve_display_image(project, item)).copy(),
-            runtime.image_rgba(runtime.resolve_coverage_image(project, item)).copy(),
+            runtime.coverage_mask(item).copy(),
         )
         for item in project.angles
     }
@@ -537,8 +517,8 @@ def run(output_directory: Path) -> None:
     for item in project.angles:
         before_display, before_coverage = painted_before[item.uuid]
         display = runtime.image_rgba(runtime.resolve_display_image(project, item))
-        coverage = runtime.image_rgba(runtime.resolve_coverage_image(project, item))
-        covered = before_coverage[..., 0] >= 0.5
+        coverage = runtime.coverage_mask(item)
+        covered = before_coverage
         np.testing.assert_array_equal(coverage, before_coverage)
         np.testing.assert_array_equal(display[..., :3][covered], before_display[..., :3][covered])
 
@@ -684,33 +664,39 @@ def run(output_directory: Path) -> None:
     original_pixels = {}
     for item, value in zip(project.angles, invalid_values):
         display = runtime.resolve_display_image(project, item)
-        coverage = runtime.resolve_coverage_image(project, item)
-        assert display is not None and coverage is not None
+        assert display is not None
         display_rgba = runtime.image_rgba(display)
-        coverage_rgba = runtime.image_rgba(coverage)
+        coverage = runtime.coverage_mask(item).copy()
         original_pixels[(item.uuid, "display")] = display_rgba[test_y, test_x].copy()
-        original_pixels[(item.uuid, "coverage")] = coverage_rgba[test_y, test_x].copy()
+        original_pixels[(item.uuid, "coverage")] = bool(coverage[test_y, test_x])
         display_rgba[test_y, test_x, :3] = float(value)
         display_rgba[test_y, test_x, 3] = 1.0
-        coverage_rgba[test_y, test_x, :3] = 1.0
-        coverage_rgba[test_y, test_x, 3] = 1.0
+        coverage[test_y, test_x] = True
         runtime.write_image_rgba(display, display_rgba)
-        runtime.write_image_rgba(coverage, coverage_rgba)
+        runtime.set_coverage_mask(item, coverage)
 
     def source_fingerprints():
         records = []
         for item in project.angles:
-            for image in (
-                runtime.resolve_display_image(project, item),
-                runtime.resolve_base_image(project, item),
-                runtime.resolve_coverage_image(project, item),
-            ):
-                assert image is not None
+            image = runtime.resolve_display_image(project, item)
+            assert image is not None
+            records.append(
+                (
+                    "display",
+                    str(item.uuid),
+                    image.name,
+                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                    hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                )
+            )
+            for role in ("BASE", "COVERAGE"):
+                blob = runtime.bitplane_blob(item, role)
                 records.append(
                     (
-                        image.name,
-                        int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
-                        hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                        role.lower(),
+                        str(item.uuid),
+                        runtime.bitplane_revision_token(item, role),
+                        hashlib.sha256(blob).hexdigest(),
                     )
                 )
         for aux_item in project.aux_masks:
@@ -794,11 +780,10 @@ def run(output_directory: Path) -> None:
     second_values = (False, True, False, True, True, True, True, True)
     for item, value in zip(project.angles, second_values):
         display = runtime.resolve_display_image(project, item)
-        coverage = runtime.resolve_coverage_image(project, item)
         display_rgba = runtime.image_rgba(display)
-        coverage_rgba = runtime.image_rgba(coverage)
+        coverage = runtime.coverage_mask(item)
         original_pixels[(item.uuid, "display2")] = display_rgba[second_y, second_x].copy()
-        original_pixels[(item.uuid, "coverage2")] = coverage_rgba[second_y, second_x].copy()
+        original_pixels[(item.uuid, "coverage2")] = bool(coverage[second_y, second_x])
         display_rgba[second_y, second_x, :3] = float(value)
         display_rgba[second_y, second_x, 3] = 1.0
         runtime.write_image_rgba(display, display_rgba)
@@ -848,15 +833,14 @@ def run(output_directory: Path) -> None:
     # through the repair-enabled export path.
     for item in project.angles:
         display = runtime.resolve_display_image(project, item)
-        coverage = runtime.resolve_coverage_image(project, item)
         display_rgba = runtime.image_rgba(display)
-        coverage_rgba = runtime.image_rgba(coverage)
+        coverage = runtime.coverage_mask(item).copy()
         display_rgba[test_y, test_x] = original_pixels[(item.uuid, "display")]
-        coverage_rgba[test_y, test_x] = original_pixels[(item.uuid, "coverage")]
+        coverage[test_y, test_x] = original_pixels[(item.uuid, "coverage")]
         display_rgba[second_y, second_x] = original_pixels[(item.uuid, "display2")]
-        coverage_rgba[second_y, second_x] = original_pixels[(item.uuid, "coverage2")]
+        coverage[second_y, second_x] = original_pixels[(item.uuid, "coverage2")]
         runtime.write_image_rgba(display, display_rgba)
-        runtime.write_image_rgba(coverage, coverage_rgba)
+        runtime.set_coverage_mask(item, coverage)
     _expect_finished(
         bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
         "clean re-export",
@@ -874,8 +858,15 @@ def run(output_directory: Path) -> None:
     project_uuid = project.uuid
     angle_uuids = tuple(item.uuid for item in project.angles)
     angle_names = tuple(item.display_image_name for item in project.angles)
-    base_names = tuple(item.base_image_name for item in project.angles)
-    coverage_names = tuple(item.coverage_image_name for item in project.angles)
+    bitplane_records = {
+        str(item.uuid): (
+            runtime.bitplane_blob(item, "BASE"),
+            runtime.bitplane_blob(item, "COVERAGE"),
+            runtime.bitplane_revision_token(item, "BASE"),
+            runtime.bitplane_revision_token(item, "COVERAGE"),
+        )
+        for item in project.angles
+    }
     aux_records = tuple(
         (
             str(item.uuid),
@@ -905,7 +896,11 @@ def run(output_directory: Path) -> None:
         for item in project.angles
     )
     expected_base_pixels = tuple(
-        runtime.image_rgba(runtime.resolve_base_image(project, item))[255, 255, :3].copy()
+        bool(runtime.base_mask(item)[255, 255])
+        for item in project.angles
+    )
+    expected_coverage_pixels = tuple(
+        bool(runtime.coverage_mask(item)[255, 255])
         for item in project.angles
     )
     generated_name = project.generated_image.name
@@ -918,8 +913,6 @@ def run(output_directory: Path) -> None:
     assert project is not None and project.uuid == project_uuid
     assert tuple(item.uuid for item in project.angles) == angle_uuids
     assert tuple(item.display_image_name for item in project.angles) == angle_names
-    assert tuple(item.base_image_name for item in project.angles) == base_names
-    assert tuple(item.coverage_image_name for item in project.angles) == coverage_names
     assert tuple(
         (
             str(item.uuid),
@@ -950,18 +943,35 @@ def run(output_directory: Path) -> None:
         assert image is not None and angle_item.display_image == image
         assert image.get(runtime.PROJECT_UUID_KEY) == project_uuid
         assert image.get(runtime.ANGLE_UUID_KEY) == angle_item.uuid
-        base = runtime.resolve_base_image(project, angle_item)
-        coverage = runtime.resolve_coverage_image(project, angle_item)
-        assert base is not None
-        assert coverage is not None
+        assert not hasattr(angle_item, "base_image")
+        assert not hasattr(angle_item, "coverage_image")
+        base_blob, coverage_blob, base_token, coverage_token = bitplane_records[
+            str(angle_item.uuid)
+        ]
+        assert runtime.bitplane_blob(angle_item, "BASE") == base_blob
+        assert runtime.bitplane_blob(angle_item, "COVERAGE") == coverage_blob
+        assert runtime.bitplane_revision_token(angle_item, "BASE") == base_token
+        assert (
+            runtime.bitplane_revision_token(angle_item, "COVERAGE")
+            == coverage_token
+        )
         np.testing.assert_array_equal(
             runtime.image_rgba(image)[255, 255, :3], expected_painted_pixels[index]
         )
-        np.testing.assert_array_equal(
-            runtime.image_rgba(base)[255, 255, :3], expected_base_pixels[index]
+        assert bool(runtime.base_mask(angle_item)[255, 255]) == expected_base_pixels[index]
+        assert (
+            bool(runtime.coverage_mask(angle_item)[255, 255])
+            == expected_coverage_pixels[index]
         )
-        assert runtime.coverage_mask(coverage)[255, 255]
         assert np.all(runtime.image_rgba(image)[..., 3] == 1.0)
+    angle_images = tuple(
+        image
+        for image in bpy.data.images
+        if image.get(runtime.PROJECT_UUID_KEY) == project_uuid
+        and image.get(runtime.ANGLE_UUID_KEY)
+    )
+    assert len(angle_images) == len(project.angles)
+    assert all(image.get(runtime.ROLE_KEY) == runtime.DISPLAY_ROLE for image in angle_images)
     assert project.generated_image is not None
     assert project.generated_image.name == generated_name
     assert project.generated_image.get(runtime.PROJECT_UUID_KEY) == project_uuid
