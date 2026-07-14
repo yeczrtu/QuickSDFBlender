@@ -31,6 +31,13 @@ const copy = {
     requirements: ["Blender 5.1", "Windows x64", "単一メッシュ", "単一マテリアルスロット", "0–1 UVマップ"],
     beforeTitle: "始める前に確認するもの",
     beforeItems: ["顔を含むメッシュ", "顔に使用しているマテリアルスロット", "0–1範囲に収まったUVマップ"],
+    creditTitle: "掲載キャラクター",
+    creditName: "オリジナル3Dモデル「キプフェル (Kipfel)」",
+    creditCreator: "モデル制作：かめ山　©もち山金魚",
+    creditBody: "本ページの操作画面、GIF、出力テクスチャ例に使用しています。モデルデータはQuick SDF Studioに含まれません。Quick SDF Studioおよび本サイトは、もち山金魚／かめ山による公式・公認プロジェクトではありません。",
+    creditProduct: "公式商品ページ",
+    creditManual: "キプフェル説明書",
+    creditFooter: "Kipfel ©もち山金魚",
     basicsTitle: "基本操作",
     basics: [
       ["Light／Shadow", "Lightは白、Shadowは黒を塗ります。"],
@@ -171,7 +178,7 @@ const copy = {
     referenceLead: "対応範囲、ソースコード、不具合報告はこちらです。",
     limitations: ["単一オブジェクト", "単一マテリアルスロット", "単一0–1 UV", "Windows x64", "Blender 5.1"],
     issue: "GitHub Issueを作成",
-    attribution: "画面キャプチャにはKipfel ©もち山金魚を使用しています。モデルデータはQuick SDF Studioに含まれません。",
+    attribution: "Kipfel 公式商品ページ",
     footer: "Quick SDF Studio v0.6.1 — Blender 5.1／Windows x64",
     imageAlts: {
       create: "顔のメッシュとマテリアルスロットを選び、Create & Editを押すQuick SDFパネル",
@@ -201,6 +208,13 @@ const copy = {
     requirements: ["Blender 5.1", "Windows x64", "One mesh", "One material slot", "One 0–1 UV map"],
     beforeTitle: "Before you begin",
     beforeItems: ["A mesh containing the face", "The material slot used by the face", "A UV map contained within the 0–1 range"],
+    creditTitle: "Character used in the examples",
+    creditName: "Original 3D model “Kipfel”",
+    creditCreator: "Model by かめ山 · ©もち山金魚",
+    creditBody: "The interface screenshots, animated preview, and exported-texture example on this page use the Kipfel character model. Character model files are not included with Quick SDF Studio. Quick SDF Studio and this website are not official or endorsed projects of もち山金魚 or かめ山.",
+    creditProduct: "Official product page",
+    creditManual: "Kipfel manual",
+    creditFooter: "Kipfel ©もち山金魚",
     basicsTitle: "Basic controls",
     basics: [["Light / Shadow", "Light paints white; Shadow paints black."], ["0° → 90°", "This is not the light’s physical angle. The lit area grows from Light Starts at 0°, through the Side reference at 45°, to Full Light at 90°."], ["One stroke", "The stroke is applied at the selected angle. Pixels crossing the 0.5 boundary are carried toward 90° for Light or toward 0° for Shadow."], ["Export", "Quick SDF fixes continuity across all eight guides without changing the images you painted."]],
     installTitle: "Installation",
@@ -255,7 +269,7 @@ const copy = {
     referenceLead: "Supported scope, source code, and issue reporting.",
     limitations: ["One object", "One material slot", "One 0–1 UV map", "Windows x64", "Blender 5.1"],
     issue: "Open a GitHub Issue",
-    attribution: "Screenshots feature Kipfel ©もち山金魚. Character model files are not included with Quick SDF Studio.",
+    attribution: "Official Kipfel product page",
     footer: "Quick SDF Studio v0.6.1 — Blender 5.1 / Windows x64",
     imageAlts: {
       create: "Quick SDF panel with the face mesh and material slot selected before choosing Create and Edit",
@@ -359,6 +373,19 @@ export default function Home() {
             <ul className="requirements-list">{t.requirements.map((item) => <li key={item}>{item}</li>)}</ul>
           </aside>
         </section>
+
+        <aside className="model-credit page-shell" aria-labelledby="model-credit-title">
+          <div className="model-credit-heading">
+            <p>{t.creditTitle}</p>
+            <h2 id="model-credit-title">{t.creditName}</h2>
+            <strong>{t.creditCreator}</strong>
+          </div>
+          <p className="model-credit-body">{t.creditBody}</p>
+          <div className="model-credit-links">
+            <a href="https://mukumi.booth.pm/items/5813187" target="_blank" rel="noreferrer">{t.creditProduct}<span aria-hidden="true">↗</span></a>
+            <a href="https://mochiyama.com/kipfel_manual_jp" target="_blank" rel="noreferrer">{t.creditManual}<span aria-hidden="true">↗</span></a>
+          </div>
+        </aside>
 
         <section className="basics-section page-shell" aria-labelledby="basics-title">
           <h2 id="basics-title">{t.basicsTitle}</h2>
@@ -465,12 +492,12 @@ export default function Home() {
         <section className="manual-section reference-section">
           <div className="page-shell reference-grid">
             <div><h2>{t.referenceTitle}</h2><p>{t.referenceLead}</p><ul>{t.limitations.map((item) => <li key={item}>{item}</li>)}</ul></div>
-            <div className="reference-links"><a href="https://github.com/yeczrtu/QuickSDFBlender" target="_blank" rel="noreferrer">{t.github}<span aria-hidden="true">↗</span></a><a href="https://github.com/yeczrtu/QuickSDFBlender/issues" target="_blank" rel="noreferrer">{t.issue}<span aria-hidden="true">↗</span></a><a href="https://mochiyama.com/kipfel_manual_jp" target="_blank" rel="noreferrer">{t.attribution}<span aria-hidden="true">↗</span></a></div>
+            <div className="reference-links"><a href="https://github.com/yeczrtu/QuickSDFBlender" target="_blank" rel="noreferrer">{t.github}<span aria-hidden="true">↗</span></a><a href="https://github.com/yeczrtu/QuickSDFBlender/issues" target="_blank" rel="noreferrer">{t.issue}<span aria-hidden="true">↗</span></a><a href="https://mukumi.booth.pm/items/5813187" target="_blank" rel="noreferrer">{t.attribution}<span aria-hidden="true">↗</span></a></div>
           </div>
         </section>
       </main>
 
-      <footer className="site-footer"><div className="page-shell"><span>{t.footer}</span><span>© 2026 Hoshino · GPL-3.0-or-later</span></div></footer>
+      <footer className="site-footer"><div className="page-shell"><span>{t.footer}</span><span><a href="https://mukumi.booth.pm/items/5813187" target="_blank" rel="noreferrer">{t.creditFooter}</a> · © 2026 Hoshino · GPL-3.0-or-later</span></div></footer>
     </>
   );
 }

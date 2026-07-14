@@ -54,6 +54,29 @@ test("keeps the guide factual in Japanese and English", async () => {
   assert.doesNotMatch(copy, /instead of painting every shadow|only what looks wrong|Only four things to remember|Your first export/i);
 });
 
+test("shows the Kipfel credit before the operation guide", async () => {
+  const [html, page] = await Promise.all([
+    readFile(new URL("../out/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(html, /id="model-credit-title"/);
+  assert.match(html, /オリジナル3Dモデル「キプフェル \(Kipfel\)」/);
+  assert.match(html, /モデル制作：かめ山[^<]*©もち山金魚/);
+  assert.match(html, /https:\/\/mukumi\.booth\.pm\/items\/5813187/);
+  assert.match(html, /https:\/\/mochiyama\.com\/kipfel_manual_jp/);
+  assert.match(html, /公式・公認プロジェクトではありません/);
+  assert.ok(
+    html.indexOf('id="model-credit-title"') < html.indexOf('id="basics-title"'),
+    "the character credit must appear before the basic controls",
+  );
+  assert.ok((html.match(/©もち山金魚/g) ?? []).length >= 2);
+
+  assert.match(page, /Character used in the examples/);
+  assert.match(page, /Model by かめ山 · ©もち山金魚/);
+  assert.match(page, /not official or endorsed projects/);
+});
+
 test("ships the documented captures and the Pages marker", async () => {
   for (const fileName of mediaFiles) {
     const file = await stat(new URL(`../out/media/${fileName}`, import.meta.url));
