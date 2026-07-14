@@ -249,11 +249,36 @@ def _draw_timeline() -> None:
         return
     import gpu
 
+    session = active_session(context)
+    if session is not None and bool(getattr(session, "editing_aux_mask_uuid", "")):
+        try:
+            from .i18n import tr
+
+            gpu.state.blend_set("ALPHA")
+            _rect(
+                Rect(0.0, 0.0, context.region.width, context.region.height),
+                (0.025, 0.03, 0.04, 1.0),
+            )
+            _text(
+                tr("This mask is shared by every light angle"),
+                18.0,
+                max(18.0, context.region.height * 0.5 - 6.0),
+                color=(0.68, 0.74, 0.82, 1.0),
+                size=12,
+            )
+        except (AttributeError, ReferenceError, RuntimeError, SystemError, ValueError):
+            pass
+        finally:
+            try:
+                gpu.state.blend_set("NONE")
+            except (AttributeError, RuntimeError):
+                pass
+        return
+
     keys = _visible_keys(project)
     geometry = build_geometry(context.region.width, context.region.height, keys)
     active = int(getattr(project, "active_angle_index", -1))
     affected = _affected_indices(project, keys)
-    session = active_session(context)
     previewing = bool(session is not None and session.view_mode == "PREVIEW")
     show_hint = bool(session is not None and session.show_first_stroke_hint)
     highlighted = (
@@ -412,6 +437,9 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
         project = _project_for_context(context)
         if project is None:
             return {"CANCELLED"}
+        session = active_session(context)
+        if session is not None and bool(getattr(session, "editing_aux_mask_uuid", "")):
+            return {"CANCELLED"}
         keys = _visible_keys(project)
         geometry = build_geometry(context.region.width, context.region.height, keys)
         x, y = float(event.mouse_region_x), float(event.mouse_region_y)
@@ -506,7 +534,10 @@ class QSDF_GGT_timeline(bpy.types.GizmoGroup):
 
     @classmethod
     def poll(cls, context):
-        return _project_for_context(context) is not None
+        if _project_for_context(context) is None:
+            return False
+        session = active_session(context)
+        return not bool(session is not None and getattr(session, "editing_aux_mask_uuid", ""))
 
     def setup(self, _context):
         gizmo = self.gizmos.new(QSDF_GT_timeline_capture.bl_idname)

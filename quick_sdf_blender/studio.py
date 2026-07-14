@@ -71,6 +71,9 @@ class StudioSession:
     stroke_from_view3d: bool = False
     projection_hint: str = ""
     export_review_active: bool = False
+    editing_aux_mask_uuid: str = ""
+    aux_previous_preview_mode: str = ""
+    aux_previous_onion_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -244,6 +247,12 @@ def select_paint_key(
     project.review_angle = _side_signed_angle(project, item)
 
     session = active_session(context)
+    if (
+        session is not None
+        and session.project_uuid == str(getattr(project, "uuid", ""))
+        and session.editing_aux_mask_uuid
+    ):
+        return False
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
         leave_export_adjustment_review(project, session=session)
         ensure_studio_material_preview(context, session=session)
@@ -262,6 +271,81 @@ def select_paint_key(
             pass
     tag_studio_redraw()
     return True
+
+
+def enter_aux_mask_edit(context: Any, project: Any, mask_uuid: str) -> bool:
+    """Switch both paint surfaces to one angle-independent project mask."""
+
+    session = active_session(context)
+    if session is None or session.project_uuid != str(getattr(project, "uuid", "")):
+        raise StudioError("Open Quick SDF Studio before editing an additional mask")
+    from . import runtime
+
+    item = runtime.aux_mask_for_uuid(project, mask_uuid)
+    image = runtime.resolve_aux_mask_image(project, item)
+    if item is None or image is None:
+        raise StudioError("The selected additional mask is missing")
+    leave_export_adjustment_review(project, session=session)
+    if not session.editing_aux_mask_uuid:
+        session.aux_previous_preview_mode = str(
+            getattr(project, "preview_mode", "OVERLAY")
+        )
+        session.aux_previous_onion_enabled = bool(
+            getattr(project, "onion_enabled", False)
+        )
+    if bool(getattr(project, "onion_enabled", False)):
+        project.onion_enabled = False
+    session.editing_aux_mask_uuid = str(item.uuid)
+    session.view_mode = "AUX_MASK"
+    project.active_aux_mask_uuid = str(item.uuid)
+    project.active_aux_mask_index = next(
+        (
+            index
+            for index, candidate in enumerate(project.aux_masks)
+            if str(candidate.uuid) == str(item.uuid)
+        ),
+        0,
+    )
+    if hasattr(project, "preview_mode"):
+        project.preview_mode = "MASK"
+    image = runtime.sync_canvas(context, project)
+    if image is None:
+        raise StudioError("The additional mask could not be used as a paint canvas")
+    try:
+        _assign_preview(project, image)
+    except (ReferenceError, RuntimeError, ValueError):
+        pass
+    tag_studio_redraw()
+    return True
+
+
+def leave_aux_mask_edit(context: Any, project: Any) -> bool:
+    """Return from an angle-independent mask to the stored face-shadow key."""
+
+    session = active_session(context)
+    if session is None or session.project_uuid != str(getattr(project, "uuid", "")):
+        return False
+    if not session.editing_aux_mask_uuid:
+        return select_paint_key(
+            context,
+            project,
+            key_uuid=session.paint_key_uuid,
+            index=int(getattr(project, "active_angle_index", 0)),
+        )
+    session.editing_aux_mask_uuid = ""
+    session.view_mode = "EDIT"
+    if session.aux_previous_preview_mode and hasattr(project, "preview_mode"):
+        project.preview_mode = session.aux_previous_preview_mode
+    if session.aux_previous_onion_enabled and hasattr(project, "onion_enabled"):
+        project.onion_enabled = True
+    session.aux_previous_preview_mode = ""
+    session.aux_previous_onion_enabled = False
+    return select_paint_key(
+        context,
+        project,
+        key_uuid=session.paint_key_uuid,
+        index=int(getattr(project, "active_angle_index", 0)),
+    )
 
 
 def show_export_adjustment_review(context: Any, project: Any, image: Any) -> bool:
@@ -338,10 +422,16 @@ def seek_preview(
     """Scrub a transient result without changing the edit key or paint canvas."""
 
     value = max(0.0, min(90.0, float(angle)))
+    session = active_session(context)
+    if (
+        session is not None
+        and session.project_uuid == str(getattr(project, "uuid", ""))
+        and session.editing_aux_mask_uuid
+    ):
+        return float(getattr(project, "seek_angle", value))
     project.seek_angle = value
     sign = -1.0 if str(getattr(project, "authoring_side", "RIGHT")) == "LEFT" else 1.0
     project.review_angle = sign * value
-    session = active_session(context)
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
         ensure_studio_material_preview(context, session=session)
         session.view_mode = "PREVIEW"
@@ -369,6 +459,14 @@ def back_to_paint(context: Any, project: Any) -> bool:
     """Return Preview to the stored edit key before any mutating action."""
 
     session = active_session(context)
+    if (
+        session is not None
+        and session.project_uuid == str(getattr(project, "uuid", ""))
+        and session.editing_aux_mask_uuid
+    ):
+        from .runtime import sync_canvas
+
+        return sync_canvas(context, project) is not None
     if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
         active_uuid = str(getattr(project, "active_angle_uuid", ""))
         canvas = getattr(context.scene.tool_settings.image_paint, "canvas", None)
@@ -397,6 +495,15 @@ def reconcile_view_state(context: Any | None = None) -> bool:
     project = resolve_session_project(session)
     if session is None or project is None:
         return False
+    if session.editing_aux_mask_uuid:
+        from .runtime import aux_mask_for_uuid, resolve_aux_mask_image, sync_canvas
+
+        item = aux_mask_for_uuid(project, session.editing_aux_mask_uuid)
+        if resolve_aux_mask_image(project, item) is None:
+            session.editing_aux_mask_uuid = ""
+            session.view_mode = "EDIT"
+        else:
+            return sync_canvas(context, project) is not None
     resolved_index, item = _resolve_paint_key(project, key_uuid=session.paint_key_uuid)
     if item is None:
         resolved_index, item = _resolve_paint_key(project)
@@ -1272,6 +1379,15 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
     caller_workspace = window.workspace
     if session.project_uuid == target_uuid:
         _activate_project(project)
+        if session.editing_aux_mask_uuid:
+            workspace = bpy.data.workspaces.get(session.workspace_name)
+            if workspace is not None:
+                window.workspace = workspace
+            from .runtime import sync_canvas
+
+            sync_canvas(context, project)
+            tag_studio_redraw()
+            return session
         _configure_session_target(context, session, project, frame_content=False)
         tag_studio_redraw()
         return session
@@ -1279,6 +1395,8 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
     old_project = resolve_session_project(session)
     if old_project is None:
         raise StudioError("The current Quick SDF Studio target is unavailable")
+    if session.editing_aux_mask_uuid:
+        leave_aux_mask_edit(context, old_project)
     old_scene, old_index = _project_location(old_project)
     workspace = bpy.data.workspaces.get(session.workspace_name)
     if old_scene is None or old_index is None or workspace is None:
@@ -1555,6 +1673,14 @@ def exit_studio(
     context = context or bpy.context
     window = find_window(session.window_pointer)
     project = resolve_session_project(session)
+    if project is not None and session.editing_aux_mask_uuid:
+        session.editing_aux_mask_uuid = ""
+        if session.aux_previous_preview_mode and hasattr(project, "preview_mode"):
+            project.preview_mode = session.aux_previous_preview_mode
+        if session.aux_previous_onion_enabled and hasattr(project, "onion_enabled"):
+            project.onion_enabled = True
+        session.aux_previous_preview_mode = ""
+        session.aux_previous_onion_enabled = False
     _restore_preview(project)
     restore_stroke_brush(session=session)
     _discard_project_paint_snapshot(project)
@@ -1618,6 +1744,14 @@ def _save_pre(_unused: Any) -> None:
     if _SESSION is None:
         return
     project = resolve_session_project()
+    if (
+        project is not None
+        and _SESSION.editing_aux_mask_uuid
+        and _SESSION.aux_previous_preview_mode
+        and hasattr(project, "preview_mode")
+    ):
+        # Aux edit mode is transient; save the artist's normal preview choice.
+        project.preview_mode = _SESSION.aux_previous_preview_mode
     _restore_preview(project)
     window = find_window(_SESSION.window_pointer)
     scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
@@ -1649,10 +1783,21 @@ def _save_post(_unused: Any) -> None:
             scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
             if window is not None and scene is not None:
                 _apply_projection_settings(scene, _SESSION, window, getattr(project, "target_object", None))
-            from .runtime import active_angle, resolve_display_image
+            from .runtime import (
+                active_angle,
+                aux_mask_for_uuid,
+                resolve_aux_mask_image,
+                resolve_display_image,
+            )
 
-            item = active_angle(project)
-            image = resolve_display_image(project, item) if item else None
+            if _SESSION.editing_aux_mask_uuid:
+                if hasattr(project, "preview_mode"):
+                    project.preview_mode = "MASK"
+                aux_item = aux_mask_for_uuid(project, _SESSION.editing_aux_mask_uuid)
+                image = resolve_aux_mask_image(project, aux_item)
+            else:
+                item = active_angle(project)
+                image = resolve_display_image(project, item) if item else None
             _assign_preview(project, image)
             if _SESSION.view_mode == "PREVIEW":
                 from .live_preview import update_seek_preview
@@ -1682,6 +1827,11 @@ def _load_pre(_unused: Any) -> None:
         window = find_window(_SESSION.window_pointer)
         scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
         project = resolve_session_project(_SESSION)
+        if project is not None and _SESSION.editing_aux_mask_uuid:
+            if _SESSION.aux_previous_preview_mode and hasattr(project, "preview_mode"):
+                project.preview_mode = _SESSION.aux_previous_preview_mode
+            if _SESSION.aux_previous_onion_enabled and hasattr(project, "onion_enabled"):
+                project.onion_enabled = True
         restore_stroke_brush(session=_SESSION)
         _discard_project_paint_snapshot(project)
         _cancel_stroke_watchdog()
@@ -1762,6 +1912,7 @@ __all__ = [
     "CLASSES", "StudioBusyError", "StudioError", "StudioSession", "StudioUnavailableError",
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
     "back_to_paint", "dismiss_first_stroke_hint", "ensure_studio_material_preview",
+    "enter_aux_mask_edit", "leave_aux_mask_edit",
     "enter_studio", "exit_studio", "open_or_switch_studio",
     "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
     "TIMELINE_SPACE_TYPE",

@@ -9,7 +9,13 @@ import struct
 import zlib
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    StringProperty,
+)
 from mathutils import Vector
 
 from . import runtime
@@ -139,6 +145,67 @@ def _extract_evaluated_bake_input(context, project):
         evaluated.to_mesh_clear()
 
 
+def _ensure_project_aux_images(project):
+    """Create the two standard static-mask images before Studio can open."""
+
+    from .model import ensure_standard_aux_masks, ensure_liltoon_packing
+
+    sdf_area, shadow_strength = ensure_standard_aux_masks(
+        project, uuid_factory=runtime.new_uuid
+    )
+    for item, fill in ((sdf_area, 0.0), (shadow_strength, 1.0)):
+        image = runtime.resolve_aux_mask_image(project, item)
+        if image is None:
+            image = runtime.create_aux_mask_image(project, item, fill_value=fill)
+            if str(item.role) == "SHADOW_STRENGTH":
+                image[runtime.AUX_MASK_INITIALIZED_KEY] = True
+    ensure_liltoon_packing(project)
+    return sdf_area, shadow_strength
+
+
+def _write_sdf_area_occupancy(project, occupancy, *, force: bool = False) -> bool:
+    """Initialize or explicitly reset the canonical SDF-area mask."""
+
+    import numpy as np
+
+    from .model import aux_mask_for_role, mark_aux_mask_changed
+
+    item = aux_mask_for_role(project, "SDF_AREA")
+    image = runtime.resolve_aux_mask_image(project, item)
+    if item is None or image is None:
+        raise ValueError("The SDF Area mask is missing")
+    if bool(image.get(runtime.AUX_MASK_INITIALIZED_KEY, False)) and not force:
+        return False
+    mask = np.asarray(occupancy, dtype=np.bool_)
+    expected = (int(project.resolution), int(project.resolution))
+    if mask.shape != expected:
+        raise ValueError(f"SDF Area shape {mask.shape} does not match {expected}")
+    rgba = np.ones((*mask.shape, 4), dtype=np.float32)
+    rgba[..., :3] = mask[..., None]
+    runtime.write_image_rgba(image, rgba)
+    image[runtime.AUX_MASK_INITIALIZED_KEY] = True
+    item.dirty = bool(force)
+    mark_aux_mask_changed(project, item)
+    if not force:
+        item.dirty = False
+    return True
+
+
+def _reset_sdf_area_from_uv(context, project, *, force: bool = True) -> bool:
+    from .bake import rasterize_uv_normals
+
+    triangle_uvs, corner_normals, _centers = _extract_evaluated_bake_input(
+        context, project
+    )
+    _normal, occupancy = rasterize_uv_normals(
+        triangle_uvs,
+        corner_normals,
+        int(project.resolution),
+        int(project.resolution),
+    )
+    return _write_sdf_area_occupancy(project, occupancy, force=force)
+
+
 def _detect_project_symmetry(project, triangle_uvs, corner_normals, triangle_centers) -> None:
     """Suggest a live UV mirror without asking a technical setup question."""
 
@@ -222,6 +289,7 @@ def _bake_project(context, project) -> None:
                 int(project.resolution),
                 int(project.resolution),
             )
+            _write_sdf_area_occupancy(project, occupancy, force=False)
             if np.any(occupancy):
                 rows, columns = np.nonzero(occupancy)
                 height, width = occupancy.shape
@@ -312,8 +380,11 @@ def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True
     try:
         source = settings.source_image if settings.initialization == "EXISTING" else None
         runtime.create_project_images(project, source)
+        _ensure_project_aux_images(project)
         if settings.initialization == "NORMAL_SWEEP":
             _bake_project(context, project)
+        else:
+            _reset_sdf_area_from_uv(context, project, force=False)
         errors, warnings, _report = runtime.validate_project(project, include_monotonic=True)
         if errors:
             raise ValueError("\n".join(errors))
@@ -867,6 +938,314 @@ class QUICKSDF_OT_sync_canvas(bpy.types.Operator):
         return {"FINISHED"} if runtime.sync_canvas(context, project) is not None else {"CANCELLED"}
 
 
+def _packing_channel(project, output_channel: str):
+    from .model import packing_channel_for
+
+    return packing_channel_for(project, str(output_channel).upper())
+
+
+def _record_aux_image_change(project, item, image, before, label: str) -> bool:
+    """Publish one static-mask edit to Quick SDF history and export revision."""
+
+    import numpy as np
+
+    after = runtime.image_rgba8(image)
+    if before.shape == after.shape and np.array_equal(before, after):
+        return False
+    history = _HISTORIES.setdefault(str(project.uuid), History(compression_level=1))
+    if not history.push(label, {image.name: before}, {image.name: after}):
+        history.clear()
+    _UNDO_FENCES.add(str(project.uuid))
+    from .model import mark_aux_mask_changed
+
+    mark_aux_mask_changed(project, item)
+    return True
+
+
+class QUICKSDF_OT_packing_customize(bpy.types.Operator):
+    bl_idname = "quicksdf.packing_customize"
+    bl_label = "Customize Output Packing"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        from .model import ensure_liltoon_packing, mark_packing_changed
+
+        ensure_liltoon_packing(project)
+        mark_packing_changed(project, customized=True)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_packing_reset_liltoon(bpy.types.Operator):
+    bl_idname = "quicksdf.packing_reset_liltoon"
+    bl_label = "Reset Packing to lilToon"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        from .model import reset_liltoon_packing
+
+        reset_liltoon_packing(project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_packing_assign_active_mask(bpy.types.Operator):
+    bl_idname = "quicksdf.packing_assign_active_mask"
+    bl_label = "Use Selected Custom Mask"
+    bl_options = {"REGISTER", "UNDO"}
+
+    output_channel: StringProperty(name="Output Channel", default="R")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        channel = _packing_channel(project, self.output_channel)
+        item = runtime.active_aux_mask(project)
+        if channel is None:
+            self.report({"ERROR"}, f"Output channel {self.output_channel!r} is missing")
+            return {"CANCELLED"}
+        if item is None or str(getattr(item, "role", "")) != "CUSTOM":
+            self.report({"ERROR"}, "Select a Custom Mask first")
+            return {"CANCELLED"}
+        channel.source_type = "CUSTOM_MASK"
+        channel.auxiliary_mask_uuid = str(item.uuid)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_edit(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_edit"
+    bl_label = "Edit Additional Mask"
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            from .studio import enter_aux_mask_edit
+
+            enter_aux_mask_edit(context, project, self.mask_uuid)
+        except (RuntimeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_back(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_back"
+    bl_label = "Back to Face Shadow"
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        from .studio import leave_aux_mask_edit
+
+        return {"FINISHED"} if leave_aux_mask_edit(context, project) else {"CANCELLED"}
+
+
+class QUICKSDF_OT_aux_mask_add(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_add"
+    bl_label = "Add Custom Mask"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(name="Name", default="Custom Mask")
+    fill_value: FloatProperty(
+        name="Initial Value", default=0.0, min=0.0, max=1.0, subtype="FACTOR"
+    )
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        requested = self.name.strip() or "Custom Mask"
+        used = {str(item.name) for item in project.aux_masks}
+        name = requested
+        suffix = 2
+        while name in used:
+            name = f"{requested} {suffix}"
+            suffix += 1
+        item = runtime.create_aux_mask(
+            project,
+            role="CUSTOM",
+            name=name,
+            fill_value=float(self.fill_value),
+        )
+        image = runtime.resolve_aux_mask_image(project, item)
+        if image is not None:
+            image[runtime.AUX_MASK_INITIALIZED_KEY] = True
+        from .model import mark_aux_mask_changed
+
+        mark_aux_mask_changed(project, item)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_import(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_import"
+    bl_label = "Import Additional Mask from Image"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+    source_image_name: StringProperty(name="Source Image", default="")
+    component: EnumProperty(
+        name="Channel",
+        items=(
+            ("LUMINANCE", "Luminance", "Rec.709 luminance from RGB"),
+            ("R", "R", "Red channel"),
+            ("G", "G", "Green channel"),
+            ("B", "B", "Blue channel"),
+            ("A", "A", "Alpha channel"),
+        ),
+        default="LUMINANCE",
+    )
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, _context):
+        self.layout.prop_search(self, "source_image_name", bpy.data, "images", text="Source Image")
+        self.layout.prop(self, "component")
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        item = runtime.aux_mask_for_uuid(project, self.mask_uuid)
+        image = runtime.resolve_aux_mask_image(project, item)
+        if item is None or image is None:
+            self.report({"ERROR"}, "The selected additional mask is missing")
+            return {"CANCELLED"}
+        source_image = bpy.data.images.get(str(self.source_image_name))
+        if source_image is None:
+            self.report({"ERROR"}, "Choose a source image")
+            return {"CANCELLED"}
+        before = runtime.image_rgba8(image)
+        try:
+            runtime.copy_image_channel_to_aux(source_image, image, self.component)
+            _record_aux_image_change(project, item, image, before, "Import Mask")
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            runtime.write_image_rgba8(image, before)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_fill(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_fill"
+    bl_label = "Fill Additional Mask"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+    value: FloatProperty(name="Value", default=1.0, min=0.0, max=1.0)
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        item = runtime.aux_mask_for_uuid(project, self.mask_uuid)
+        image = runtime.resolve_aux_mask_image(project, item)
+        if item is None or image is None:
+            return {"CANCELLED"}
+        before = runtime.image_rgba8(image)
+        runtime.fill_aux_mask_image(image, self.value)
+        _record_aux_image_change(project, item, image, before, "Fill Mask")
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_reset_sdf_area(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_reset_sdf_area"
+    bl_label = "Reset SDF Area from UV"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        item = runtime.aux_mask_for_uuid(project, self.mask_uuid)
+        if item is None or str(getattr(item, "role", "")) != "SDF_AREA":
+            self.report({"ERROR"}, "Select the SDF Area mask")
+            return {"CANCELLED"}
+        image = runtime.resolve_aux_mask_image(project, item)
+        if image is None:
+            return {"CANCELLED"}
+        before = runtime.image_rgba8(image)
+        try:
+            _reset_sdf_area_from_uv(context, project, force=True)
+            _record_aux_image_change(project, item, image, before, "Reset SDF Area")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            runtime.write_image_rgba8(image, before)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        runtime.sync_canvas(context, project)
+        return {"FINISHED"}
+
+
+class QUICKSDF_OT_aux_mask_delete(bpy.types.Operator):
+    bl_idname = "quicksdf.aux_mask_delete"
+    bl_label = "Delete Custom Mask"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mask_uuid: StringProperty(name="Mask UUID", default="", options={"HIDDEN"})
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        item = runtime.aux_mask_for_uuid(project, self.mask_uuid)
+        if item is None or str(getattr(item, "role", "")) != "CUSTOM":
+            self.report({"ERROR"}, "The standard masks cannot be deleted")
+            return {"CANCELLED"}
+        if any(
+            str(getattr(channel, "source_type", "")) == "CUSTOM_MASK"
+            and str(getattr(channel, "auxiliary_mask_uuid", "")) == str(item.uuid)
+            for channel in project.packing_channels
+        ):
+            self.report({"ERROR"}, "This mask is used by Output Packing")
+            return {"CANCELLED"}
+        try:
+            from .studio import active_session, leave_aux_mask_edit
+
+            session = active_session(context)
+            if session is not None and session.editing_aux_mask_uuid == str(item.uuid):
+                leave_aux_mask_edit(context, project)
+        except (ImportError, ReferenceError, RuntimeError):
+            pass
+        index = next(
+            (
+                index
+                for index, candidate in enumerate(project.aux_masks)
+                if str(candidate.uuid) == str(item.uuid)
+            ),
+            -1,
+        )
+        if index < 0:
+            return {"CANCELLED"}
+        runtime.remove_aux_mask_image(project, item)
+        project.aux_masks.remove(index)
+        project.active_aux_mask_index = min(index, len(project.aux_masks) - 1)
+        active = runtime.active_aux_mask(project)
+        project.active_aux_mask_uuid = str(getattr(active, "uuid", ""))
+        from .model import mark_packing_changed
+
+        mark_packing_changed(project, customized=bool(project.packing_customized))
+        return {"FINISHED"}
+
+
 class QUICKSDF_OT_boundary_track_add(bpy.types.Operator):
     bl_idname = "quicksdf.boundary_track_add"
     bl_label = "Add Boundary Track"
@@ -1328,6 +1707,52 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             except (ImportError, RuntimeError):
                 pass
 
+        aux_snapshot = runtime.consume_aux_paint_snapshot(project)
+        if aux_snapshot is not None:
+            mask_uuid, image_name, before_rgba = aux_snapshot
+            item = runtime.aux_mask_for_uuid(project, mask_uuid)
+            image = bpy.data.images.get(image_name)
+            try:
+                if item is None or image is None:
+                    raise ValueError("The additional mask disappeared during the stroke")
+                current = runtime.image_rgba8(image)
+                if current.shape != before_rgba.shape:
+                    raise ValueError("The additional mask changed size during the stroke")
+                if np.any(current[..., 3] != 255):
+                    current[..., 3] = 255
+                    runtime.write_image_rgba8(image, current)
+                changed = np.any(current[..., :3] != before_rgba[..., :3], axis=2)
+                if not np.any(changed):
+                    return {"FINISHED"}
+                image[runtime.IMAGE_REVISION_KEY] = int(
+                    image.get(runtime.IMAGE_REVISION_KEY, 0)
+                ) + 1
+                _record_aux_image_change(
+                    project,
+                    item,
+                    image,
+                    before_rgba,
+                    "Paint Additional Mask",
+                )
+                try:
+                    from .studio import tag_studio_redraw
+
+                    tag_studio_redraw()
+                except (ImportError, RuntimeError):
+                    pass
+                return {"FINISHED"}
+            except Exception as exc:
+                clear_histories(str(project.uuid))
+                if image is not None:
+                    try:
+                        runtime.write_image_rgba8(image, before_rgba)
+                    except Exception:
+                        pass
+                self.report({"ERROR"}, f"Could not finish the mask stroke: {exc}")
+                return {"CANCELLED"}
+            finally:
+                finish_stroke()
+
         interactive_snapshot = runtime.consume_interactive_paint_snapshot(project)
         if interactive_snapshot is not None:
             active_uuid, display_name, before_rgba, coverage_name, coverage_before = interactive_snapshot
@@ -1571,11 +1996,19 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        aux_mask_uuid = ""
         try:
-            from .studio import back_to_paint, is_studio_active
+            from .studio import active_session, back_to_paint, is_studio_active
 
-            if is_studio_active(context, str(project.uuid)) and not back_to_paint(context, project):
-                return {"CANCELLED"}
+            if is_studio_active(context, str(project.uuid)):
+                session = active_session(context)
+                aux_mask_uuid = str(
+                    getattr(session, "editing_aux_mask_uuid", "")
+                    if session is not None
+                    else ""
+                )
+                if not aux_mask_uuid and not back_to_paint(context, project):
+                    return {"CANCELLED"}
         except (ImportError, AttributeError, ReferenceError, RuntimeError):
             pass
         try:
@@ -1584,15 +2017,19 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
             prepare_stroke_brush(context, project)
         except (ImportError, AttributeError, ReferenceError, RuntimeError):
             pass
-        if bool(getattr(project, "onion_enabled", False)):
+        if not aux_mask_uuid and bool(getattr(project, "onion_enabled", False)):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
         runtime.discard_interactive_paint_snapshot(project)
+        runtime.discard_aux_paint_snapshot(project)
         try:
-            runtime.capture_interactive_paint_snapshot(
-                project,
-                include_coverage=bool(project.boundary_tracks),
-            )
+            if aux_mask_uuid:
+                runtime.capture_aux_paint_snapshot(project, aux_mask_uuid)
+            else:
+                runtime.capture_interactive_paint_snapshot(
+                    project,
+                    include_coverage=bool(project.boundary_tracks),
+                )
         except (RuntimeError, ValueError) as exc:
             try:
                 from .studio import restore_stroke_brush
@@ -1681,6 +2118,27 @@ def _write_history_images(values) -> None:
         runtime.write_image_rgba8(image, rgba)
 
 
+def _mark_history_images_changed(project, image_names) -> None:
+    """Keep persistent mask revisions in step with Quick SDF undo/redo."""
+
+    aux_items = []
+    for name in image_names:
+        image = bpy.data.images.get(name)
+        if image is None or str(image.get(runtime.ROLE_KEY, "")) != runtime.AUX_MASK_ROLE:
+            continue
+        item = runtime.aux_mask_for_uuid(
+            project, str(image.get(runtime.AUX_MASK_UUID_KEY, ""))
+        )
+        if item is not None and item not in aux_items:
+            aux_items.append(item)
+    if aux_items:
+        for item in aux_items:
+            item.revision = int(getattr(item, "revision", 0)) + 1
+            item.dirty = True
+        project.packing_revision = int(getattr(project, "packing_revision", 0)) + 1
+    project.dirty = True
+
+
 def _history_context_active(context, project) -> bool:
     # Background/API callers have no editor area and retain scripting access.
     if getattr(context, "area", None) is None:
@@ -1722,6 +2180,7 @@ class QUICKSDF_OT_history_undo(bpy.types.Operator):
             restored = history.undo(current)
             moved = True
             _write_history_images(restored)
+            _mark_history_images_changed(project, restored)
         except Exception as exc:
             # ``History`` is pure array state, while Blender Image writes may
             # fail halfway through. Move the entry back and restore every
@@ -1769,6 +2228,7 @@ class QUICKSDF_OT_history_redo(bpy.types.Operator):
             restored = history.redo(current)
             moved = True
             _write_history_images(restored)
+            _mark_history_images_changed(project, restored)
         except Exception as exc:
             try:
                 if moved:
@@ -1811,6 +2271,10 @@ class QUICKSDF_OT_validate(bpy.types.Operator):
 def _prepare_threshold_inputs(project):
     """Copy every bpy-backed export layer before work moves to a worker."""
 
+    # Resolve the recipe first so a broken reference is reported against its
+    # visible R/G/B/A row instead of being hidden behind a generic project
+    # validation error.
+    packing = _snapshot_packing_inputs(project)
     previous_status = (
         str(getattr(project, "validation_message", "")),
         str(getattr(project, "warning_message", "")),
@@ -1839,6 +2303,7 @@ def _prepare_threshold_inputs(project):
             "linked": False,
             "right": runtime.project_side_export_layers(project, "RIGHT"),
             "left": runtime.project_side_export_layers(project, "LEFT"),
+            "packing": packing,
         }
 
     available = {
@@ -1862,7 +2327,67 @@ def _prepare_threshold_inputs(project):
         "source": source,
         "mirror_mode": mode_map.get(mirror_mode, "TEXTURE_MIRROR"),
         "island_pairs": pairs,
+        "packing": packing,
     }
+
+
+def _snapshot_packing_inputs(project):
+    """Copy the project-local recipe and all referenced masks on the main thread."""
+
+    from .model import aux_mask_for_role
+    from .packing import PackingChannelSpec
+
+    channels = {}
+    for item in getattr(project, "packing_channels", ()):
+        output = str(getattr(item, "output_channel", "")).upper()
+        if output not in "RGBA":
+            raise ValueError(f"Output Packing has an invalid channel {output!r}")
+        if output in channels:
+            raise ValueError(f"Output Packing has more than one {output} row")
+        channels[output] = item
+    missing = [output for output in "RGBA" if output not in channels]
+    if missing:
+        raise ValueError(f"Output Packing is missing {', '.join(missing)}")
+
+    specs = []
+    signals = {}
+    expected = (int(project.resolution), int(project.resolution))
+    for output in "RGBA":
+        channel = channels[output]
+        source = str(getattr(channel, "source_type", "")).upper()
+        mask_uuid = str(getattr(channel, "auxiliary_mask_uuid", ""))
+        if source in {"SDF_AREA", "SHADOW_STRENGTH"}:
+            item = aux_mask_for_role(project, source)
+            if item is None:
+                raise ValueError(f"Packing {output}: {source.replace('_', ' ').title()} is missing")
+            mask_uuid = str(item.uuid)
+        elif source == "CUSTOM_MASK":
+            item = runtime.aux_mask_for_uuid(project, mask_uuid)
+            if item is None or str(getattr(item, "role", "")) != "CUSTOM":
+                raise ValueError(f"Packing {output}: select a valid Custom Mask")
+        else:
+            item = None
+        if item is not None:
+            image = runtime.resolve_aux_mask_image(project, item)
+            if image is None:
+                raise ValueError(f"Packing {output}: mask image is missing")
+            if tuple(map(int, image.size[:])) != (expected[1], expected[0]):
+                raise ValueError(
+                    f"Packing {output}: mask size {tuple(image.size[:])} does not match {expected[::-1]}"
+                )
+            signals[mask_uuid] = runtime.image_channel_u16(image, 0)
+        try:
+            specs.append(
+                PackingChannelSpec(
+                    source=source,
+                    invert=bool(getattr(channel, "invert", False)),
+                    constant_value=float(getattr(channel, "constant_value", 0.0)),
+                    auxiliary_mask_uuid=mask_uuid,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Packing {output}: {exc}") from exc
+    return {"specs": tuple(specs), "signals": signals, "shape": expected}
 
 
 def _export_revision_token(project):
@@ -1901,6 +2426,36 @@ def _export_revision_token(project):
                 tuple(layers),
             )
         )
+    aux_entries = []
+    for item in sorted(
+        getattr(project, "aux_masks", ()),
+        key=lambda value: str(getattr(value, "uuid", "")),
+    ):
+        image = runtime.resolve_aux_mask_image(project, item)
+        aux_entries.append(
+            (
+                str(getattr(item, "uuid", "")),
+                str(getattr(item, "role", "")),
+                int(getattr(item, "revision", 0)),
+                None
+                if image is None
+                else (
+                    str(image.name),
+                    tuple(int(value) for value in image.size[:]),
+                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                ),
+            )
+        )
+    packing_entries = tuple(
+        (
+            str(getattr(item, "output_channel", "")),
+            str(getattr(item, "source_type", "")),
+            str(getattr(item, "auxiliary_mask_uuid", "")),
+            bool(getattr(item, "invert", False)),
+            float(getattr(item, "constant_value", 0.0)),
+        )
+        for item in getattr(project, "packing_channels", ())
+    )
     return (
         str(getattr(project, "uuid", "")),
         str(getattr(getattr(project, "target_object", None), "name_full", "")),
@@ -1911,6 +2466,9 @@ def _export_revision_token(project):
         str(getattr(project, "symmetry_mode", "AUTO")),
         str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR")),
         str(getattr(project, "authoring_side", "RIGHT")),
+        int(getattr(project, "packing_revision", 0)),
+        packing_entries,
+        tuple(aux_entries),
         tuple(entries),
     )
 
@@ -1952,28 +2510,37 @@ def _prepare_strict_threshold_inputs(project):
     return right, right_angles, left, left_angles
 
 
-def _compute_threshold_rgba(inputs, cancel_flag=None):
-    """Blender-free worker entry point; ctypes releases the GIL in native EDT."""
+def _compute_threshold_channels(inputs, cancel_flag=None):
+    """Generate canonical R/G planes; ctypes releases the GIL in native EDT."""
 
-    import numpy as np
-
-    from .core import generate_threshold_pair
+    from .core import generate_threshold_pair_channels
 
     right, right_angles, left, left_angles = inputs
     try:
         from . import native
 
         if native.available() and native.version() >= 5:
-            channels = native.generate_threshold_pair(
+            return native.generate_threshold_pair(
                 right, right_angles, left, left_angles, cancel_flag=cancel_flag
             )
-            rgba = np.zeros((*channels.shape[:2], 4), dtype=np.uint16)
-            rgba[..., :2] = channels
-            rgba[..., 3] = np.uint16(65535)
-            return rgba
     except (ImportError, OSError, AttributeError):
         pass
-    return generate_threshold_pair(right, right_angles, left, left_angles, validate=True)
+    return generate_threshold_pair_channels(
+        right, right_angles, left, left_angles, validate=True
+    )
+
+
+def _pack_threshold_channels(channels, packing):
+    from .packing import PackingSource, pack_rgba16
+
+    signals = dict(packing["signals"])
+    signals[PackingSource.RIGHT_THRESHOLD] = channels[..., 0]
+    signals[PackingSource.LEFT_THRESHOLD] = channels[..., 1]
+    return pack_rgba16(
+        signals,
+        packing["specs"],
+        shape=packing.get("shape", channels.shape[:2]),
+    )
 
 
 def _repair_export_lane(lane, cancel_flag=None):
@@ -2056,7 +2623,8 @@ def _compute_export_result(inputs, cancel_flag=None):
 
     if cancelled():
         raise RuntimeError("Export cancelled")
-    rgba = _compute_threshold_rgba(threshold_inputs, cancel_flag)
+    channels = _compute_threshold_channels(threshold_inputs, cancel_flag)
+    rgba = _pack_threshold_channels(channels, inputs["packing"])
     if cancelled():
         raise RuntimeError("Export cancelled")
     return {
@@ -2238,11 +2806,13 @@ def shutdown_export_job(
 
 def _generate(project, context):
     inputs = _prepare_strict_threshold_inputs(project)
+    packing = _snapshot_packing_inputs(project)
     window_manager = context.window_manager
     window_manager.progress_begin(0, 2)
     try:
         window_manager.progress_update(1)
-        rgba = _compute_threshold_rgba(inputs)
+        channels = _compute_threshold_channels(inputs)
+        rgba = _pack_threshold_channels(channels, packing)
         runtime.update_threshold_preview(project, rgba)
         window_manager.progress_update(2)
     finally:
@@ -2263,6 +2833,50 @@ def _generate_export(project, context):
     finally:
         window_manager.progress_end()
     return result
+
+
+class QUICKSDF_OT_packing_preview_channel(bpy.types.Operator):
+    bl_idname = "quicksdf.packing_preview_channel"
+    bl_label = "Preview Packed Channel"
+    bl_description = "Show the current packed output or one channel as grayscale"
+
+    output_channel: EnumProperty(
+        name="Channel",
+        items=(
+            ("RGB", "RGB", "Packed RGB preview"),
+            ("R", "R", "Red channel"),
+            ("G", "G", "Green channel"),
+            ("B", "B", "Blue channel"),
+            ("A", "A", "Alpha channel"),
+        ),
+        default="RGB",
+    )
+
+    def execute(self, context):
+        import numpy as np
+
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            result = _generate_export(project, context)
+            rgba = np.array(result["rgba"], copy=True, order="C")
+            if self.output_channel in "RGBA" and self.output_channel != "RGB":
+                index = "RGBA".index(self.output_channel)
+                plane = rgba[..., index].copy()
+                rgba[..., :3] = plane[..., None]
+            rgba[..., 3] = np.uint16(65535)
+            image = runtime.update_threshold_preview(project, rgba)
+            project.packing_preview_channel = self.output_channel
+            from .studio import show_export_adjustment_review
+
+            if not show_export_adjustment_review(context, project, image):
+                raise RuntimeError("Open Quick SDF Studio to preview packed channels")
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Showing packed {self.output_channel}")
+        return {"FINISHED"}
 
 
 class QUICKSDF_OT_generate(bpy.types.Operator):
@@ -2530,6 +3144,16 @@ CLASSES = (
     QUICKSDF_OT_key_move,
     QUICKSDF_OT_key_delete,
     QUICKSDF_OT_sync_canvas,
+    QUICKSDF_OT_packing_customize,
+    QUICKSDF_OT_packing_reset_liltoon,
+    QUICKSDF_OT_packing_assign_active_mask,
+    QUICKSDF_OT_aux_mask_edit,
+    QUICKSDF_OT_aux_mask_back,
+    QUICKSDF_OT_aux_mask_add,
+    QUICKSDF_OT_aux_mask_import,
+    QUICKSDF_OT_aux_mask_fill,
+    QUICKSDF_OT_aux_mask_reset_sdf_area,
+    QUICKSDF_OT_aux_mask_delete,
     QUICKSDF_OT_boundary_track_add,
     QUICKSDF_OT_boundary_track_remove,
     QUICKSDF_OT_paint_value_toggle,
@@ -2546,6 +3170,7 @@ CLASSES = (
     QUICKSDF_OT_history_undo,
     QUICKSDF_OT_history_redo,
     QUICKSDF_OT_validate,
+    QUICKSDF_OT_packing_preview_channel,
     QUICKSDF_OT_generate,
     QUICKSDF_OT_export_texture,
     QUICKSDF_OT_review_export_adjustments,

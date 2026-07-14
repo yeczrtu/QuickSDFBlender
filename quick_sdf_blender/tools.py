@@ -40,40 +40,68 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         layout.label(text="Open Quick SDF Studio to paint", icon="INFO")
         return
 
+    editing_aux_uuid = ""
+    try:
+        from .studio import active_session
+
+        session = active_session(context)
+        editing_aux_uuid = str(
+            getattr(session, "editing_aux_mask_uuid", "")
+            if session is not None
+            else ""
+        )
+    except (ImportError, AttributeError, ReferenceError, RuntimeError):
+        pass
+
     row = layout.row(align=True)
     if _operator_exists("quicksdf.paint_value_set"):
         light = row.operator(
             "quicksdf.paint_value_set",
-            text="Light",
-            icon="LIGHT_SUN",
+            text="White" if editing_aux_uuid else "Light",
+            icon="RADIOBUT_ON" if editing_aux_uuid else "LIGHT_SUN",
             depress=int(getattr(project, "paint_value", 0)) == 1,
         )
         light.value = 1
         shadow = row.operator(
             "quicksdf.paint_value_set",
-            text="Shadow",
-            icon="SHADING_SOLID",
+            text="Black" if editing_aux_uuid else "Shadow",
+            icon="RADIOBUT_OFF" if editing_aux_uuid else "SHADING_SOLID",
             depress=int(getattr(project, "paint_value", 0)) == 0,
         )
         shadow.value = 0
     elif hasattr(project, "paint_value"):
         row.prop(project, "paint_value", text="Light / Shadow")
 
-    row.separator()
-    if _operator_exists("quicksdf.mirror_toggle"):
+    if editing_aux_uuid:
+        try:
+            from . import runtime
+
+            item = runtime.aux_mask_for_uuid(project, editing_aux_uuid)
+            row.label(text=f"Editing: {getattr(item, 'name', 'Mask')}", icon="IMAGE_DATA")
+        except (ImportError, AttributeError, ReferenceError):
+            pass
+        if _operator_exists("quicksdf.aux_mask_back"):
+            back = row.operator(
+                "quicksdf.aux_mask_back", text="Back to Face Shadow", icon="LOOP_BACK"
+            )
+            if hasattr(back, "mask_uuid"):
+                back.mask_uuid = editing_aux_uuid
+    else:
+        row.separator()
+    if not editing_aux_uuid and _operator_exists("quicksdf.mirror_toggle"):
         row.operator(
             "quicksdf.mirror_toggle", text="Mirror On", icon="MOD_MIRROR",
             depress=bool(getattr(project, "mirror_enabled", False)),
         )
-    elif hasattr(project, "mirror_enabled"):
+    elif not editing_aux_uuid and hasattr(project, "mirror_enabled"):
         row.prop(project, "mirror_enabled", text="Mirror On", toggle=True, icon="MOD_MIRROR")
 
     display_prop = "preview_mode" if hasattr(project, "preview_mode") else (
         "review_mode" if hasattr(project, "review_mode") else ""
     )
-    if display_prop:
+    if display_prop and not editing_aux_uuid:
         row.prop(project, display_prop, text="")
-    if getattr(getattr(context, "area", None), "type", "") == "IMAGE_EDITOR" and hasattr(
+    if not editing_aux_uuid and getattr(getattr(context, "area", None), "type", "") == "IMAGE_EDITOR" and hasattr(
         project, "onion_enabled"
     ):
         row.prop(project, "onion_enabled", text="Onion", toggle=True, icon="IMAGE_ALPHA")

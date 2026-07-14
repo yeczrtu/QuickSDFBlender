@@ -20,14 +20,18 @@ PROJECT_UUID_KEY = "quick_sdf_project_uuid"
 ANGLE_UUID_KEY = "quick_sdf_angle_uuid"
 ROLE_KEY = "quick_sdf_role"
 IMAGE_REVISION_KEY = "quick_sdf_revision"
+AUX_MASK_UUID_KEY = "quick_sdf_aux_mask_uuid"
+AUX_MASK_INITIALIZED_KEY = "quick_sdf_aux_mask_initialized"
 DISPLAY_ROLE = "angle_display"
 BASE_ROLE = "angle_base"
 COVERAGE_ROLE = "angle_coverage"
+AUX_MASK_ROLE = "aux_mask"
 THRESHOLD_ROLE = "threshold_preview"
 EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
 PALETTE_NAME = "Quick SDF Light Shadow"
 _PAINT_SNAPSHOTS: dict[str, Any] = {}
 _INTERACTIVE_PAINT_SNAPSHOTS: dict[str, tuple[str, str, Any, str, Any | None]] = {}
+_AUX_PAINT_SNAPSHOTS: dict[str, tuple[str, str, Any]] = {}
 _BASE_BAKE_UUIDS: set[str] = set()
 _PENDING_BASE_SIGNATURES: set[str] = set()
 
@@ -169,6 +173,76 @@ def resolve_coverage_image(project: Any, angle_item: Any) -> bpy.types.Image | N
     return resolve_angle_data_image(project, angle_item, COVERAGE_ROLE)
 
 
+def resolve_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | None:
+    """Resolve one project-owned angle-independent mask after Undo/Load."""
+
+    if aux_item is None:
+        return None
+    candidates: list[bpy.types.Image] = []
+    pointer = getattr(aux_item, "image", None)
+    if pointer is not None:
+        candidates.append(pointer)
+    stored_name = str(getattr(aux_item, "image_name", ""))
+    named = bpy.data.images.get(stored_name) if stored_name else None
+    if named is not None and named not in candidates:
+        candidates.append(named)
+    mask_uuid = str(getattr(aux_item, "uuid", ""))
+    candidate = next(
+        (
+            image
+            for image in candidates
+            if _image_matches_role(image, AUX_MASK_ROLE)
+            and str(image.get(AUX_MASK_UUID_KEY, "")) == mask_uuid
+        ),
+        None,
+    )
+    if candidate is None:
+        candidate = next(
+            (
+                image
+                for image in bpy.data.images
+                if str(image.get(PROJECT_UUID_KEY, "")) == str(getattr(project, "uuid", ""))
+                and _image_matches_role(image, AUX_MASK_ROLE)
+                and str(image.get(AUX_MASK_UUID_KEY, "")) == mask_uuid
+            ),
+            None,
+        )
+    if candidate is not None:
+        aux_item.image = candidate
+        aux_item.image_name = candidate.name
+    return candidate
+
+
+def aux_mask_for_uuid(project: Any, mask_uuid: str) -> Any | None:
+    return next(
+        (
+            item
+            for item in getattr(project, "aux_masks", ())
+            if str(getattr(item, "uuid", "")) == str(mask_uuid)
+        ),
+        None,
+    )
+
+
+def active_aux_mask(project: Any) -> Any | None:
+    items = getattr(project, "aux_masks", ())
+    if items:
+        index = int(getattr(project, "active_aux_mask_index", -1))
+        if 0 <= index < len(items):
+            item = items[index]
+            try:
+                project.active_aux_mask_uuid = str(item.uuid)
+            except (AttributeError, ReferenceError, TypeError):
+                pass
+            return item
+    uuid_value = str(getattr(project, "active_aux_mask_uuid", ""))
+    if uuid_value:
+        found = aux_mask_for_uuid(project, uuid_value)
+        if found is not None:
+            return found
+    return None
+
+
 def tag_image(
     image: bpy.types.Image,
     project_uuid: str,
@@ -225,6 +299,124 @@ def create_angle_layer_image(
     # sample forces buffer allocation before the image becomes a paint canvas.
     image.update()
     return image
+
+
+def create_aux_mask_image(
+    project: Any,
+    aux_item: Any,
+    *,
+    fill_value: float = 0.0,
+) -> bpy.types.Image:
+    """Create one opaque project-owned grayscale image for a static signal."""
+
+    value = max(0.0, min(1.0, float(fill_value)))
+    stem = str(getattr(project, "uuid", "project")).split("-", 1)[0]
+    label = str(getattr(aux_item, "name", "Mask")) or "Mask"
+    image = bpy.data.images.new(
+        f"QSDF Aux {stem} {label}",
+        width=int(project.resolution),
+        height=int(project.resolution),
+        alpha=True,
+        float_buffer=False,
+    )
+    image.generated_type = "BLANK"
+    image.generated_color = (value, value, value, 1.0)
+    tag_image(image, str(project.uuid), role=AUX_MASK_ROLE)
+    image[AUX_MASK_UUID_KEY] = str(aux_item.uuid)
+    image[AUX_MASK_INITIALIZED_KEY] = False
+    make_image_opaque(image)
+    image.update()
+    aux_item.image = image
+    aux_item.image_name = image.name
+    aux_item.dirty = False
+    return image
+
+
+def create_aux_mask(
+    project: Any,
+    *,
+    role: str = "CUSTOM",
+    name: str = "Custom Mask",
+    fill_value: float = 0.0,
+) -> Any:
+    item = project.aux_masks.add()
+    item.uuid = new_uuid()
+    item.name = str(name).strip() or "Custom Mask"
+    item.role = str(role)
+    create_aux_mask_image(project, item, fill_value=fill_value)
+    project.active_aux_mask_index = len(project.aux_masks) - 1
+    project.active_aux_mask_uuid = item.uuid
+    return item
+
+
+def remove_aux_mask_image(project: Any, aux_item: Any) -> None:
+    image = resolve_aux_mask_image(project, aux_item)
+    if image is not None:
+        bpy.data.images.remove(image)
+
+
+def fill_aux_mask_image(image: bpy.types.Image, value: float) -> None:
+    import numpy as np
+
+    width, height = image.size[:]
+    rgba = np.ones((height, width, 4), dtype=np.float32)
+    rgba[..., :3] = max(0.0, min(1.0, float(value)))
+    write_image_rgba(image, rgba)
+    image[AUX_MASK_INITIALIZED_KEY] = True
+
+
+def copy_image_channel_to_aux(
+    source: bpy.types.Image,
+    destination: bpy.types.Image,
+    component: str,
+) -> None:
+    """Copy one source component with bilinear resize; never mutate the source."""
+
+    import numpy as np
+
+    source_width, source_height = map(int, source.size[:])
+    target_width, target_height = map(int, destination.size[:])
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("The source image has no readable pixels")
+    flat = np.empty(source_width * source_height * 4, dtype=np.float32)
+    source.pixels.foreach_get(flat)
+    rgba = flat.reshape(source_height, source_width, 4)
+    component = str(component).upper()
+    if component == "LUMINANCE":
+        plane = (
+            rgba[..., 0] * np.float32(0.2126)
+            + rgba[..., 1] * np.float32(0.7152)
+            + rgba[..., 2] * np.float32(0.0722)
+        )
+    else:
+        indices = {"R": 0, "G": 1, "B": 2, "A": 3}
+        if component not in indices:
+            raise ValueError(f"Unknown image component: {component}")
+        plane = rgba[..., indices[component]]
+    if (source_width, source_height) != (target_width, target_height):
+        xs = np.clip(
+            (np.arange(target_width, dtype=np.float64) + 0.5) * source_width / target_width - 0.5,
+            0.0,
+            source_width - 1.0,
+        )
+        ys = np.clip(
+            (np.arange(target_height, dtype=np.float64) + 0.5) * source_height / target_height - 0.5,
+            0.0,
+            source_height - 1.0,
+        )
+        x0 = np.floor(xs).astype(np.intp)
+        y0 = np.floor(ys).astype(np.intp)
+        x1 = np.minimum(x0 + 1, source_width - 1)
+        y1 = np.minimum(y0 + 1, source_height - 1)
+        wx = (xs - x0).astype(np.float32)[None, :]
+        wy = (ys - y0).astype(np.float32)[:, None]
+        top = plane[y0[:, None], x0[None, :]] * (1.0 - wx) + plane[y0[:, None], x1[None, :]] * wx
+        bottom = plane[y1[:, None], x0[None, :]] * (1.0 - wx) + plane[y1[:, None], x1[None, :]] * wx
+        plane = top * (1.0 - wy) + bottom * wy
+    output = np.ones((target_height, target_width, 4), dtype=np.float32)
+    output[..., :3] = np.clip(plane, 0.0, 1.0)[..., None]
+    write_image_rgba(destination, output)
+    destination[AUX_MASK_INITIALIZED_KEY] = True
 
 
 def create_project_images(project: Any, source: bpy.types.Image | None = None) -> None:
@@ -484,15 +676,11 @@ def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.t
     project = project or active_project(context.scene)
     if project is None:
         return None
-    angle_item = active_angle(project)
-    if angle_item is None:
-        return None
-    image = resolve_display_image(project, angle_item)
-    if image is None:
-        return None
+    image = None
     try:
         studio_active = False
         studio_window_pointer = 0
+        editing_aux_mask_uuid = ""
         try:
             from . import studio
 
@@ -500,10 +688,22 @@ def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.t
             session = studio.active_session(context)
             if session is not None:
                 studio_window_pointer = int(session.window_pointer)
+                editing_aux_mask_uuid = str(
+                    getattr(session, "editing_aux_mask_uuid", "")
+                )
         except (ImportError, AttributeError, ReferenceError, RuntimeError):
             # ``studio`` is optional while the add-on is registering or
             # unregistering, so canvas synchronization remains defensive.
             studio_active = False
+        if editing_aux_mask_uuid:
+            image = resolve_aux_mask_image(
+                project, aux_mask_for_uuid(project, editing_aux_mask_uuid)
+            )
+        if image is None:
+            angle_item = active_angle(project)
+            image = resolve_display_image(project, angle_item) if angle_item is not None else None
+        if image is None:
+            return None
         if studio_active:
             context.scene.tool_settings.image_paint.mode = "IMAGE"
         context.scene.tool_settings.image_paint.canvas = image
@@ -559,6 +759,49 @@ def image_rgba(image: bpy.types.Image) -> Any:
     flat = np.empty(width * height * 4, dtype=np.float32)
     image.pixels.foreach_get(flat)
     return np.flip(flat.reshape(height, width, 4), axis=0).copy()
+
+
+def image_channel_u16(
+    image: bpy.types.Image,
+    channel_index: int = 0,
+    *,
+    rows_per_chunk: int = 64,
+) -> Any:
+    """Read one image channel as a compact top-down UNORM16 plane.
+
+    Blender exposes image pixels as an interleaved RGBA buffer, so one full
+    temporary float buffer is unavoidable during ``foreach_get``. Converting
+    into the final 2-byte plane in small row chunks prevents that RGBA buffer
+    (and a float64 quantization copy) from being retained for the whole export.
+    """
+
+    import numpy as np
+
+    index = int(channel_index)
+    if index < 0 or index > 3:
+        raise ValueError("image channel index must be between zero and three")
+    chunk_rows = max(1, int(rows_per_chunk))
+    width, height = map(int, image.size[:])
+    flat = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(flat)
+    source = flat.reshape(height, width, 4)[..., index]
+    output = np.empty((height, width), dtype=np.uint16)
+    for top_start in range(0, height, chunk_rows):
+        top_end = min(height, top_start + chunk_rows)
+        # Blender stores rows bottom-up. Reverse only this block while copying
+        # it into the top-down export plane.
+        values = np.asarray(
+            source[height - top_end : height - top_start][::-1],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Image {image.name!r} contains non-finite pixels")
+        np.clip(values, 0.0, 1.0, out=values)
+        values *= 65535.0
+        values += 0.5
+        np.floor(values, out=values)
+        output[top_start:top_end] = values
+    return output
 
 
 def rgba_to_u8(rgba: Any) -> Any:
@@ -625,6 +868,29 @@ def capture_interactive_paint_snapshot(
     )
 
 
+def capture_aux_paint_snapshot(project: Any, mask_uuid: str) -> None:
+    item = aux_mask_for_uuid(project, mask_uuid)
+    image = resolve_aux_mask_image(project, item)
+    if item is None or image is None:
+        raise ValueError("The selected additional mask is missing")
+    _AUX_PAINT_SNAPSHOTS[str(project.uuid)] = (
+        str(item.uuid),
+        str(image.name),
+        image_rgba8(image),
+    )
+
+
+def consume_aux_paint_snapshot(project: Any) -> tuple[str, str, Any] | None:
+    return _AUX_PAINT_SNAPSHOTS.pop(str(project.uuid), None)
+
+
+def discard_aux_paint_snapshot(project: Any | None = None) -> None:
+    if project is None:
+        _AUX_PAINT_SNAPSHOTS.clear()
+    else:
+        _AUX_PAINT_SNAPSHOTS.pop(str(project.uuid), None)
+
+
 def consume_interactive_paint_snapshot(project: Any) -> tuple[str, str, Any, str, Any | None] | None:
     return _INTERACTIVE_PAINT_SNAPSHOTS.pop(str(getattr(project, "uuid", "")), None)
 
@@ -665,9 +931,11 @@ def discard_paint_snapshot(project: Any | None = None) -> None:
     if project is None:
         _PAINT_SNAPSHOTS.clear()
         _INTERACTIVE_PAINT_SNAPSHOTS.clear()
+        _AUX_PAINT_SNAPSHOTS.clear()
     else:
         _PAINT_SNAPSHOTS.pop(str(project.uuid), None)
         _INTERACTIVE_PAINT_SNAPSHOTS.pop(str(project.uuid), None)
+        _AUX_PAINT_SNAPSHOTS.pop(str(project.uuid), None)
 
 
 def _project_angle_for_image(image: bpy.types.Image) -> tuple[Any | None, Any | None]:
@@ -1085,6 +1353,8 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
     errors: list[str] = []
     warnings: list[str] = []
     report = None
+    if int(getattr(project, "schema_version", -1)) != SCHEMA_VERSION:
+        errors.append(f"Project schema {SCHEMA_VERSION} is required.")
     obj = project.target_object
     if obj is None or obj.type != "MESH":
         errors.append("Target must be a mesh object.")
@@ -1148,6 +1418,23 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
             errors.append(f"Missing base mask at {angle_item.angle:+g} degrees.")
         if resolve_coverage_image(project, angle_item) is None:
             errors.append(f"Missing override coverage at {angle_item.angle:+g} degrees.")
+    aux_uuids: set[str] = set()
+    aux_roles: dict[str, int] = {}
+    for item in getattr(project, "aux_masks", ()):
+        mask_uuid = str(getattr(item, "uuid", ""))
+        role = str(getattr(item, "role", ""))
+        if not mask_uuid or mask_uuid in aux_uuids:
+            errors.append("Additional masks require unique UUIDs.")
+        aux_uuids.add(mask_uuid)
+        aux_roles[role] = aux_roles.get(role, 0) + 1
+        image = resolve_aux_mask_image(project, item)
+        if image is None:
+            errors.append(f"Missing additional mask: {getattr(item, 'name', role)}.")
+        elif tuple(image.size[:]) != (int(project.resolution), int(project.resolution)):
+            errors.append(f"Additional mask size differs: {getattr(item, 'name', role)}.")
+    for role, label in (("SDF_AREA", "SDF Area"), ("SHADOW_STRENGTH", "Shadow Strength")):
+        if aux_roles.get(role, 0) != 1:
+            errors.append(f"Project requires exactly one {label} mask.")
     if include_monotonic and not errors:
         from .core import validate_monotonic
 
@@ -1180,6 +1467,8 @@ def repair_project_references(scene: bpy.types.Scene) -> None:
             resolve_display_image(project, angle_item)
             resolve_base_image(project, angle_item)
             resolve_coverage_image(project, angle_item)
+        for aux_item in getattr(project, "aux_masks", ()):
+            resolve_aux_mask_image(project, aux_item)
 
 
 def cleanup_export_adjustment_previews() -> None:
@@ -1222,6 +1511,7 @@ def cleanup_export_adjustment_previews() -> None:
 def _load_or_undo_post(_unused: Any) -> None:
     _PAINT_SNAPSHOTS.clear()
     _INTERACTIVE_PAINT_SNAPSHOTS.clear()
+    _AUX_PAINT_SNAPSHOTS.clear()
     try:
         from .operators import clear_histories
 
@@ -1252,7 +1542,7 @@ def _save_project_images(_unused: Any) -> None:
     # Export review is derived data.  Never serialize a potentially 4K
     # heatmap into the artist's source-of-truth blend file.
     cleanup_export_adjustment_previews()
-    persistent_roles = {DISPLAY_ROLE, BASE_ROLE, COVERAGE_ROLE}
+    persistent_roles = {DISPLAY_ROLE, BASE_ROLE, COVERAGE_ROLE, AUX_MASK_ROLE}
     for image in tuple(bpy.data.images):
         if image.get(ROLE_KEY) not in persistent_roles or not image.get(PROJECT_UUID_KEY):
             continue
