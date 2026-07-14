@@ -1,4 +1,4 @@
-# Quick SDF Studio 0.4.0
+# Quick SDF Studio 0.5.0
 
 Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作るWindows向けExtensionです。法線から作られた影ガイドを下描きにして、気になる部分だけを直せます。
 
@@ -21,7 +21,10 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 一筆はBlender標準Texture Paintの操作感を保ったまま、選択中の角度へ即時反映されます。書き出し時に角度のつながりを非破壊で自動調整するため、Propagate、Validate、反対側生成の追加操作は不要です。
 
-0.4.0では、lilToon／liltoonUEで直接利用するライトスイープへ一本化しました。白い明部が斜め後ろから顔全体へ広がる8枚を編集し、R=右光、G=左光、B=0、A=65535の16-bit PNGを書き出します。
+0.5.0では、ライトスイープの編集体験を変えずに、書き出すRGBAの割り当てをプロジェクトごとに変更できます。既定のlilToon設定は、R=右光、G=左光、B=通常法線へ戻す領域、A=影強度です。通常は設定を触らず、そのまま1ボタンで書き出せます。
+
+> [!WARNING]
+> 0.5.0のProject schemaは5です。以前のProjectを移行する処理はありません。0.5.0では新しいProjectを作成してください。
 
 詳しい使い方は[日本語ユーザーガイド](docs/USER_GUIDE_JA.md)を参照してください。
 
@@ -29,7 +32,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 対応環境はBlender 5.1、Windows x64です。
 
-1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.4.0-windows-x64.zip` を取得する
+1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.5.0-windows-x64.zip` を取得する
 2. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
 3. 右上メニューから `ディスクからインストール` を選ぶ
 4. 取得したZIPを展開せずに選択する
@@ -51,7 +54,20 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 ## 出力
 
-`Export Face Shadow Texture`を押すと、検証・生成・保存を一度に行い、lilToon用16-bit RGBA PNGを1枚出力します。Rは右光、Gは左光、Bは0、Aは65535です。角度のつながりに矛盾があっても、元のペイントを変更せず、書き出し用データだけを自動調整します。初回だけ保存先を選び、同じパスへの上書き時は確認が表示されます。エンジンではNon-Color／Dataテクスチャとして扱ってください。
+`Export Face Shadow Texture`を押すと、検証・生成・パッキング・保存を一度に行い、16-bit RGBA PNGを1枚出力します。既定のlilToonパッキングは次の構成です。
+
+| Channel | 既定の内容 |
+|---|---|
+| R | キャラクター右側からの光に対するスレッショルド |
+| G | キャラクター左側からの光に対するスレッショルド |
+| B | 顔SDF領域で0、通常法線シェーディングへ戻す領域で65535 |
+| A | 通常の影で65535、影を無効化する領域で0 |
+
+角度のつながりに矛盾があっても、元のペイントを変更せず、書き出し用データだけを自動調整します。初回だけ保存先を選び、同じパスへの上書き時は確認が表示されます。エンジンではNon-Color／Dataテクスチャとして扱ってください。
+
+別のシェーダー向けに並べ替える場合は、`Quick SDF` → `Advanced` → `Output Packing`で`Customize`を押します。R/G/B/Aの各行へRight Threshold、Left Threshold、SDF Area、Shadow Strength、Custom Mask、Constantを割り当て、必要な行だけDirect／Invertを切り替えられます。このレシピはProject内に保存され、ほかのProjectには影響しません。ノードグラフや数式は使いません。
+
+`Additional Masks`では、全角度に共通する`SDF Area`と`Shadow Strength`を3D／2Dでペイントできます。任意のCustom Maskも追加でき、既存のBlender ImageからR/G/B/A/Luminanceのいずれかを読み込めます。マスク編集を終えるときは`Back to Face Shadow`で角度別ペイントへ戻ります。
 
 最終生成はバックグラウンドで実行されます。高解像度ではStudio内に進捗と `Cancel` が表示されるため、Blenderを固めずに中止できます。保存先やディスクの問題で失敗した場合は、パスを保持したまま `Retry Export` できます。
 
