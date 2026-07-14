@@ -20,6 +20,7 @@ test("exports a GitHub Pages document with project-relative assets", async () =>
 
   assert.match(html, /<html[^>]+lang="ja"/i);
   assert.match(html, /Quick SDF Studio 操作ガイド/);
+  assert.match(html, /v0\.6\.1/);
   assert.match(html, /角度別の顔影マスクを編集/);
   assert.match(html, /href="https:\/\/yeczrtu\.github\.io\/QuickSDFBlender\/"/);
   assert.match(html, /\/QuickSDFBlender\/_next\//);
