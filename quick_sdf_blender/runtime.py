@@ -30,6 +30,7 @@ IMAGE_REVISION_KEY = "quick_sdf_revision"
 AUX_MASK_UUID_KEY = "quick_sdf_aux_mask_uuid"
 AUX_MASK_INITIALIZED_KEY = "quick_sdf_aux_mask_initialized"
 DISPLAY_ROLE = "angle_display"
+PROVISIONAL_DISPLAY_ROLE = "provisional_display"
 AUX_MASK_ROLE = "aux_mask"
 THRESHOLD_ROLE = "threshold_preview"
 EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
@@ -608,7 +609,11 @@ def _write_blender_rows(image: bpy.types.Image, blender_rows: Any) -> None:
         # Material/Image Editor uploads can reload a generated Image from
         # generated_color. Keep the current display pixels in its packed source
         # before reattaching an active projection-paint canvas.
-        if str(image.get(ROLE_KEY, "")) == DISPLAY_ROLE:
+        if str(image.get(ROLE_KEY, "")) in {
+            DISPLAY_ROLE,
+            PROVISIONAL_DISPLAY_ROLE,
+            AUX_MASK_ROLE,
+        }:
             image.pack()
     finally:
         for image_paint in detached:
@@ -962,12 +967,45 @@ def capture_interactive_paint_snapshot(
     coverage = coverage_mask(angle_item).copy() if include_coverage and angle_item is not None else None
     if angle_item is None or display is None:
         raise ValueError("The active angle paint layers are incomplete")
+    capture_interactive_paint_snapshot_values(
+        project,
+        angle_uuid=str(angle_item.uuid),
+        display=display,
+        coverage=coverage,
+    )
+
+
+def capture_interactive_paint_snapshot_values(
+    project: Any,
+    *,
+    angle_uuid: str,
+    display: bpy.types.Image,
+    coverage: Any | None,
+) -> None:
+    """Capture a paint canvas which is not yet a persistent angle key.
+
+    Adaptive angles stay session-only until a native stroke changes an actual
+    8-bit Display value.  Keeping this snapshot API independent of
+    ``project.angles`` lets Blender paint the prepared Image without briefly
+    inserting a key into the timeline first.
+    """
+
+    import numpy as np
+
+    before = image_gray8(display)
+    coverage_copy = None
+    coverage_uuid = ""
+    if coverage is not None:
+        coverage_copy = np.ascontiguousarray(coverage, dtype=np.bool_).copy()
+        if coverage_copy.shape != before.shape:
+            raise ValueError("The prepared angle Coverage does not match its Display")
+        coverage_uuid = str(angle_uuid)
     _INTERACTIVE_PAINT_SNAPSHOTS[str(project.uuid)] = (
-        str(angle_item.uuid),
+        str(angle_uuid),
         str(display.name),
-        image_gray8(display),
-        str(angle_item.uuid) if coverage is not None else "",
-        coverage,
+        before,
+        coverage_uuid,
+        coverage_copy,
     )
 
 

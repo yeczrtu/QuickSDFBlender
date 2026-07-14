@@ -25,6 +25,8 @@ WORKSPACE_BASENAME = "Quick SDF Studio"
 TIMELINE_HEIGHT = 104
 TIMELINE_SPACE_TYPE = "NODE_EDITOR"
 PROVISIONAL_DISPLAY_ROLE = "provisional_display"
+TIMELINE_HOST_TAG = "_qsdf_runtime_timeline_host"
+TIMELINE_HOST_NAME = ".Quick SDF Timeline Runtime"
 
 
 class StudioError(RuntimeError):
@@ -70,6 +72,8 @@ class StudioSession:
     stroke_unified_color: tuple[float, float, float] | None = None
     stroke_unified_secondary_color: tuple[float, float, float] | None = None
     stroke_watchdog_deadline: float = 0.0
+    stroke_watchdog_seen_modal: bool = False
+    stroke_watchdog_absent_since: float = 0.0
     stroke_from_view3d: bool = False
     projection_hint: str = ""
     export_review_active: bool = False
@@ -491,7 +495,10 @@ def _remove_provisional_image(session: StudioSession) -> None:
     try:
         from . import runtime
 
-        if str(image.get(runtime.ROLE_KEY, "")) == PROVISIONAL_DISPLAY_ROLE:
+        if (
+            str(image.get(runtime.PROJECT_UUID_KEY, "")) == session.project_uuid
+            and str(image.get(runtime.ANGLE_UUID_KEY, "")) == session.provisional_uuid
+        ):
             bpy.data.images.remove(image)
     except (ReferenceError, RuntimeError):
         pass
@@ -783,7 +790,7 @@ def settle_seek(context: Any, project: Any, angle: float) -> float:
 
 
 def activate_provisional_for_stroke(context: Any, project: Any) -> Any | None:
-    """Temporarily insert the ready key so the native Paint macro can use it."""
+    """Arm the ready session Image for paint without adding a project key."""
 
     from . import runtime
 
@@ -799,9 +806,40 @@ def activate_provisional_for_stroke(context: Any, project: Any) -> Any | None:
     image = bpy.data.images.get(session.provisional_image_name)
     if image is None:
         raise StudioError("The prepared paint canvas is missing")
+    # Generated Images can reload ``generated_color`` when Blender changes the
+    # projection-paint canvas.  Persist the prepared pixels before the native
+    # modal operator starts; otherwise the canvas can become entirely black.
+    image.pack()
+    session.provisional_promoting = True
+    session.view_mode = "PROVISIONAL_STROKE"
+    _assign_provisional_canvas(context, project, session, image)
+    return image
+
+
+def promote_provisional_after_stroke(context: Any, project: Any) -> Any:
+    """Persist an armed provisional angle after an actual 8-bit change."""
+
+    from . import runtime
+
+    session = active_session(context)
+    if (
+        session is None
+        or not session.provisional_promoting
+        or not session.provisional_uuid
+    ):
+        raise StudioError("There is no painted in-between angle to add")
+    image = bpy.data.images.get(session.provisional_image_name)
+    if image is None:
+        raise StudioError("The prepared paint canvas is missing")
     provisional_uuid = str(session.provisional_uuid)
     provisional_angle = float(session.provisional_angle)
     provisional_side = str(session.provisional_side)
+    if any(str(candidate.uuid) == provisional_uuid for candidate in project.angles):
+        return next(
+            candidate
+            for candidate in project.angles
+            if str(candidate.uuid) == provisional_uuid
+        )
     item = project.angles.add()
     item.uuid = provisional_uuid
     item.angle = provisional_angle
@@ -818,7 +856,6 @@ def activate_provisional_for_stroke(context: Any, project: Any) -> Any | None:
     item.base_revision = session.provisional_base_revision
     item.coverage_revision = session.provisional_coverage_revision
     item["_qsdf_provisional"] = True
-    runtime.tag_image(image, str(project.uuid), provisional_uuid, runtime.DISPLAY_ROLE)
     desired = [
         str(candidate.uuid)
         for candidate in sorted(
@@ -850,9 +887,8 @@ def activate_provisional_for_stroke(context: Any, project: Any) -> Any | None:
     project.active_side = provisional_side
     project.seek_angle = provisional_angle
     project.review_angle = _side_signed_angle(project, item)
-    session.provisional_promoting = True
-    session.view_mode = "PROVISIONAL_STROKE"
-    runtime.sync_canvas(context, project)
+    runtime.tag_image(image, str(project.uuid), provisional_uuid, runtime.DISPLAY_ROLE)
+    tag_studio_redraw()
     return project.angles[index]
 
 
@@ -894,11 +930,17 @@ def finish_provisional_stroke(context: Any, project: Any, *, changed: bool) -> N
 
             runtime.tag_image(image, str(project.uuid), uuid, runtime.DISPLAY_ROLE)
         session.provisional_uuid = ""
+        session.provisional_angle = -1.0
+        session.provisional_side = ""
         session.provisional_image_name = ""
         session.provisional_base_blob = b""
         session.provisional_coverage_blob = b""
+        session.provisional_base_revision = 0
+        session.provisional_coverage_revision = 0
         session.provisional_state = "NONE"
+        session.provisional_source_token = ()
         session.provisional_promoting = False
+        session.provisional_previous_key_uuid = ""
         session.view_mode = "EDIT"
         session.paint_key_uuid = uuid
         session.paint_key_angle = float(item.angle)
@@ -1063,6 +1105,15 @@ def reconcile_view_state(context: Any | None = None) -> bool:
     return select_paint_key(context, project, key_uuid=session.paint_key_uuid)
 
 
+def _arm_stroke_watchdog(session: StudioSession) -> None:
+    now = time.monotonic()
+    session.stroke_watchdog_deadline = now + 0.75
+    session.stroke_watchdog_seen_modal = False
+    session.stroke_watchdog_absent_since = 0.0
+    if not bpy.app.timers.is_registered(_stroke_restore_watchdog):
+        bpy.app.timers.register(_stroke_restore_watchdog, first_interval=0.05)
+
+
 def prepare_stroke_brush(context: Any, project: Any) -> None:
     """Temporarily apply the selected binary colour without changing assets."""
 
@@ -1093,9 +1144,7 @@ def prepare_stroke_brush(context: Any, project: Any) -> None:
             unified.use_unified_color = True
             unified.color = (value, value, value)
             unified.secondary_color = (inverse, inverse, inverse)
-            session.stroke_watchdog_deadline = time.monotonic() + 0.25
-            if not bpy.app.timers.is_registered(_stroke_restore_watchdog):
-                bpy.app.timers.register(_stroke_restore_watchdog, first_interval=0.05)
+            _arm_stroke_watchdog(session)
             return
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
             try:
@@ -1122,9 +1171,7 @@ def prepare_stroke_brush(context: Any, project: Any) -> None:
         brush.color = (value, value, value)
         brush.secondary_color = (inverse, inverse, inverse)
         brush.update_tag()
-        session.stroke_watchdog_deadline = time.monotonic() + 0.25
-        if not bpy.app.timers.is_registered(_stroke_restore_watchdog):
-            bpy.app.timers.register(_stroke_restore_watchdog, first_interval=0.05)
+        _arm_stroke_watchdog(session)
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         session.stroke_brush_name = ""
         session.stroke_brush_color = None
@@ -1171,6 +1218,8 @@ def restore_stroke_brush(
     session.stroke_unified_color = None
     session.stroke_unified_secondary_color = None
     session.stroke_watchdog_deadline = 0.0
+    session.stroke_watchdog_seen_modal = False
+    session.stroke_watchdog_absent_since = 0.0
 
 
 def _stroke_restore_watchdog() -> float | None:
@@ -1193,22 +1242,59 @@ def _stroke_restore_watchdog() -> float | None:
         )
         for operator in getattr(window, "modal_operators", ())
     }
-    if modal_ids & {"QUICKSDF_OT_range_paint", "QUICKSDF_OT_range_paint_invert"}:
+    paint_modal = any(
+        identifier in {
+            "QUICKSDF_OT_range_paint",
+            "QUICKSDF_OT_range_paint_invert",
+            "PAINT_OT_image_paint",
+        }
+        or identifier.endswith("_OT_image_paint")
+        for identifier in modal_ids
+    )
+    if paint_modal:
+        session.stroke_watchdog_seen_modal = True
+        session.stroke_watchdog_absent_since = 0.0
         return 0.05
-    if time.monotonic() < float(session.stroke_watchdog_deadline):
+    now = time.monotonic()
+    if now < float(session.stroke_watchdog_deadline):
         return 0.05
+    if session.stroke_watchdog_seen_modal:
+        if session.stroke_watchdog_absent_since <= 0.0:
+            session.stroke_watchdog_absent_since = now
+            return 0.05
+        if now - session.stroke_watchdog_absent_since < 0.6:
+            return 0.05
     project = resolve_session_project(session)
     restore_stroke_brush(session=session)
     if project is not None:
         try:
-            from .runtime import discard_interactive_paint_snapshot
+            from . import runtime
 
-            discard_interactive_paint_snapshot(project)
-        except (AttributeError, ImportError, ReferenceError, RuntimeError):
+            snapshot = runtime.consume_interactive_paint_snapshot(project)
+            if snapshot is not None:
+                _uuid, image_name, before_gray, _coverage_uuid, _coverage = snapshot
+                image = bpy.data.images.get(str(image_name))
+                if image is not None:
+                    runtime.write_image_gray8(image, before_gray)
+            aux_snapshot = runtime.consume_aux_paint_snapshot(project)
+            if aux_snapshot is not None:
+                _mask_uuid, image_name, before_rgba = aux_snapshot
+                image = bpy.data.images.get(str(image_name))
+                if image is not None:
+                    runtime.write_image_rgba8(image, before_rgba)
+            runtime.discard_paint_snapshot(project)
+        except (
+            AttributeError,
+            ImportError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
             pass
         # If Blender cancelled the native modal stroke, the propagation macro
-        # never gets a chance to decide whether an auto key changed. Roll the
-        # temporary collection item back and keep its prepared canvas available.
+        # never gets a chance to decide whether an auto key changed. Restore
+        # the session-only canvas and remove any partially promoted key.
         if session.provisional_promoting:
             try:
                 finish_provisional_stroke(bpy.context, project, changed=False)
@@ -1375,6 +1461,86 @@ def _split_area(context: Any, window: Any, area: Any, direction: str, factor: fl
         raise StudioError("Could not split the Studio workspace")
 
 
+def _timeline_host_tree(project_uuid: str) -> Any:
+    """Return a process-only empty tree for the timeline's Node Editor host.
+
+    A plain Node Editor follows the active material.  The opaque timeline draw
+    handler then hides, but does not disable, the real node buttons underneath;
+    clicking the seek rail can consequently open a Principled BSDF enum.  A
+    pinned empty tree leaves no hidden UI blocks for Blender to dispatch first.
+    """
+
+    for tree in bpy.data.node_groups:
+        if bool(tree.get(TIMELINE_HOST_TAG, False)):
+            tree[TIMELINE_HOST_TAG] = str(project_uuid)
+            return tree
+    tree = bpy.data.node_groups.new(TIMELINE_HOST_NAME, "ShaderNodeTree")
+    tree[TIMELINE_HOST_TAG] = str(project_uuid)
+    tree.use_fake_user = False
+    return tree
+
+
+def _bind_timeline_host(area: Any, project_uuid: str) -> Any:
+    space = area.spaces.active
+    if hasattr(space, "tree_type"):
+        space.tree_type = "ShaderNodeTree"
+    tree = _timeline_host_tree(project_uuid)
+    if hasattr(space, "pin"):
+        space.pin = True
+    if hasattr(space, "node_tree"):
+        space.node_tree = tree
+    return tree
+
+
+def _remove_timeline_hosts() -> None:
+    """Detach and delete every runtime timeline host before save/load/exit."""
+
+    # Blender exposes ``_RestrictData`` while enabling an add-on. Registration
+    # and failed-registration cleanup must never enumerate datablocks there.
+    if not hasattr(bpy.data, "node_groups") or not hasattr(bpy.data, "screens"):
+        return
+    hosts = {
+        tree.as_pointer(): tree
+        for tree in bpy.data.node_groups
+        if bool(tree.get(TIMELINE_HOST_TAG, False))
+    }
+    if not hosts:
+        return
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != TIMELINE_SPACE_TYPE:
+                continue
+            for space in area.spaces:
+                tree = getattr(space, "node_tree", None)
+                if tree is None or tree.as_pointer() not in hosts:
+                    continue
+                try:
+                    if hasattr(space, "pin"):
+                        space.pin = False
+                    space.node_tree = None
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    pass
+    for tree in tuple(hosts.values()):
+        try:
+            bpy.data.node_groups.remove(tree)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+def _ensure_session_timeline_host(session: StudioSession | None = None) -> bool:
+    session = session or _SESSION
+    if session is None:
+        return False
+    window = find_window(session.window_pointer)
+    if window is None:
+        return False
+    _view, _image, timeline_area = studio_areas(window)
+    if timeline_area is None:
+        return False
+    _bind_timeline_host(timeline_area, session.project_uuid)
+    return True
+
+
 def configure_workspace(context: Any, window: Any) -> tuple[Any, Any, Any]:
     """Replace the cloned screen with Image/3D over a compact timeline."""
 
@@ -1411,8 +1577,10 @@ def configure_workspace(context: Any, window: Any) -> tuple[Any, Any, Any]:
         if hasattr(space, "show_region_header"):
             space.show_region_header = True
     timeline_space = bottom.spaces.active
-    if hasattr(timeline_space, "tree_type"):
-        timeline_space.tree_type = "ShaderNodeTree"
+    _bind_timeline_host(
+        bottom,
+        str(getattr(window, "workspace", {}).get(WORKSPACE_PROJECT_TAG, "")),
+    )
     if hasattr(timeline_space, "show_gizmo"):
         timeline_space.show_gizmo = True
     if hasattr(timeline_space, "show_gizmo_active_node"):
@@ -1666,8 +1834,10 @@ def _configure_area_types(window: Any) -> tuple[Any, Any, Any]:
     if hasattr(view_space, "shading"):
         view_space.shading.type = "MATERIAL"
     timeline_space = bottom.spaces.active
-    if hasattr(timeline_space, "tree_type"):
-        timeline_space.tree_type = "ShaderNodeTree"
+    _bind_timeline_host(
+        bottom,
+        str(getattr(window, "workspace", {}).get(WORKSPACE_PROJECT_TAG, "")),
+    )
     if hasattr(timeline_space, "show_gizmo"):
         timeline_space.show_gizmo = True
     if hasattr(timeline_space, "show_gizmo_active_node"):
@@ -1723,6 +1893,7 @@ def _frame_studio_content(context: Any, window: Any, view_area: Any, image_area:
 def _rollback_pending(error: BaseException | None = None) -> None:
     global _PENDING
     pending = _PENDING
+    _remove_timeline_hosts()
     _PENDING = None
     if pending is None:
         return
@@ -1876,6 +2047,7 @@ def _configure_session_target(
     scene.quick_sdf_active_project_index = project_index
     session.project_uuid = str(getattr(project, "uuid", ""))
     session.scene_name = scene.name
+    _ensure_session_timeline_host(session)
 
     view_area, image_area, _timeline_area = studio_areas(window)
     if view_area is None or image_area is None:
@@ -2223,6 +2395,7 @@ def exit_studio(
     window = find_window(session.window_pointer)
     project = resolve_session_project(session)
     discard_provisional(context, project)
+    _remove_timeline_hosts()
     if project is not None and session.editing_aux_mask_uuid:
         session.editing_aux_mask_uuid = ""
         if session.aux_previous_preview_mode and hasattr(project, "preview_mode"):
@@ -2293,6 +2466,7 @@ def tag_studio_redraw() -> None:
 def _save_pre(_unused: Any) -> None:
     if _SESSION is None:
         return
+    _remove_timeline_hosts()
     project = resolve_session_project()
     # Provisional canvases and structural Redo images are process-only state.
     # Never serialize them into the .blend. A ready angle is reconstructed
@@ -2344,6 +2518,7 @@ def _save_post(_unused: Any) -> None:
     project = resolve_session_project()
     if project is not None:
         try:
+            _ensure_session_timeline_host(_SESSION)
             window = find_window(_SESSION.window_pointer)
             scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
             if window is not None and scene is not None:
@@ -2389,6 +2564,7 @@ def _save_post(_unused: Any) -> None:
 def _load_pre(_unused: Any) -> None:
     global _SESSION, _PENDING, _SWITCH_PENDING
     _SWITCH_PENDING = None
+    _remove_timeline_hosts()
     try:
         from .operators import shutdown_export_job
 
@@ -2463,6 +2639,7 @@ def unregister_studio() -> None:
         bpy.app.timers.unregister(_continue_enter)
     _cancel_provisional_job()
     _cancel_stroke_watchdog()
+    _remove_timeline_hosts()
     if _PENDING is not None:
         _rollback_pending()
     try:
@@ -2494,7 +2671,8 @@ __all__ = [
     "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
     "TIMELINE_SPACE_TYPE",
     "reconcile_view_state", "register_studio", "show_export_adjustment_review",
-    "finish_provisional_stroke", "prepare_stroke_brush", "provisional_created_metadata",
+    "finish_provisional_stroke", "prepare_stroke_brush", "promote_provisional_after_stroke",
+    "provisional_created_metadata",
     "resolve_session_project", "restore_stroke_brush", "seek_preview", "settle_seek",
     "select_paint_key", "set_projection_hint", "studio_areas", "tag_studio_redraw",
     "unregister_studio",

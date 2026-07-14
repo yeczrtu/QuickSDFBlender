@@ -14,7 +14,9 @@ $schemaSmokeTest = Join-Path $repositoryRoot 'tests\blender_schema6_smoke.py'
 $interactivePaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_interactive_paint_smoke.py'
 $studioSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_smoke.py'
 $studioSwitchSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_switch_smoke.py'
+$timelineIsolationSmokeTest = Join-Path $repositoryRoot 'tests\blender_timeline_isolation_smoke.py'
 $autoKeySmokeTest = Join-Path $repositoryRoot 'tests\blender_auto_key_smoke.py'
+$adaptiveProjectionSmokeTest = Join-Path $repositoryRoot 'tests\blender_adaptive_projection_smoke.py'
 $projectionPaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_projection_paint_smoke.py'
 $icospherePaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_icosphere_paint_smoke.py'
 $savedStateSmokeTest = Join-Path $repositoryRoot 'tests\blender_saved_state_smoke.py'
@@ -31,7 +33,9 @@ $extensionArchive = Join-Path $buildDirectory "quick_sdf_blender-$extensionVersi
 $studioResult = Join-Path $buildDirectory 'studio_smoke_result.txt'
 $studioSavedBlend = Join-Path $buildDirectory 'studio_adjusted_save.blend'
 $studioSwitchResult = Join-Path $buildDirectory 'studio_switch_smoke_result.txt'
+$timelineIsolationResult = Join-Path $buildDirectory 'timeline_isolation_smoke_result.txt'
 $autoKeyResult = Join-Path $buildDirectory 'auto_key_smoke_result.txt'
+$adaptiveProjectionResult = Join-Path $buildDirectory 'adaptive_projection_smoke_result.txt'
 $projectionPaintResult = Join-Path $buildDirectory 'projection_paint_smoke_result.txt'
 $icospherePaintResult = Join-Path $buildDirectory 'icosphere_paint_smoke_result.txt'
 
@@ -52,7 +56,7 @@ try {
         $repositoryRoot
     }
 
-    Write-Host '==> 1/15 Build Windows native core'
+    Write-Host '==> 1/17 Build Windows native core'
     $global:LASTEXITCODE = 0
     & $nativeBuild
     if ($LASTEXITCODE -ne 0) {
@@ -63,41 +67,41 @@ try {
         throw "Native build did not produce $nativeLibrary"
     }
 
-    Write-Host '==> 2/15 Run Python unit tests'
+    Write-Host '==> 2/17 Run Python unit tests'
     & $PythonPath -m unittest discover -s tests -p 'test_*.py'
     if ($LASTEXITCODE -ne 0) {
         throw "Unit tests failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 3/15 Run Blender 5.1 background smoke test'
+    Write-Host '==> 3/17 Run Blender 5.1 background smoke test'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $smokeTest -- --output-dir $buildDirectory
     if ($LASTEXITCODE -ne 0) {
         throw "Blender smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 4/15 Verify active Material Output and Canvas preview rendering'
+    Write-Host '==> 4/17 Verify active Material Output and Canvas preview rendering'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $previewRenderSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender preview render smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 5/15 Verify schema-6 bitplane save/reload persistence'
+    Write-Host '==> 5/17 Verify schema-6 bitplane save/reload persistence'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $schemaSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender schema-6 smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 6/15 Verify typed Display/Coverage Smart Paint in background mode'
+    Write-Host '==> 6/17 Verify typed Display/Coverage Smart Paint in background mode'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $interactivePaintSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender interactive paint smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 7/15 Run Blender 5.1 interactive Studio lifecycle smoke test'
+    Write-Host '==> 7/17 Run Blender 5.1 interactive Studio lifecycle smoke test'
     if (Test-Path -LiteralPath $studioResult) {
         Remove-Item -Force -LiteralPath $studioResult
     }
@@ -117,7 +121,7 @@ try {
         throw 'Blender Studio smoke test did not produce its active-session save'
     }
 
-    Write-Host '==> 8/15 Verify one-click Studio model switching'
+    Write-Host '==> 8/17 Verify one-click Studio model switching'
     if (Test-Path -LiteralPath $studioSwitchResult) {
         Remove-Item -Force -LiteralPath $studioSwitchResult
     }
@@ -133,7 +137,24 @@ try {
         throw "Blender Studio switch smoke test failed:`n$studioSwitchOutcome"
     }
 
-    Write-Host '==> 9/15 Verify adaptive angle-key creation and transactional Undo/Redo'
+    Write-Host '==> 9/17 Verify timeline input isolation and runtime-host cleanup'
+    if (Test-Path -LiteralPath $timelineIsolationResult) {
+        Remove-Item -Force -LiteralPath $timelineIsolationResult
+    }
+    & $BlenderPath --enable-event-simulate --factory-startup --python-exit-code 1 `
+        --python $timelineIsolationSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender timeline isolation smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $timelineIsolationResult -PathType Leaf)) {
+        throw 'Blender timeline isolation smoke test did not produce a result file'
+    }
+    $timelineIsolationOutcome = (Get-Content -Raw -LiteralPath $timelineIsolationResult).Trim()
+    if ($timelineIsolationOutcome -ne 'PASS') {
+        throw "Blender timeline isolation smoke test failed:`n$timelineIsolationOutcome"
+    }
+
+    Write-Host '==> 10/17 Verify adaptive angle-key creation and transactional Undo/Redo'
     if (Test-Path -LiteralPath $autoKeyResult) {
         Remove-Item -Force -LiteralPath $autoKeyResult
     }
@@ -149,7 +170,24 @@ try {
         throw "Blender auto-key smoke test failed:`n$autoKeyOutcome"
     }
 
-    Write-Host '==> 10/15 Run a native 3D Projection Paint stroke through Quick SDF'
+    Write-Host '==> 11/17 Verify real Projection Paint on a session-only adaptive key'
+    if (Test-Path -LiteralPath $adaptiveProjectionResult) {
+        Remove-Item -Force -LiteralPath $adaptiveProjectionResult
+    }
+    & $BlenderPath --factory-startup --python-exit-code 1 `
+        --python $adaptiveProjectionSmokeTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blender adaptive Projection Paint smoke test failed with exit code $LASTEXITCODE"
+    }
+    if (-not (Test-Path -LiteralPath $adaptiveProjectionResult -PathType Leaf)) {
+        throw 'Blender adaptive Projection Paint smoke test did not produce a result file'
+    }
+    $adaptiveProjectionOutcome = (Get-Content -Raw -LiteralPath $adaptiveProjectionResult).Trim()
+    if ($adaptiveProjectionOutcome -ne 'PASS') {
+        throw "Blender adaptive Projection Paint smoke test failed:`n$adaptiveProjectionOutcome"
+    }
+
+    Write-Host '==> 12/17 Run a native 3D Projection Paint stroke through Quick SDF'
     if (Test-Path -LiteralPath $projectionPaintResult) {
         Remove-Item -Force -LiteralPath $projectionPaintResult
     }
@@ -165,7 +203,7 @@ try {
         throw "Blender Projection Paint smoke test failed:`n$projectionPaintOutcome"
     }
 
-    Write-Host '==> 11/15 Verify repeated artist painting on a Normal Guide Icosphere'
+    Write-Host '==> 13/17 Verify repeated artist painting on a Normal Guide Icosphere'
     if (Test-Path -LiteralPath $icospherePaintResult) {
         Remove-Item -Force -LiteralPath $icospherePaintResult
     }
@@ -182,7 +220,7 @@ try {
         throw "Blender Icosphere paint smoke test failed:`n$icospherePaintOutcome"
     }
 
-    Write-Host '==> 12/15 Verify active Studio save in a fresh Blender process'
+    Write-Host '==> 14/17 Verify active Studio save in a fresh Blender process'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $savedStateSmokeTest `
         -- --blend $studioSavedBlend
@@ -190,7 +228,7 @@ try {
         throw "Blender saved-state smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "==> 13/15 Build and validate Blender extension $extensionVersion"
+    Write-Host "==> 15/17 Build and validate Blender extension $extensionVersion"
     if (Test-Path -LiteralPath $extensionArchive) {
         Remove-Item -Force -LiteralPath $extensionArchive
     }
@@ -209,7 +247,7 @@ try {
         throw "Extension validation failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 14/15 Verify release ZIP contents byte-for-byte'
+    Write-Host '==> 16/17 Verify release ZIP contents byte-for-byte'
     & $PythonPath $archiveVerification `
         --archive $extensionArchive `
         --source $extensionSource `
@@ -218,7 +256,7 @@ try {
         throw "Extension archive verification failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 15/15 Install and exercise the ZIP in an isolated Blender user directory'
+    Write-Host '==> 17/17 Install and exercise the ZIP in an isolated Blender user directory'
     $isolatedUser = Join-Path $buildDirectory ("isolated-user-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $isolatedUser | Out-Null
     $previousUserResources = $env:BLENDER_USER_RESOURCES

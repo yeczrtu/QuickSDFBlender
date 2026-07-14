@@ -110,9 +110,13 @@ def _promote_ready(project, runtime, studio, seed: int) -> None:
     expected_angle = float(session.provisional_angle)
     expected_side = str(session.provisional_side)
     before_count = len(_lane(project, expected_side))
+    canvas = bpy.context.scene.tool_settings.image_paint.canvas
+    before_snapshot = runtime.image_gray8(canvas)
     assert bpy.ops.quicksdf.paint_snapshot() == {"FINISHED"}
     assert session.provisional_promoting
-    assert len(_lane(project, expected_side)) == before_count + 1
+    assert len(_lane(project, expected_side)) == before_count
+    assert canvas.packed_file is not None
+    np.testing.assert_array_equal(runtime.image_gray8(canvas), before_snapshot)
     _paint_one_texel(project, runtime, seed)
     assert not session.provisional_promoting
     assert session.provisional_state == "NONE"
@@ -207,8 +211,14 @@ def check() -> float | None:
                 assert _persistent_display_names(project, runtime) == STATE["initial_images"]
                 assert len(_provisional_images(project, runtime, studio)) == 1
 
+                provisional_canvas = bpy.context.scene.tool_settings.image_paint.canvas
+                before_snapshot = runtime.image_gray8(provisional_canvas)
                 assert bpy.ops.quicksdf.paint_snapshot() == {"FINISHED"}
-                assert len(project.angles) == 9
+                assert len(project.angles) == 8
+                assert provisional_canvas.packed_file is not None
+                np.testing.assert_array_equal(
+                    runtime.image_gray8(provisional_canvas), before_snapshot
+                )
                 assert bpy.ops.quicksdf.propagate_overrides() == {"FINISHED"}
                 assert len(project.angles) == 8
                 assert session.provisional_state == "READY"

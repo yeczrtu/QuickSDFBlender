@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Sequence
 
 import bpy
@@ -43,6 +44,8 @@ class TimelineGeometry:
 _DRAW_HANDLE: Any = None
 _COLOR_SHADER: Any = None
 _IMAGE_SHADER: Any = None
+_ADDON_KEYMAPS: list[tuple[Any, Any]] = []
+_SCRUB_PREVIEW_INTERVAL = 1.0 / 24.0
 
 
 def _visible_keys(project: Any) -> list[tuple[int, Any]]:
@@ -466,6 +469,21 @@ def _set_seek(context: Any, project: Any, value: float) -> None:
     tag_timeline_redraw()
 
 
+def _set_seek_position_only(context: Any, project: Any, value: float) -> None:
+    """Move the visible playhead without rebuilding a preview every mouse event."""
+
+    angle = max(0.0, min(90.0, float(value)))
+    project.seek_angle = angle
+    sign = -1.0 if str(getattr(project, "authoring_side", "RIGHT")) == "LEFT" else 1.0
+    if hasattr(project, "review_angle"):
+        project.review_angle = sign * angle
+    session = active_session(context)
+    if session is not None and session.project_uuid == str(getattr(project, "uuid", "")):
+        session.view_mode = "PREVIEW"
+        session.seek_angle = angle
+    tag_timeline_redraw()
+
+
 def _settle_seek(context: Any, project: Any, value: float) -> None:
     try:
         from .studio import settle_seek
@@ -478,13 +496,20 @@ def _settle_seek(context: Any, project: Any, value: float) -> None:
 
 class QSDF_GT_timeline_capture(bpy.types.Gizmo):
     bl_idname = "QSDF_GT_timeline_capture"
-    __slots__ = ("_shape", "_initial_seek", "_initial_key_uuid", "_dragging")
+    __slots__ = (
+        "_shape",
+        "_initial_seek",
+        "_initial_key_uuid",
+        "_dragging",
+        "_last_preview_time",
+    )
 
     def setup(self):
         self._shape = self.new_custom_shape("TRIS", ((0, 0), (1, 0), (1, 1), (0, 0), (1, 1), (0, 1)))
         self._initial_seek = 0.0
         self._initial_key_uuid = ""
         self._dragging = False
+        self._last_preview_time = 0.0
 
     def draw(self, _context):
         # The visible timeline is rendered by the shared draw handler.
@@ -531,6 +556,7 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
             self._dragging = True
             value = geometry.angle_from_x(x)
             _set_seek(context, project, value)
+            self._last_preview_time = time.monotonic()
             return {"RUNNING_MODAL"}
         return {"FINISHED"}
 
@@ -558,7 +584,13 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
             return {"CANCELLED"}
         if event.type == "MOUSEMOVE":
             geometry = build_geometry(context.region.width, context.region.height, _visible_keys(project))
-            _set_seek(context, project, geometry.angle_from_x(float(event.mouse_region_x)))
+            value = geometry.angle_from_x(float(event.mouse_region_x))
+            now = time.monotonic()
+            if now - self._last_preview_time >= _SCRUB_PREVIEW_INTERVAL:
+                _set_seek(context, project, value)
+                self._last_preview_time = now
+            else:
+                _set_seek_position_only(context, project, value)
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
             geometry = build_geometry(
                 context.region.width, context.region.height, _visible_keys(project)
@@ -604,7 +636,29 @@ class QSDF_GGT_timeline(bpy.types.GizmoGroup):
         self.capture = gizmo
 
 
-CLASSES = (QSDF_GT_timeline_capture, QSDF_GGT_timeline)
+class QUICKSDF_OT_timeline_block_context_menu(bpy.types.Operator):
+    bl_idname = "quicksdf.timeline_block_context_menu"
+    bl_label = "Quick SDF Timeline"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(
+            getattr(getattr(context, "area", None), "type", "") == TIMELINE_SPACE_TYPE
+            and _project_for_context(context) is not None
+        )
+
+    def execute(self, _context):
+        # The timeline has no context menu. Consuming RMB prevents the host Node
+        # Editor from exposing controls which do not belong to artist authoring.
+        return {"FINISHED"}
+
+
+CLASSES = (
+    QUICKSDF_OT_timeline_block_context_menu,
+    QSDF_GT_timeline_capture,
+    QSDF_GGT_timeline,
+)
 
 
 def tag_timeline_redraw() -> None:
@@ -621,10 +675,28 @@ def register_timeline() -> None:
         _DRAW_HANDLE = bpy.types.SpaceNodeEditor.draw_handler_add(
             _draw_timeline, (), "WINDOW", "POST_PIXEL"
         )
+    keyconfigs = getattr(getattr(bpy.context, "window_manager", None), "keyconfigs", None)
+    addon = getattr(keyconfigs, "addon", None)
+    if addon is not None and not _ADDON_KEYMAPS:
+        keymap = addon.keymaps.new(
+            name="Node Editor", space_type="NODE_EDITOR", region_type="WINDOW"
+        )
+        item = keymap.keymap_items.new(
+            "quicksdf.timeline_block_context_menu",
+            type="RIGHTMOUSE",
+            value="PRESS",
+        )
+        _ADDON_KEYMAPS.append((keymap, item))
 
 
 def unregister_timeline() -> None:
     global _DRAW_HANDLE, _COLOR_SHADER, _IMAGE_SHADER
+    while _ADDON_KEYMAPS:
+        keymap, item = _ADDON_KEYMAPS.pop()
+        try:
+            keymap.keymap_items.remove(item)
+        except (ReferenceError, RuntimeError, ValueError):
+            pass
     if _DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceNodeEditor.draw_handler_remove(_DRAW_HANDLE, "WINDOW")

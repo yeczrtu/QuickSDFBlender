@@ -1823,7 +1823,19 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
         interactive_snapshot = runtime.consume_interactive_paint_snapshot(project)
         if interactive_snapshot is not None:
             active_uuid, display_name, before_gray, coverage_uuid, coverage_before = interactive_snapshot
-            active_item = runtime.active_angle(project)
+            try:
+                from .studio import active_session
+
+                paint_session = active_session(context)
+            except (ImportError, ReferenceError, RuntimeError):
+                paint_session = None
+            provisional_stroke = bool(
+                paint_session is not None
+                and paint_session.provisional_promoting
+                and str(paint_session.provisional_uuid) == active_uuid
+                and str(paint_session.provisional_image_name) == display_name
+            )
+            active_item = None if provisional_stroke else runtime.active_angle(project)
             source_image = bpy.data.images.get(display_name)
             before_history: dict[str, np.ndarray] = {}
             metadata_before: dict[str, tuple[bool, bool]] = {}
@@ -1831,7 +1843,9 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             try:
                 if source_image is None:
                     raise ValueError("The active angle paint layers disappeared")
-                if active_item is None or str(active_item.uuid) != active_uuid:
+                if not provisional_stroke and (
+                    active_item is None or str(active_item.uuid) != active_uuid
+                ):
                     raise ValueError("The active angle changed before the stroke finished")
                 source_rgba = runtime.image_rgba8(source_image)
                 source_gray = source_rgba[..., 0].copy()
@@ -1855,6 +1869,17 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     except (ImportError, ReferenceError, RuntimeError):
                         pass
                     return {"FINISHED"}
+                if provisional_stroke:
+                    from .studio import promote_provisional_after_stroke
+
+                    active_item = promote_provisional_after_stroke(context, project)
+                    # Assigning a formerly generated Image to a persistent key
+                    # can make Blender reload its pre-stroke packed source.
+                    # Publish the 8-bit native-paint result captured above only
+                    # after the structural promotion is complete.
+                    runtime.write_image_gray8(source_image, source_gray)
+                if active_item is None or str(active_item.uuid) != active_uuid:
+                    raise ValueError("The painted angle could not be added")
                 _UNDO_FENCES.add(str(project.uuid))
                 try:
                     from .studio import provisional_created_metadata
@@ -2170,6 +2195,8 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
         if project is None:
             return {"CANCELLED"}
         aux_mask_uuid = ""
+        provisional_image = None
+        session = None
         try:
             from .studio import (
                 activate_provisional_for_stroke,
@@ -2187,7 +2214,9 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
                 )
                 if not aux_mask_uuid:
                     if session is not None and session.provisional_uuid:
-                        activate_provisional_for_stroke(context, project)
+                        provisional_image = activate_provisional_for_stroke(
+                            context, project
+                        )
                     elif not back_to_paint(context, project):
                         return {"CANCELLED"}
         except (ImportError, AttributeError, ReferenceError, RuntimeError) as exc:
@@ -2207,6 +2236,19 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
         try:
             if aux_mask_uuid:
                 runtime.capture_aux_paint_snapshot(project, aux_mask_uuid)
+            elif provisional_image is not None and session is not None:
+                from .bitplane import BitplaneRole, decode_bitplane
+
+                coverage = decode_bitplane(
+                    bytes(session.provisional_coverage_blob),
+                    expected_role=BitplaneRole.COVERAGE,
+                )
+                runtime.capture_interactive_paint_snapshot_values(
+                    project,
+                    angle_uuid=str(session.provisional_uuid),
+                    display=provisional_image,
+                    coverage=coverage,
+                )
             else:
                 runtime.capture_interactive_paint_snapshot(
                     project,
@@ -2219,6 +2261,13 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
                 restore_stroke_brush(context)
             except (ImportError, AttributeError, ReferenceError, RuntimeError):
                 pass
+            if session is not None and session.provisional_promoting:
+                try:
+                    from .studio import finish_provisional_stroke
+
+                    finish_provisional_stroke(context, project, changed=False)
+                except (ImportError, AttributeError, ReferenceError, RuntimeError):
+                    pass
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         # The snapshot contains only the selected key. Angle consistency is
