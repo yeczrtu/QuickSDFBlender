@@ -8,6 +8,9 @@ because undo/load can invalidate those Python wrappers.
 
 from __future__ import annotations
 
+import uuid as uuid_module
+from collections.abc import Callable
+
 import bpy
 from bpy.props import (
     BoolProperty,
@@ -22,7 +25,7 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # Eight evenly spaced authoring stages.  The values are intentionally not
 # rounded: interpolation and export use the exact normalized position i / 7.
 DEFAULT_KEY_ANGLES = tuple(index * 90.0 / 7.0 for index in range(8))
@@ -42,6 +45,80 @@ BASE_SOURCE_ITEMS = (
     ("IMPORTED", "Imported Mask", "Base masks copied from artist-supplied images"),
     ("WHITE", "All Light", "Base masks initialized as all Light"),
 )
+
+
+PACKING_OUTPUT_CHANNELS = ("R", "G", "B", "A")
+
+PACKING_OUTPUT_CHANNEL_ITEMS = (
+    ("R", "R", "Red output channel"),
+    ("G", "G", "Green output channel"),
+    ("B", "B", "Blue output channel"),
+    ("A", "A", "Alpha output channel"),
+)
+
+PACKING_SOURCE_ITEMS = (
+    (
+        "RIGHT_THRESHOLD",
+        "Right Threshold",
+        "Face-shadow threshold authored for light from the character's right",
+    ),
+    (
+        "LEFT_THRESHOLD",
+        "Left Threshold",
+        "Face-shadow threshold authored for light from the character's left",
+    ),
+    ("SDF_AREA", "SDF Area", "Angle-independent mask selecting face-SDF shading"),
+    (
+        "SHADOW_STRENGTH",
+        "Shadow Strength",
+        "Angle-independent mask controlling face-shadow strength",
+    ),
+    ("CUSTOM_MASK", "Custom Mask", "A project-local angle-independent custom mask"),
+    ("CONSTANT", "Constant", "A uniform value between zero and one"),
+)
+
+AUX_MASK_ROLE_ITEMS = (
+    ("SDF_AREA", "SDF Area", "White where face-SDF shading is used"),
+    ("SHADOW_STRENGTH", "Shadow Strength", "White where face shadow is enabled"),
+    ("CUSTOM", "Custom", "A user-defined angle-independent mask"),
+)
+
+STANDARD_AUX_MASK_ROLES = ("SDF_AREA", "SHADOW_STRENGTH")
+
+
+_PACKING_RESET_DEPTH = 0
+
+
+def _same_rna_value(left, right) -> bool:
+    try:
+        return int(left.as_pointer()) == int(right.as_pointer())
+    except (AttributeError, ReferenceError, TypeError):
+        return left is right
+
+
+def _project_owning_packing_channel(channel):
+    """Resolve a child PropertyGroup owner without retaining an RNA wrapper."""
+
+    scene = getattr(channel, "id_data", None)
+    projects = getattr(scene, "quick_sdf_projects", ())
+    try:
+        for project in projects:
+            if any(_same_rna_value(item, channel) for item in project.packing_channels):
+                return project
+    except (AttributeError, ReferenceError, TypeError):
+        pass
+    return None
+
+
+def _packing_channel_changed(channel, _context) -> None:
+    if _PACKING_RESET_DEPTH:
+        return
+    project = _project_owning_packing_channel(channel)
+    if project is None:
+        return
+    project.packing_customized = True
+    project.packing_revision = int(project.packing_revision) + 1
+    project.dirty = True
 
 
 APPLY_TARGET_ITEMS = (
@@ -151,6 +228,54 @@ class QSDFAngle(PropertyGroup):
     dirty: BoolProperty(name="Dirty", default=False)
 
 
+class QSDFPackingChannel(PropertyGroup):
+    """One project-local mapping from a named signal to an RGBA channel."""
+
+    output_channel: EnumProperty(
+        name="Output Channel",
+        items=PACKING_OUTPUT_CHANNEL_ITEMS,
+        default="R",
+        update=_packing_channel_changed,
+    )
+    source_type: EnumProperty(
+        name="Source",
+        items=PACKING_SOURCE_ITEMS,
+        default="CONSTANT",
+        update=_packing_channel_changed,
+    )
+    auxiliary_mask_uuid: StringProperty(
+        name="Auxiliary Mask UUID",
+        default="",
+        update=_packing_channel_changed,
+    )
+    invert: BoolProperty(name="Invert", default=False, update=_packing_channel_changed)
+    constant_value: FloatProperty(
+        name="Value",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        update=_packing_channel_changed,
+    )
+
+
+class QSDFAuxMask(PropertyGroup):
+    """An angle-independent grayscale image owned by one Quick SDF project."""
+
+    uuid: StringProperty(name="UUID", default="")
+    name: StringProperty(name="Name", default="Mask")
+    role: EnumProperty(name="Role", items=AUX_MASK_ROLE_ITEMS, default="CUSTOM")
+    image: PointerProperty(name="Image", type=bpy.types.Image)
+    image_name: StringProperty(name="Image Name", default="")
+    revision: IntProperty(
+        name="Revision",
+        default=0,
+        min=0,
+        options={"HIDDEN"},
+    )
+    dirty: BoolProperty(name="Dirty", default=False, options={"HIDDEN"})
+
+
 class QSDFProject(PropertyGroup):
     uuid: StringProperty(name="UUID", default="")
     schema_version: IntProperty(
@@ -194,6 +319,29 @@ class QSDFProject(PropertyGroup):
     active_side: EnumProperty(name="Active Side", items=SIDE_ITEMS, default="RIGHT")
     boundary_tracks: CollectionProperty(type=QSDFBoundaryTrack)
     active_boundary_track_index: IntProperty(name="Active Boundary", default=-1, min=-1)
+
+    packing_channels: CollectionProperty(type=QSDFPackingChannel)
+    packing_customized: BoolProperty(name="Custom Packing", default=False)
+    packing_revision: IntProperty(
+        name="Packing Revision",
+        default=0,
+        min=0,
+        options={"HIDDEN"},
+    )
+    aux_masks: CollectionProperty(type=QSDFAuxMask)
+    active_aux_mask_index: IntProperty(name="Active Additional Mask", default=-1, min=-1)
+    active_aux_mask_uuid: StringProperty(name="Active Additional Mask UUID", default="")
+    packing_preview_channel: EnumProperty(
+        name="Packing Preview",
+        items=(
+            ("RGB", "RGB", "Preview the packed RGB channels"),
+            ("R", "R", "Preview the red channel as grayscale"),
+            ("G", "G", "Preview the green channel as grayscale"),
+            ("B", "B", "Preview the blue channel as grayscale"),
+            ("A", "A", "Preview the alpha channel as grayscale"),
+        ),
+        default="RGB",
+    )
 
     author_tool: EnumProperty(
         name="Author Tool",
@@ -346,11 +494,176 @@ class QSDFSettings(PropertyGroup):
     mask_sequence_directory: StringProperty(name="Mask Directory", subtype="DIR_PATH", default="//QuickSDF_masks")
 
 
+def is_current_schema(project) -> bool:
+    """Return whether ``project`` is exactly the only supported schema."""
+
+    try:
+        return int(project.schema_version) == SCHEMA_VERSION
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        return False
+
+
+def validate_schema(project):
+    """Require schema 5 and return the validated project for call chaining."""
+
+    actual = getattr(project, "schema_version", None)
+    if not is_current_schema(project):
+        raise ValueError(
+            f"Unsupported Quick SDF project schema {actual!r}; "
+            f"schema {SCHEMA_VERSION} is required"
+        )
+    return project
+
+
+def aux_mask_for_uuid(project, mask_uuid: str):
+    wanted = str(mask_uuid)
+    if not wanted:
+        return None
+    try:
+        return next(
+            (item for item in project.aux_masks if str(item.uuid) == wanted),
+            None,
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        return None
+
+
+def aux_mask_for_role(project, role: str):
+    wanted = str(role)
+    try:
+        return next(
+            (item for item in project.aux_masks if str(item.role) == wanted),
+            None,
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        return None
+
+
+def packing_channel_for(project, output_channel: str):
+    wanted = str(output_channel).upper()
+    try:
+        return next(
+            (
+                item
+                for item in project.packing_channels
+                if str(item.output_channel) == wanted
+            ),
+            None,
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        return None
+
+
+def _default_uuid() -> str:
+    return str(uuid_module.uuid4())
+
+
+def ensure_standard_aux_masks(
+    project,
+    *,
+    uuid_factory: Callable[[], str] | None = None,
+) -> tuple:
+    """Ensure the two built-in mask records exist and have stable UUIDs.
+
+    Image creation deliberately remains in the runtime layer.  This helper only
+    creates persistent records so project creation can attach Blender Images to
+    the returned entries.
+    """
+
+    uuid_factory = uuid_factory or _default_uuid
+    labels = {
+        "SDF_AREA": "SDF Area",
+        "SHADOW_STRENGTH": "Shadow Strength",
+    }
+    result = []
+    for role in STANDARD_AUX_MASK_ROLES:
+        item = aux_mask_for_role(project, role)
+        if item is None:
+            item = project.aux_masks.add()
+            item.role = role
+            item.name = labels[role]
+        if not str(item.uuid):
+            item.uuid = str(uuid_factory())
+        result.append(item)
+    if int(getattr(project, "active_aux_mask_index", -1)) < 0 and result:
+        active = result[0]
+        project.active_aux_mask_uuid = str(active.uuid)
+        project.active_aux_mask_index = next(
+            (
+                index
+                for index, item in enumerate(project.aux_masks)
+                if str(item.uuid) == str(active.uuid)
+            ),
+            0,
+        )
+    return tuple(result)
+
+
+def mark_packing_changed(project, *, customized: bool = True) -> int:
+    """Invalidate an in-flight packed export after a recipe or mask change."""
+
+    project.packing_customized = bool(customized)
+    project.packing_revision = int(getattr(project, "packing_revision", 0)) + 1
+    project.dirty = True
+    return int(project.packing_revision)
+
+
+def mark_aux_mask_changed(project, aux_mask=None) -> int:
+    if aux_mask is not None:
+        aux_mask.revision = int(getattr(aux_mask, "revision", 0)) + 1
+        aux_mask.dirty = True
+    return mark_packing_changed(project, customized=bool(project.packing_customized))
+
+
+def reset_liltoon_packing(project) -> None:
+    """Replace the project-local recipe with the built-in lilToon mapping."""
+
+    global _PACKING_RESET_DEPTH
+
+    sdf_area, shadow_strength = ensure_standard_aux_masks(project)
+    rows = (
+        ("R", "RIGHT_THRESHOLD", "", False, 0.0),
+        ("G", "LEFT_THRESHOLD", "", False, 0.0),
+        ("B", "SDF_AREA", str(sdf_area.uuid), True, 0.0),
+        ("A", "SHADOW_STRENGTH", str(shadow_strength.uuid), False, 1.0),
+    )
+    _PACKING_RESET_DEPTH += 1
+    try:
+        project.packing_channels.clear()
+        for output, source, mask_uuid, invert, constant in rows:
+            item = project.packing_channels.add()
+            item.output_channel = output
+            item.source_type = source
+            item.auxiliary_mask_uuid = mask_uuid
+            item.invert = invert
+            item.constant_value = constant
+        project.packing_customized = False
+        project.packing_revision = int(getattr(project, "packing_revision", 0)) + 1
+        project.dirty = True
+    finally:
+        _PACKING_RESET_DEPTH -= 1
+
+
+def ensure_liltoon_packing(project) -> bool:
+    """Initialize a missing/invalid four-row recipe without replacing custom rows."""
+
+    outputs = tuple(
+        str(getattr(item, "output_channel", ""))
+        for item in getattr(project, "packing_channels", ())
+    )
+    if outputs == PACKING_OUTPUT_CHANNELS:
+        return False
+    reset_liltoon_packing(project)
+    return True
+
+
 CLASSES = (
     QSDFBoundaryPoint,
     QSDFBoundaryKey,
     QSDFBoundaryTrack,
     QSDFAngle,
+    QSDFPackingChannel,
+    QSDFAuxMask,
     QSDFProject,
     QSDFSettings,
 )
