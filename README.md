@@ -1,4 +1,4 @@
-# Quick SDF Studio 0.6.0
+# Quick SDF Studio 0.6.1
 
 Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作るWindows向けExtensionです。法線から作られた影ガイドを下描きにして、気になる部分だけを直せます。
 
@@ -25,10 +25,10 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 書き出すRGBAの割り当てはプロジェクトごとに変更できます。既定のlilToon設定は、R=右光、G=左光、B=通常法線へ戻す領域、A=影強度です。通常は設定を触らず、そのまま1ボタンで書き出せます。
 
-0.6.0では、Texture Paintに必要なDisplayだけをRGBA8 Imageとして保持し、Baseと手描き範囲は検証付き1-bit bitplaneとして保存します。キーを追加しても補助レイヤーがRGBA Imageとして増えないため、従来より少ないメモリで細かな角度制御ができます。
+schema 6では、Texture Paintに必要なDisplayだけをRGBA8 Imageとして保持し、Baseと手描き範囲は検証付き1-bit bitplaneとして保存します。キーを追加しても補助レイヤーがRGBA Imageとして増えないため、従来より少ないメモリで細かな角度制御ができます。
 
 > [!WARNING]
-> 0.6.0のProject schemaは6です。以前のProjectを移行する処理はありません。0.6.0では新しいProjectを作成してください。
+> 0.6.xのProject schemaは6です。schema 5以前を移行する処理はありません。0.6.0のProjectは0.6.1でもそのまま開けます。
 
 詳しい使い方は[日本語ユーザーガイド](docs/USER_GUIDE_JA.md)を参照してください。
 
@@ -36,7 +36,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 対応環境はBlender 5.1、Windows x64です。
 
-1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.6.0-windows-x64.zip` を取得する
+1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.6.1-windows-x64.zip` を取得する
 2. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
 3. 右上メニューから `ディスクからインストール` を選ぶ
 4. 取得したZIPを展開せずに選択する
