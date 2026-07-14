@@ -30,6 +30,12 @@ import numpy as np  # noqa: E402
 import quick_sdf_blender  # noqa: E402
 from quick_sdf_blender import runtime, studio  # noqa: E402
 from quick_sdf_blender.model import DEFAULT_ANGLES, SCHEMA_VERSION  # noqa: E402
+from quick_sdf_blender.packing import (  # noqa: E402
+    PackingChannelSpec,
+    PackingSource,
+    pack_rgba16,
+    quantize_unorm16,
+)
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -127,9 +133,51 @@ def _assert_canvas(project: object) -> None:
     assert image.get(runtime.ANGLE_UUID_KEY) == angle_item.uuid
 
 
+def _liltoon_packing_snapshot(
+    sdf_area: np.ndarray,
+    shadow_strength: np.ndarray,
+) -> dict[str, object]:
+    shape = tuple(int(value) for value in np.asarray(sdf_area).shape)
+    assert shape == tuple(int(value) for value in np.asarray(shadow_strength).shape)
+    return {
+        "specs": (
+            PackingChannelSpec(PackingSource.RIGHT_THRESHOLD),
+            PackingChannelSpec(PackingSource.LEFT_THRESHOLD),
+            PackingChannelSpec(
+                PackingSource.SDF_AREA,
+                invert=True,
+                auxiliary_mask_uuid="smoke-sdf-area",
+            ),
+            PackingChannelSpec(
+                PackingSource.SHADOW_STRENGTH,
+                auxiliary_mask_uuid="smoke-shadow-strength",
+            ),
+        ),
+        "signals": {
+            "smoke-sdf-area": np.asarray(sdf_area),
+            "smoke-shadow-strength": np.asarray(shadow_strength),
+        },
+        "shape": shape,
+    }
+
+
+def _pack_expected_thresholds(
+    channels: np.ndarray,
+    packing: dict[str, object],
+) -> np.ndarray:
+    signals = dict(packing["signals"])
+    signals[PackingSource.RIGHT_THRESHOLD] = channels[..., 0]
+    signals[PackingSource.LEFT_THRESHOLD] = channels[..., 1]
+    return pack_rgba16(
+        signals,
+        packing["specs"],
+        shape=packing["shape"],
+    )
+
+
 def _assert_export_worker_side_contracts() -> None:
     from quick_sdf_blender import operators
-    from quick_sdf_blender.core import generate_threshold_pair
+    from quick_sdf_blender.core import generate_threshold_pair_channels
     from quick_sdf_blender.symmetry import IslandPair, mirror_side_stack
 
     angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float64)
@@ -138,15 +186,33 @@ def _assert_export_worker_side_contracts() -> None:
     right = np.arange(3)[:, None, None] >= right_transition[None, ...]
     left = np.arange(3)[:, None, None] >= left_transition[None, ...]
     coverage = np.zeros_like(right)
+    sdf_area = np.asarray(
+        [[True, True, False, False], [True, False, True, False]], dtype=np.bool_
+    )
+    shadow_strength = np.asarray(
+        [[1.0, 0.75, 0.5, 0.25], [0.0, 0.25, 0.5, 1.0]], dtype=np.float64
+    )
+    packing = _liltoon_packing_snapshot(sdf_area, shadow_strength)
     independent = operators._compute_export_result(
         {
             "linked": False,
             "right": (right, angles, ~right, coverage),
             "left": (left, angles, np.roll(left, 1, axis=0), coverage),
+            "packing": packing,
         }
     )
+    independent_channels = generate_threshold_pair_channels(
+        right, angles, left, angles
+    )
     np.testing.assert_array_equal(
-        independent["rgba"], generate_threshold_pair(right, angles, left, angles)
+        independent["rgba"],
+        _pack_expected_thresholds(independent_channels, packing),
+    )
+    np.testing.assert_array_equal(
+        independent["rgba"][..., 2], 65535 - quantize_unorm16(sdf_area)
+    )
+    np.testing.assert_array_equal(
+        independent["rgba"][..., 3], quantize_unorm16(shadow_strength)
     )
     assert independent["changed_pixel_count"] == 0
 
@@ -164,11 +230,15 @@ def _assert_export_worker_side_contracts() -> None:
                 "source": (left, angles, ~left, coverage),
                 "mirror_mode": mode,
                 "island_pairs": pairs,
+                "packing": packing,
             }
+        )
+        linked_channels = generate_threshold_pair_channels(
+            mirrored, angles, left, angles
         )
         np.testing.assert_array_equal(
             linked_left["rgba"],
-            generate_threshold_pair(mirrored, angles, left, angles),
+            _pack_expected_thresholds(linked_channels, packing),
         )
         assert linked_left["changed_pixel_count"] == 0
 
@@ -181,11 +251,14 @@ def run(output_directory: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     blend_path = output_directory / "quick_sdf_smoke.blend"
     png_path = output_directory / "quick_sdf_smoke_rgba16.png"
+    custom_png_path = output_directory / "quick_sdf_smoke_custom_rgba16.png"
     repaired_png_path = output_directory / "quick_sdf_smoke_repaired_rgba16.png"
     if blend_path.exists():
         blend_path.unlink()
     if png_path.exists():
         png_path.unlink()
+    if custom_png_path.exists():
+        custom_png_path.unlink()
     if repaired_png_path.exists():
         repaired_png_path.unlink()
 
@@ -217,7 +290,7 @@ def run(output_directory: Path) -> None:
     project = scene.quick_sdf_projects[0]
     assert project.target_object == cube
     assert project.resolution == 512
-    assert project.schema_version == SCHEMA_VERSION == 4
+    assert project.schema_version == SCHEMA_VERSION == 5
     assert project.base_source == "NORMAL_GUIDE"
     assert project.guide_version == 2
     assert len(project.angles) == 8
@@ -229,6 +302,48 @@ def run(output_directory: Path) -> None:
     )
     assert {item.side for item in project.angles} == {"RIGHT"}
     assert not project.base_needs_update
+    assert len(project.aux_masks) == 2
+    aux_by_role = {str(item.role): item for item in project.aux_masks}
+    assert set(aux_by_role) == {"SDF_AREA", "SHADOW_STRENGTH"}
+    for role, item in aux_by_role.items():
+        image = runtime.resolve_aux_mask_image(project, item)
+        assert image is not None
+        assert image.alpha_mode == "NONE"
+        assert image.get(runtime.PROJECT_UUID_KEY) == project.uuid
+        assert image.get(runtime.ROLE_KEY) == runtime.AUX_MASK_ROLE
+        assert image.get(runtime.AUX_MASK_UUID_KEY) == item.uuid
+        assert bool(image.get(runtime.AUX_MASK_INITIALIZED_KEY, False))
+        assert np.all(runtime.image_rgba(image)[..., 3] == 1.0), role
+    sdf_area_image = runtime.resolve_aux_mask_image(
+        project, aux_by_role["SDF_AREA"]
+    )
+    shadow_strength_image = runtime.resolve_aux_mask_image(
+        project, aux_by_role["SHADOW_STRENGTH"]
+    )
+    assert sdf_area_image is not None and shadow_strength_image is not None
+    sdf_area = runtime.image_rgba(sdf_area_image)[..., 0]
+    shadow_strength = runtime.image_rgba(shadow_strength_image)[..., 0]
+    assert np.any(sdf_area >= 0.5)
+    assert np.all(shadow_strength == 1.0)
+    recipe = {
+        str(item.output_channel): (
+            str(item.source_type),
+            bool(item.invert),
+            str(item.auxiliary_mask_uuid),
+        )
+        for item in project.packing_channels
+    }
+    assert recipe == {
+        "R": ("RIGHT_THRESHOLD", False, ""),
+        "G": ("LEFT_THRESHOLD", False, ""),
+        "B": ("SDF_AREA", True, aux_by_role["SDF_AREA"].uuid),
+        "A": (
+            "SHADOW_STRENGTH",
+            False,
+            aux_by_role["SHADOW_STRENGTH"].uuid,
+        ),
+    }
+    assert not project.packing_customized
     expected_active = min(DEFAULT_ANGLES, key=lambda value: abs(value - 45.0))
     assert math.isclose(
         float(project.angles[project.active_angle_index].angle),
@@ -457,8 +572,11 @@ def run(output_directory: Path) -> None:
     assert project.generated_image.get(runtime.ROLE_KEY) == runtime.THRESHOLD_ROLE
     from quick_sdf_blender import operators
 
-    strict_expected = operators._compute_threshold_rgba(
+    strict_channels = operators._compute_threshold_channels(
         operators._prepare_strict_threshold_inputs(project)
+    )
+    strict_expected = operators._pack_threshold_channels(
+        strict_channels, operators._snapshot_packing_inputs(project)
     )
     _expect_finished(
         bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
@@ -475,8 +593,12 @@ def run(output_directory: Path) -> None:
         "filtering": 0,
         "interlace": 0,
     }
-    assert np.all(pixels[..., 2] == 0)
-    assert np.all(pixels[..., 3] == 65535)
+    np.testing.assert_array_equal(
+        pixels[..., 2], 65535 - quantize_unorm16(sdf_area)
+    )
+    np.testing.assert_array_equal(
+        pixels[..., 3], quantize_unorm16(shadow_strength)
+    )
     assert np.all((pixels[..., 0] >= 0) & (pixels[..., 0] <= 65535))
     assert np.all((pixels[..., 1] >= 0) & (pixels[..., 1] <= 65535))
     np.testing.assert_array_equal(pixels, strict_expected)
@@ -484,8 +606,77 @@ def run(output_directory: Path) -> None:
     assert project.export_adjustment_image is None
     valid_png_bytes = png_path.read_bytes()
 
+    print("[Quick SDF smoke] customize, export, and reset project-local packing")
+    _expect_finished(
+        bpy.ops.quicksdf.aux_mask_add(name="Smoke Custom", fill_value=0.25),
+        "aux_mask_add",
+    )
+    custom_item = runtime.active_aux_mask(project)
+    assert custom_item is not None and custom_item.role == "CUSTOM"
+    custom_uuid = str(custom_item.uuid)
+    custom_image = runtime.resolve_aux_mask_image(project, custom_item)
+    assert custom_image is not None
+    custom_mask_values = quantize_unorm16(
+        runtime.image_rgba(custom_image)[..., 0]
+    )
+    np.testing.assert_array_equal(
+        runtime.image_channel_u16(custom_image), custom_mask_values
+    )
+    assert np.unique(custom_mask_values).size == 1
+    assert 0 < int(custom_mask_values[0, 0]) < 65535
+    _expect_finished(bpy.ops.quicksdf.packing_customize(), "packing_customize")
+    _expect_finished(
+        bpy.ops.quicksdf.packing_assign_active_mask(output_channel="B"),
+        "packing_assign_active_mask",
+    )
+    packing_by_output = {
+        str(item.output_channel): item for item in project.packing_channels
+    }
+    packing_by_output["B"].invert = False
+    packing_by_output["A"].source_type = "CONSTANT"
+    packing_by_output["A"].constant_value = 0.5
+    assert project.packing_customized
+    valid_custom_uuid = str(packing_by_output["B"].auxiliary_mask_uuid)
+    packing_by_output["B"].auxiliary_mask_uuid = "missing-mask-for-row-error"
+    try:
+        operators._prepare_threshold_inputs(project)
+    except ValueError as error:
+        assert str(error).startswith("Packing B:"), str(error)
+    else:
+        raise AssertionError("A missing Custom Mask must identify its packing row")
+    finally:
+        packing_by_output["B"].auxiliary_mask_uuid = valid_custom_uuid
+    _expect_finished(
+        bpy.ops.quicksdf.export_texture(
+            filepath=str(custom_png_path), overwrite=True
+        ),
+        "custom packing export_texture",
+    )
+    _custom_header, custom_pixels = _decode_rgba16(custom_png_path)
+    np.testing.assert_array_equal(custom_pixels[..., :2], pixels[..., :2])
+    np.testing.assert_array_equal(custom_pixels[..., 2], custom_mask_values)
+    assert np.all(custom_pixels[..., 3] == 32768)
+
+    _expect_finished(
+        bpy.ops.quicksdf.packing_reset_liltoon(), "packing_reset_liltoon"
+    )
+    assert not project.packing_customized
+    _expect_finished(
+        bpy.ops.quicksdf.aux_mask_delete(mask_uuid=custom_uuid),
+        "aux_mask_delete",
+    )
+    assert len(project.aux_masks) == 2
+    _expect_finished(
+        bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
+        "default packing re-export",
+    )
+    assert png_path.read_bytes() == valid_png_bytes
+
     print("[Quick SDF smoke] auto-repair an invalid paint stack without changing source images")
-    from quick_sdf_blender.core import generate_threshold_pair, repair_side_monotonic
+    from quick_sdf_blender.core import (
+        generate_threshold_pair_channels,
+        repair_side_monotonic,
+    )
     from quick_sdf_blender.symmetry import mirror_side_stack
 
     test_y, test_x = 100, 100
@@ -522,7 +713,27 @@ def run(output_directory: Path) -> None:
                         hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
                     )
                 )
-        return tuple(records)
+        for aux_item in project.aux_masks:
+            image = runtime.resolve_aux_mask_image(project, aux_item)
+            assert image is not None
+            records.append(
+                (
+                    image.name,
+                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                    hashlib.sha256(runtime.image_rgba(image).tobytes()).hexdigest(),
+                )
+            )
+        recipe_fingerprint = tuple(
+            (
+                str(item.output_channel),
+                str(item.source_type),
+                bool(item.invert),
+                float(item.constant_value),
+                str(item.auxiliary_mask_uuid),
+            )
+            for item in project.packing_channels
+        )
+        return tuple(records), int(project.packing_revision), recipe_fingerprint
 
     before_repair_export = source_fingerprints()
     try:
@@ -550,13 +761,16 @@ def run(output_directory: Path) -> None:
         island_pairs=prepared["island_pairs"],
     )
     if prepared["author_side"] == "RIGHT":
-        expected_repaired = generate_threshold_pair(
+        expected_repaired_channels = generate_threshold_pair_channels(
             repair.masks, source_angles, mirrored, source_angles
         )
     else:
-        expected_repaired = generate_threshold_pair(
+        expected_repaired_channels = generate_threshold_pair_channels(
             mirrored, source_angles, repair.masks, source_angles
         )
+    expected_repaired = operators._pack_threshold_channels(
+        expected_repaired_channels, prepared["packing"]
+    )
     _expect_finished(
         bpy.ops.quicksdf.export_texture(filepath=str(repaired_png_path), overwrite=True),
         "repairing export_texture",
@@ -662,6 +876,30 @@ def run(output_directory: Path) -> None:
     angle_names = tuple(item.display_image_name for item in project.angles)
     base_names = tuple(item.base_image_name for item in project.angles)
     coverage_names = tuple(item.coverage_image_name for item in project.angles)
+    aux_records = tuple(
+        (
+            str(item.uuid),
+            str(item.name),
+            str(item.role),
+            str(item.image_name),
+            int(item.revision),
+            hashlib.sha256(
+                runtime.image_rgba(runtime.resolve_aux_mask_image(project, item)).tobytes()
+            ).hexdigest(),
+        )
+        for item in project.aux_masks
+    )
+    packing_records = tuple(
+        (
+            str(item.output_channel),
+            str(item.source_type),
+            str(item.auxiliary_mask_uuid),
+            bool(item.invert),
+            float(item.constant_value),
+        )
+        for item in project.packing_channels
+    )
+    packing_revision = int(project.packing_revision)
     expected_painted_pixels = tuple(
         runtime.image_rgba(runtime.resolve_display_image(project, item))[255, 255, :3].copy()
         for item in project.angles
@@ -682,6 +920,30 @@ def run(output_directory: Path) -> None:
     assert tuple(item.display_image_name for item in project.angles) == angle_names
     assert tuple(item.base_image_name for item in project.angles) == base_names
     assert tuple(item.coverage_image_name for item in project.angles) == coverage_names
+    assert tuple(
+        (
+            str(item.uuid),
+            str(item.name),
+            str(item.role),
+            str(item.image_name),
+            int(item.revision),
+            hashlib.sha256(
+                runtime.image_rgba(runtime.resolve_aux_mask_image(project, item)).tobytes()
+            ).hexdigest(),
+        )
+        for item in project.aux_masks
+    ) == aux_records
+    assert tuple(
+        (
+            str(item.output_channel),
+            str(item.source_type),
+            str(item.auxiliary_mask_uuid),
+            bool(item.invert),
+            float(item.constant_value),
+        )
+        for item in project.packing_channels
+    ) == packing_records
+    assert int(project.packing_revision) == packing_revision
     assert studio.current_session() is None
     for index, angle_item in enumerate(project.angles):
         image = runtime.resolve_display_image(project, angle_item)

@@ -4,7 +4,10 @@ import unittest
 
 import numpy as np
 
-from quick_sdf_blender.core import generate_threshold_pair, validate_side_monotonic
+from quick_sdf_blender.core import (
+    generate_threshold_pair_channels,
+    validate_side_monotonic,
+)
 from quick_sdf_blender.smart_paint import (
     affected_key_indices,
     apply_smart_stroke,
@@ -90,19 +93,18 @@ class SmartPaintTests(unittest.TestCase):
             )
 
 
-class ThresholdPairTests(unittest.TestCase):
+class ThresholdPairChannelTests(unittest.TestCase):
     def test_two_lanes_can_own_different_front_masks(self):
         right = np.zeros((len(ANGLES), 2, 2), dtype=np.bool_)
         left = np.zeros_like(right)
         right[:, 0, 0] = True
         left[:, 1, 1] = True
-        rgba = generate_threshold_pair(right, ANGLES, left, ANGLES)
-        self.assertEqual(int(rgba[0, 0, 0]), 65535)
-        self.assertEqual(int(rgba[0, 0, 1]), 0)
-        self.assertEqual(int(rgba[1, 1, 0]), 0)
-        self.assertEqual(int(rgba[1, 1, 1]), 65535)
-        self.assertTrue(np.all(rgba[..., 2] == 0))
-        self.assertTrue(np.all(rgba[..., 3] == 65535))
+        channels = generate_threshold_pair_channels(right, ANGLES, left, ANGLES)
+        self.assertEqual(channels.shape, (2, 2, 2))
+        self.assertEqual(int(channels[0, 0, 0]), 65535)
+        self.assertEqual(int(channels[0, 0, 1]), 0)
+        self.assertEqual(int(channels[1, 1, 0]), 0)
+        self.assertEqual(int(channels[1, 1, 1]), 65535)
 
     def test_irregular_angles_are_supported(self):
         angles = np.array([0.0, 22.5, 71.0, 90.0])
@@ -110,16 +112,18 @@ class ThresholdPairTests(unittest.TestCase):
         masks[1:, 0, 0] = True
         masks[2:, 0, 1] = True
         masks[3:, 0, 2] = True
-        rgba = generate_threshold_pair(masks, angles, masks, angles)
-        self.assertTrue(1 <= int(rgba[0, 0, 0]) <= 65534)
-        self.assertTrue(1 <= int(rgba[0, 1, 0]) <= 65534)
-        self.assertTrue(1 <= int(rgba[0, 2, 0]) <= 65534)
+        channels = generate_threshold_pair_channels(masks, angles, masks, angles)
+        self.assertTrue(1 <= int(channels[0, 0, 0]) <= 65534)
+        self.assertTrue(1 <= int(channels[0, 1, 0]) <= 65534)
+        self.assertTrue(1 <= int(channels[0, 2, 0]) <= 65534)
 
     def test_each_lane_is_validated_independently(self):
         masks = np.zeros((len(ANGLES), 1, 1), dtype=np.bool_)
         masks[2, 0, 0] = True
         with self.assertRaisesRegex(ValueError, "right mask lane"):
-            generate_threshold_pair(masks, ANGLES, np.zeros_like(masks), ANGLES)
+            generate_threshold_pair_channels(
+                masks, ANGLES, np.zeros_like(masks), ANGLES
+            )
 
 
 if __name__ == "__main__":

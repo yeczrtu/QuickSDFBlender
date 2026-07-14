@@ -11,10 +11,17 @@ from quick_sdf_blender.bake import (
     bake_normal_sweep as reference_bake,
 )
 from quick_sdf_blender.core import (
-    generate_threshold_pair as reference_threshold_pair,
-    generate_threshold_rgba16,
+    generate_threshold_channels as reference_threshold_channels,
+    generate_threshold_pair_channels as reference_threshold_pair,
     repair_side_monotonic as reference_repair,
 )
+
+
+def reference_signed_threshold_channels(
+    masks: np.ndarray, angles: np.ndarray
+) -> np.ndarray:
+    positive, negative = reference_threshold_channels(masks, angles)
+    return np.stack((positive, negative), axis=-1)
 
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
@@ -261,7 +268,7 @@ class NativeCoreTests(unittest.TestCase):
         left = np.arange(8)[:, None, None] >= left_transition[None, ...]
         expected = reference_threshold_pair(right, angles, left, angles)
         actual = native.generate_threshold_pair(right, angles, left, angles)
-        np.testing.assert_array_equal(actual, expected[..., :2])
+        np.testing.assert_array_equal(actual, expected)
 
     def test_non_monotonic_is_rejected(self):
         angles = np.array([-90.0, 0.0, 90.0], dtype=np.float32)
@@ -280,18 +287,17 @@ class NativeCoreTests(unittest.TestCase):
         for distance in range(7):
             masks[6 + distance] = distance >= switches[0]
             masks[6 - distance] = distance >= switches[1]
-        reference = generate_threshold_rgba16(masks, angles)
+        reference = reference_signed_threshold_channels(masks, angles)
         channels = native.generate_threshold(masks, angles)
-        np.testing.assert_array_equal(channels[..., 0], reference[..., 0])
-        np.testing.assert_array_equal(channels[..., 1], reference[..., 1])
+        np.testing.assert_array_equal(channels, reference)
 
     def test_unsorted_angles_match_reference(self):
         angles = np.array([90.0, 0.0, -90.0], dtype=np.float32)
         masks = np.ones((3, 3, 5), dtype=np.uint8)
         masks[1] = 0
-        reference = generate_threshold_rgba16(masks, angles)
+        reference = reference_signed_threshold_channels(masks, angles)
         channels = native.generate_threshold(masks, angles)
-        np.testing.assert_array_equal(channels, reference[..., :2])
+        np.testing.assert_array_equal(channels, reference)
 
     def test_endpoints_are_required(self):
         masks = np.ones((3, 2, 2), dtype=np.uint8)

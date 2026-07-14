@@ -60,15 +60,53 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     # table. Fractional 8-stage angles catch stale pre-ABI-5 builds that would
     # otherwise truncate authoring angles or use the old reserved endpoints.
     core = importlib.import_module(f"{module_name}.core")
+    model = importlib.import_module(f"{module_name}.model")
+    packing = importlib.import_module(f"{module_name}.packing")
+    assert model.SCHEMA_VERSION == 5
     angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
     steps = np.arange(8, dtype=np.int64)[:, None]
     right = (steps >= np.array([0, 1, 4, 8])[None, :]).reshape(8, 1, 4)
     left = (steps >= np.array([7, 5, 2, 0])[None, :]).reshape(8, 1, 4)
-    expected = core.generate_threshold_pair(right, angles, left, angles)
+    expected = core.generate_threshold_pair_channels(right, angles, left, angles)
     actual = native.generate_threshold_pair(right, angles, left, angles)
-    np.testing.assert_array_equal(actual, expected[..., :2])
+    assert expected.shape == actual.shape == (1, 4, 2)
+    assert expected.dtype == actual.dtype == np.uint16
+    assert expected.flags.c_contiguous and actual.flags.c_contiguous
+    np.testing.assert_array_equal(actual, expected)
     assert expected[0, 0, 0] == 65535
     assert expected[0, 3, 0] == 0
+
+    sdf_area = np.asarray([[True, True, False, False]], dtype=np.bool_)
+    strength = np.asarray([[1.0, 0.5, 0.25, 0.0]], dtype=np.float64)
+    packed = packing.pack_rgba16(
+        {
+            packing.PackingSource.RIGHT_THRESHOLD: actual[..., 0],
+            packing.PackingSource.LEFT_THRESHOLD: actual[..., 1],
+            "installed-sdf": sdf_area,
+            "installed-strength": strength,
+        },
+        (
+            packing.PackingChannelSpec(packing.PackingSource.RIGHT_THRESHOLD),
+            packing.PackingChannelSpec(packing.PackingSource.LEFT_THRESHOLD),
+            packing.PackingChannelSpec(
+                packing.PackingSource.SDF_AREA,
+                invert=True,
+                auxiliary_mask_uuid="installed-sdf",
+            ),
+            packing.PackingChannelSpec(
+                packing.PackingSource.SHADOW_STRENGTH,
+                auxiliary_mask_uuid="installed-strength",
+            ),
+        ),
+    )
+    assert packed.shape == (1, 4, 4)
+    np.testing.assert_array_equal(packed[..., :2], actual)
+    np.testing.assert_array_equal(
+        packed[..., 2], np.asarray([[0, 0, 65535, 65535]], dtype=np.uint16)
+    )
+    np.testing.assert_array_equal(
+        packed[..., 3], np.asarray([[65535, 32768, 16384, 0]], dtype=np.uint16)
+    )
 
     triangle_uvs = np.array(
         [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=np.float32
@@ -97,10 +135,44 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     np.testing.assert_array_equal(guide, expected_guide)
 
     assert hasattr(bpy.types.Scene, "quick_sdf_projects")
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFPackingChannel") is not None
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFAuxMask") is not None
+    project = bpy.context.scene.quick_sdf_projects.add()
+    project.uuid = "installed-schema-five"
+    uuids = iter(("installed-area", "installed-strength"))
+    aux_items = model.ensure_standard_aux_masks(
+        project, uuid_factory=lambda: next(uuids)
+    )
+    model.reset_liltoon_packing(project)
+    assert [(item.role, item.uuid) for item in aux_items] == [
+        ("SDF_AREA", "installed-area"),
+        ("SHADOW_STRENGTH", "installed-strength"),
+    ]
+    assert [
+        (
+            item.output_channel,
+            item.source_type,
+            item.invert,
+            item.auxiliary_mask_uuid,
+        )
+        for item in project.packing_channels
+    ] == [
+        ("R", "RIGHT_THRESHOLD", False, ""),
+        ("G", "LEFT_THRESHOLD", False, ""),
+        ("B", "SDF_AREA", True, "installed-area"),
+        ("A", "SHADOW_STRENGTH", False, "installed-strength"),
+    ]
+    bpy.context.scene.quick_sdf_projects.remove(
+        len(bpy.context.scene.quick_sdf_projects) - 1
+    )
     addon.unregister()
     assert not hasattr(bpy.types.Scene, "quick_sdf_projects")
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFPackingChannel") is None
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFAuxMask") is None
     addon.register()
     assert hasattr(bpy.types.Scene, "quick_sdf_projects")
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFPackingChannel") is not None
+    assert bpy.types.PropertyGroup.bl_rna_get_subclass_py("QSDFAuxMask") is not None
     print(
         "[Quick SDF installed extension smoke] PASS: "
         f"{expected_version} ABI {native.version()} at {module_path}"

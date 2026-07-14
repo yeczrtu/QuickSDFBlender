@@ -4,7 +4,8 @@ import unittest
 
 import numpy as np
 
-from quick_sdf_blender.core import generate_threshold_pair
+from quick_sdf_blender.core import generate_threshold_pair_channels
+from quick_sdf_blender.packing import PackingChannelSpec, PackingSource, pack_rgba16
 from quick_sdf_blender.review import (
     review_current,
     review_onion_difference,
@@ -14,6 +15,29 @@ from quick_sdf_blender.review import (
 
 
 ANGLES = np.asarray([-90.0, -45.0, 0.0, 45.0, 90.0])
+
+
+def _review_texture(
+    right: np.ndarray,
+    right_angles: np.ndarray,
+    left: np.ndarray,
+    left_angles: np.ndarray,
+) -> np.ndarray:
+    channels = generate_threshold_pair_channels(
+        right, right_angles, left, left_angles
+    )
+    return pack_rgba16(
+        {
+            PackingSource.RIGHT_THRESHOLD: channels[..., 0],
+            PackingSource.LEFT_THRESHOLD: channels[..., 1],
+        },
+        (
+            PackingChannelSpec(PackingSource.RIGHT_THRESHOLD),
+            PackingChannelSpec(PackingSource.LEFT_THRESHOLD),
+            PackingChannelSpec(PackingSource.CONSTANT, constant_value=0.0),
+            PackingChannelSpec(PackingSource.CONSTANT, constant_value=1.0),
+        ),
+    )
 
 
 class CurrentReviewTests(unittest.TestCase):
@@ -98,7 +122,7 @@ class ThresholdReviewTests(unittest.TestCase):
         left_transition = (2 * x + y + 1) % 8
         right = np.arange(8)[:, None, None] >= right_transition[None, ...]
         left = np.arange(8)[:, None, None] >= left_transition[None, ...]
-        texture = generate_threshold_pair(right, angles, left, angles)
+        texture = _review_texture(right, angles, left, angles)
         for index, angle in enumerate(angles):
             right_preview = review_threshold_rgba16(texture, float(angle))[..., 0] >= 0.5
             np.testing.assert_array_equal(right_preview, right[index])

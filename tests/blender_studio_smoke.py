@@ -411,6 +411,72 @@ def check() -> float | None:
             runtime.discard_interactive_paint_snapshot(project)
             studio.restore_stroke_brush(bpy.context)
             STATE["timeline_release_verified"] = True
+        if not STATE.get("aux_masks_verified"):
+            from quick_sdf_blender import timeline
+
+            angle_item = runtime.active_angle(project)
+            angle_canvas = runtime.resolve_display_image(project, angle_item)
+            mask_item = next(
+                item for item in project.aux_masks if str(item.role) == "SDF_AREA"
+            )
+            mask_image = runtime.resolve_aux_mask_image(project, mask_item)
+            assert mask_image is not None
+            mask_before = runtime.image_rgba8(mask_image)
+            mask_revision = int(mask_item.revision)
+            packing_revision = int(project.packing_revision)
+            preview_mode = str(project.preview_mode)
+            image_area = next(
+                area for area in bpy.context.window.screen.areas
+                if area.type == "IMAGE_EDITOR"
+            )
+            assert bpy.ops.quicksdf.aux_mask_edit(mask_uuid=str(mask_item.uuid)) == {"FINISHED"}
+            session = studio.current_session()
+            assert session.editing_aux_mask_uuid == str(mask_item.uuid)
+            assert session.view_mode == "AUX_MASK"
+            assert bpy.context.scene.tool_settings.image_paint.canvas == mask_image
+            assert image_area.spaces.active.image == mask_image
+            assert obj.material_slots[0].material.node_tree.nodes["QSDF Mask"].image == mask_image
+            timeline_region = next(
+                region for region in timeline_area.regions if region.type == "WINDOW"
+            )
+            with bpy.context.temp_override(
+                window=bpy.context.window,
+                screen=bpy.context.window.screen,
+                area=timeline_area,
+                region=timeline_region,
+            ):
+                assert not timeline.QSDF_GGT_timeline.poll(bpy.context)
+            seek_before = float(project.seek_angle)
+            assert bpy.ops.quicksdf.seek_set(angle=61.0) == {"FINISHED"}
+            assert float(project.seek_angle) == seek_before
+            assert bpy.context.scene.tool_settings.image_paint.canvas == mask_image
+
+            assert bpy.ops.quicksdf.aux_mask_fill(
+                mask_uuid=str(mask_item.uuid), value=0.0
+            ) == {"FINISHED"}
+            assert not np.any(runtime.image_channel_u16(mask_image))
+            assert int(mask_item.revision) > mask_revision
+            assert int(project.packing_revision) > packing_revision
+            changed_revision = int(mask_item.revision)
+            assert bpy.ops.quicksdf.history_undo() == {"FINISHED"}
+            np.testing.assert_array_equal(runtime.image_rgba8(mask_image), mask_before)
+            assert int(mask_item.revision) > changed_revision
+            undo_revision = int(mask_item.revision)
+            assert bpy.ops.quicksdf.history_redo() == {"FINISHED"}
+            assert not np.any(runtime.image_channel_u16(mask_image))
+            assert int(mask_item.revision) > undo_revision
+            assert bpy.ops.quicksdf.history_undo() == {"FINISHED"}
+            np.testing.assert_array_equal(runtime.image_rgba8(mask_image), mask_before)
+
+            assert bpy.ops.quicksdf.aux_mask_back() == {"FINISHED"}
+            session = studio.current_session()
+            assert not session.editing_aux_mask_uuid
+            assert session.view_mode == "EDIT"
+            assert str(project.preview_mode) == preview_mode
+            assert bpy.context.scene.tool_settings.image_paint.canvas == angle_canvas
+            assert image_area.spaces.active.image == angle_canvas
+            assert obj.material_slots[0].material.node_tree.nodes["QSDF Mask"].image == angle_canvas
+            STATE["aux_masks_verified"] = True
         assert obj.mode == "TEXTURE_PAINT"
         assert abs(
             float(runtime.active_angle(project).angle)
