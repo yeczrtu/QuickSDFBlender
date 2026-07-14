@@ -16,6 +16,26 @@ if (-not $OutputDirectory) {
 }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
+function Get-QuickSdfStage {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return 'startup'
+    }
+    try {
+        # The Blender probe replaces this tiny file while the sampler is
+        # running.  A read can therefore observe the truncate/write gap.
+        $value = [string](Get-Content -Raw -LiteralPath $Path -ErrorAction Stop)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            return 'startup'
+        }
+        return $value.Trim()
+    }
+    catch {
+        return 'startup'
+    }
+}
+
 $cases = if ($FullMatrix) {
     foreach ($resolution in 512, 1024, 2048, 4096) {
         foreach ($keys in 8, 16, 32) {
@@ -58,7 +78,7 @@ foreach ($case in $cases) {
             $process.Refresh()
             $samples.Add([pscustomobject]@{
                 elapsed_ms = [math]::Round(([DateTimeOffset]::UtcNow - $started).TotalMilliseconds, 3)
-                stage = if (Test-Path -LiteralPath $stageOutput) { (Get-Content -Raw -LiteralPath $stageOutput).Trim() } else { 'startup' }
+                stage = Get-QuickSdfStage -Path $stageOutput
                 working_set_bytes = [int64]$process.WorkingSet64
                 private_bytes = [int64]$process.PrivateMemorySize64
                 peak_working_set_bytes = [int64]$process.PeakWorkingSet64
