@@ -2033,6 +2033,20 @@ def _watched_source_ids(project: Any) -> set[Any]:
     return result
 
 
+def _queue_base_signature_check(project: Any, scene: bpy.types.Scene) -> None:
+    """Debounce ambiguous mode/paint geometry tags into one exact check."""
+
+    uuid_value = str(getattr(project, "uuid", ""))
+    if not uuid_value:
+        return
+    _PENDING_BASE_SIGNATURES.add(uuid_value)
+    if bpy.app.background:
+        refresh_base_staleness(project, scene)
+        _PENDING_BASE_SIGNATURES.discard(uuid_value)
+    elif not bpy.app.timers.is_registered(_deferred_base_check):
+        bpy.app.timers.register(_deferred_base_check, first_interval=0.05)
+
+
 @persistent
 def _depsgraph_base_update(scene: bpy.types.Scene, depsgraph: Any) -> None:
     updates = tuple(getattr(depsgraph, "updates", ()))
@@ -2052,11 +2066,13 @@ def _depsgraph_base_update(scene: bpy.types.Scene, depsgraph: Any) -> None:
             identifier = getattr(identifier, "original", identifier)
             geometry = bool(getattr(update, "is_updated_geometry", False))
             transform = bool(getattr(update, "is_updated_transform", False))
-            if identifier is data or identifier is shape_keys:
-                project.base_needs_update = True
+            # Material/paint/canvas changes also report the Mesh ID, but do
+            # not change the evaluated normals used by the guide.
+            if (identifier is data or identifier is shape_keys) and geometry:
+                _queue_base_signature_check(project, scene)
                 break
             if identifier is obj and geometry:
-                project.base_needs_update = True
+                _queue_base_signature_check(project, scene)
                 break
             if identifier in modifier_ids and (geometry or transform):
                 project.base_needs_update = True
