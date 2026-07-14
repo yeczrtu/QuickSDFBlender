@@ -47,7 +47,6 @@ def run(blend_path: Path) -> None:
     ]
     assert projects
     for project in projects:
-        assert not project.author_active
         assert not project.job_running
         assert not project.preview_enabled
         assert not project.material_override_active

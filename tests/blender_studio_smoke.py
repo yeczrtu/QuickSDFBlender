@@ -468,7 +468,7 @@ def check() -> float | None:
         assert not session.projection_hint
         project.paint_value = 0
         assert not project.base_needs_update
-        canvas = runtime.resolve_angle_image(
+        canvas = runtime.resolve_display_image(
             project, runtime.active_angle(project)
         )
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas

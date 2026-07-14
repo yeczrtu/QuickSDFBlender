@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import hashlib
+import math
 from pathlib import Path
 import struct
 import sys
@@ -28,6 +29,7 @@ import numpy as np  # noqa: E402
 
 import quick_sdf_blender  # noqa: E402
 from quick_sdf_blender import runtime, studio  # noqa: E402
+from quick_sdf_blender.model import DEFAULT_ANGLES, SCHEMA_VERSION  # noqa: E402
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -118,7 +120,7 @@ def _decode_rgba16(path: Path) -> tuple[dict[str, int], np.ndarray]:
 
 def _assert_canvas(project: object) -> None:
     angle_item = project.angles[int(project.active_angle_index)]
-    image = runtime.resolve_angle_image(project, angle_item)
+    image = runtime.resolve_display_image(project, angle_item)
     assert image is not None
     assert bpy.context.scene.tool_settings.image_paint.canvas == image
     assert image.get(runtime.PROJECT_UUID_KEY) == project.uuid
@@ -215,15 +217,24 @@ def run(output_directory: Path) -> None:
     project = scene.quick_sdf_projects[0]
     assert project.target_object == cube
     assert project.resolution == 512
-    assert project.schema_version == 3
+    assert project.schema_version == SCHEMA_VERSION == 4
     assert project.base_source == "NORMAL_GUIDE"
-    assert project.guide_version == 1
-    assert len(project.angles) == 7
-    assert [round(item.angle) for item in project.angles] == list(range(0, 91, 15))
+    assert project.guide_version == 2
+    assert len(project.angles) == 8
+    np.testing.assert_allclose(
+        [float(item.angle) for item in project.angles],
+        DEFAULT_ANGLES,
+        rtol=0.0,
+        atol=1.0e-5,
+    )
     assert {item.side for item in project.angles} == {"RIGHT"}
-    assert not project.author_active
     assert not project.base_needs_update
-    assert project.angles[project.active_angle_index].angle == 45.0
+    expected_active = min(DEFAULT_ANGLES, key=lambda value: abs(value - 45.0))
+    assert math.isclose(
+        float(project.angles[project.active_angle_index].angle),
+        expected_active,
+        abs_tol=1.0e-5,
+    )
     original_base_signature = project.base_signature
     assert original_base_signature
     cube.data.vertices[0].co.x += 0.01
@@ -274,12 +285,12 @@ def run(output_directory: Path) -> None:
     # Pick a semantic/range guaranteed to change the sampled pixel while
     # preserving closure: Shadow at 90 reaches every key when the pixel is
     # currently Light; Light at 0 reaches every key otherwise.
-    front = runtime.resolve_angle_image(project, project.angles[0])
+    front = runtime.resolve_display_image(project, project.angles[0])
     current_light = bool(runtime.image_mask(front)[256, 256])
     selected_index = 6 if current_light else 0
     project.paint_value = 0 if current_light else 1
     _expect_finished(bpy.ops.quicksdf.key_select(index=selected_index), "key_select")
-    source_image = runtime.resolve_angle_image(project, project.angles[project.active_angle_index])
+    source_image = runtime.resolve_display_image(project, project.angles[project.active_angle_index])
     assert source_image is not None
     source_mask = runtime.image_mask(source_image)
     source_before = runtime.image_rgba(source_image)
@@ -340,27 +351,27 @@ def run(output_directory: Path) -> None:
     _expect_finished(bpy.ops.quicksdf.history_undo(), "history_undo")
     _expect_finished(bpy.ops.quicksdf.history_redo(), "history_redo")
 
-    print("[Quick SDF smoke] roll back a partial legacy Smart Paint collection")
-    # Reproduce a compatibility-path failure after an earlier key has already
+    print("[Quick SDF smoke] roll back a partial Smart Paint collection")
+    # Reproduce a propagation failure after an earlier key has already
     # populated ``before_history`` but before the active (90 degree) canvas is
     # captured. A cancelled propagation must still remove the native stroke.
-    _expect_finished(bpy.ops.quicksdf.key_select(index=6), "key_select legacy rollback")
-    legacy_source = runtime.resolve_display_image(project, project.angles[6])
+    _expect_finished(bpy.ops.quicksdf.key_select(index=6), "key_select propagation rollback")
+    propagation_source = runtime.resolve_display_image(project, project.angles[6])
     fail_display = runtime.resolve_display_image(project, project.angles[1])
-    assert legacy_source is not None and fail_display is not None
-    legacy_original = runtime.image_rgba(legacy_source)
-    legacy_region = np.zeros(runtime.image_mask(legacy_source).shape, dtype=np.bool_)
-    legacy_region[200:202, 200:202] = True
-    legacy_light = runtime.image_rgba(legacy_source)
-    legacy_light[..., :3][legacy_region] = 1.0
-    legacy_light[..., 3] = 1.0
-    runtime.write_image_rgba(legacy_source, legacy_light)
+    assert propagation_source is not None and fail_display is not None
+    propagation_original = runtime.image_rgba(propagation_source)
+    propagation_region = np.zeros(runtime.image_mask(propagation_source).shape, dtype=np.bool_)
+    propagation_region[200:202, 200:202] = True
+    propagation_light = runtime.image_rgba(propagation_source)
+    propagation_light[..., :3][propagation_region] = 1.0
+    propagation_light[..., 3] = 1.0
+    runtime.write_image_rgba(propagation_source, propagation_light)
     runtime.capture_paint_snapshot(project)
-    legacy_snapshot = runtime.image_rgba(legacy_source)
-    legacy_shadow = legacy_snapshot.copy()
-    legacy_shadow[..., :3][legacy_region] = 0.0
-    runtime.write_image_rgba(legacy_source, legacy_shadow)
-    assert np.any(runtime.image_rgba(legacy_source) != legacy_snapshot)
+    propagation_snapshot = runtime.image_rgba(propagation_source)
+    propagation_shadow = propagation_snapshot.copy()
+    propagation_shadow[..., :3][propagation_region] = 0.0
+    runtime.write_image_rgba(propagation_source, propagation_shadow)
+    assert np.any(runtime.image_rgba(propagation_source) != propagation_snapshot)
 
     original_image_rgba8 = runtime.image_rgba8
     failure_injected = False
@@ -369,23 +380,25 @@ def run(output_directory: Path) -> None:
         nonlocal failure_injected
         if image == fail_display:
             failure_injected = True
-            raise RuntimeError("simulated legacy pre-active collection failure")
+            raise RuntimeError("simulated pre-active collection failure")
         return original_image_rgba8(image)
 
     runtime.image_rgba8 = fail_before_active_collection
     try:
         try:
-            failed_legacy_result = bpy.ops.quicksdf.propagate_overrides()
+            failed_propagation_result = bpy.ops.quicksdf.propagate_overrides()
         except RuntimeError as exc:
-            assert "simulated legacy pre-active collection failure" in str(exc)
+            assert "simulated pre-active collection failure" in str(exc)
         else:
-            assert failed_legacy_result == {"CANCELLED"}, failed_legacy_result
+            assert failed_propagation_result == {"CANCELLED"}, failed_propagation_result
     finally:
         runtime.image_rgba8 = original_image_rgba8
     assert failure_injected
     assert not runtime.has_paint_snapshot(project)
-    np.testing.assert_array_equal(runtime.image_rgba(legacy_source), legacy_snapshot)
-    runtime.write_image_rgba(legacy_source, legacy_original)
+    np.testing.assert_array_equal(
+        runtime.image_rgba(propagation_source), propagation_snapshot
+    )
+    runtime.write_image_rgba(propagation_source, propagation_original)
 
     print("[Quick SDF smoke] rebake guide preserves painted RGB and coverage")
     painted_before = {
@@ -476,7 +489,7 @@ def run(output_directory: Path) -> None:
     from quick_sdf_blender.symmetry import mirror_side_stack
 
     test_y, test_x = 100, 100
-    invalid_values = (True, False, True, True, True, True, True)
+    invalid_values = (True, False, True, True, True, True, True, True)
     original_pixels = {}
     for item, value in zip(project.angles, invalid_values):
         display = runtime.resolve_display_image(project, item)
@@ -564,7 +577,7 @@ def run(output_directory: Path) -> None:
 
     print("[Quick SDF smoke] preserve successful derived state on I/O failure")
     second_y, second_x = 101, 101
-    second_values = (False, True, False, True, True, True, True)
+    second_values = (False, True, False, True, True, True, True, True)
     for item, value in zip(project.angles, second_values):
         display = runtime.resolve_display_image(project, item)
         coverage = runtime.resolve_coverage_image(project, item)
@@ -669,11 +682,10 @@ def run(output_directory: Path) -> None:
     assert tuple(item.display_image_name for item in project.angles) == angle_names
     assert tuple(item.base_image_name for item in project.angles) == base_names
     assert tuple(item.coverage_image_name for item in project.angles) == coverage_names
-    assert not project.author_active
     assert studio.current_session() is None
     for index, angle_item in enumerate(project.angles):
-        image = runtime.resolve_angle_image(project, angle_item)
-        assert image is not None and angle_item.image == image
+        image = runtime.resolve_display_image(project, angle_item)
+        assert image is not None and angle_item.display_image == image
         assert image.get(runtime.PROJECT_UUID_KEY) == project_uuid
         assert image.get(runtime.ANGLE_UUID_KEY) == angle_item.uuid
         base = runtime.resolve_base_image(project, angle_item)

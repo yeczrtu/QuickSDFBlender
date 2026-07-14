@@ -138,11 +138,6 @@ class QSDFAngle(PropertyGroup):
     uuid: StringProperty(name="UUID", default="")
     angle: FloatProperty(name="Angle", default=0.0, min=-90.0, max=90.0)
     side: EnumProperty(name="Side", items=SIDE_ITEMS, default="RIGHT")
-    # ``image``/``image_name`` are retained through schema v2 so Blender can
-    # deserialize v1 PointerProperties.  Runtime treats them as deprecated
-    # aliases of ``display_image``.
-    image: PointerProperty(name="Mask Image", type=bpy.types.Image)
-    image_name: StringProperty(name="Image Name", default="")
     display_image: PointerProperty(name="Display Image", type=bpy.types.Image)
     display_image_name: StringProperty(name="Display Image Name", default="")
     base_image: PointerProperty(name="Base Mask", type=bpy.types.Image)
@@ -158,7 +153,12 @@ class QSDFAngle(PropertyGroup):
 
 class QSDFProject(PropertyGroup):
     uuid: StringProperty(name="UUID", default="")
-    schema_version: IntProperty(name="Schema Version", default=SCHEMA_VERSION, min=1)
+    schema_version: IntProperty(
+        name="Schema Version",
+        default=SCHEMA_VERSION,
+        min=SCHEMA_VERSION,
+        max=SCHEMA_VERSION,
+    )
     name: StringProperty(name="Name", default="Quick SDF")
 
     target_object: PointerProperty(name="Object", type=bpy.types.Object)
@@ -195,17 +195,6 @@ class QSDFProject(PropertyGroup):
     boundary_tracks: CollectionProperty(type=QSDFBoundaryTrack)
     active_boundary_track_index: IntProperty(name="Active Boundary", default=-1, min=-1)
 
-    # Deprecated compatibility fields.  Studio execution state is transient
-    # and must never be inferred from these values.  SKIP_SAVE prevents new
-    # files from recreating the stale "Stop Authoring" state.
-    author_active: BoolProperty(
-        name="Authoring (Legacy)", default=False, options={"HIDDEN", "SKIP_SAVE"}
-    )
-    previous_image_paint_mode: StringProperty(
-        name="Previous Paint Mode (Legacy)",
-        default="MATERIAL",
-        options={"HIDDEN", "SKIP_SAVE"},
-    )
     author_tool: EnumProperty(
         name="Author Tool",
         items=(("BOUNDARY", "Boundary", "Edit boundary curves"), ("PAINT", "Paint", "Paint local corrections")),
@@ -384,8 +373,3 @@ def unregister_properties() -> None:
     ):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
-
-
-# Backward-compatible names for early development builds.
-register_runtime = register_properties
-unregister_runtime = unregister_properties

@@ -264,7 +264,7 @@ def _bake_project(context, project) -> None:
         project.base_needs_update = False
         project.base_signature = runtime.compute_base_signature(project, context.scene)
         project.base_source = "NORMAL_GUIDE"
-        project.guide_version = 1
+        project.guide_version = 2
         project.guide_direction_warning = guide_warning
         project.guide_direction_message = guide_message
         project.dirty = True
@@ -307,7 +307,7 @@ def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True
         "EXISTING": "IMPORTED",
         "WHITE": "WHITE",
     }.get(str(settings.initialization), "NORMAL_GUIDE")
-    project.guide_version = 1 if project.base_source == "NORMAL_GUIDE" else 0
+    project.guide_version = 2 if project.base_source == "NORMAL_GUIDE" else 0
     project.guide_shadow_amount = 50.0
     try:
         source = settings.source_image if settings.initialization == "EXISTING" else None
@@ -352,7 +352,7 @@ def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True
 class QUICKSDF_OT_project_create(bpy.types.Operator):
     bl_idname = "quicksdf.project_create"
     bl_label = "Create Quick SDF Project"
-    bl_description = "Create seven paint-ready face-shadow keys from the evaluated pose"
+    bl_description = "Create eight paint-ready face-shadow keys from the evaluated pose"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -365,7 +365,7 @@ class QUICKSDF_OT_project_create(bpy.types.Operator):
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        self.report({"INFO"}, "Created and auto-baked seven face-shadow keys")
+        self.report({"INFO"}, "Created and auto-baked eight face-shadow keys")
         return {"FINISHED"}
 
 
@@ -415,17 +415,6 @@ class QUICKSDF_OT_project_remove(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class QUICKSDF_OT_project_delete(bpy.types.Operator):
-    """Script-facing alias retained for the original implementation contract."""
-
-    bl_idname = "quicksdf.project_delete"
-    bl_label = "Delete Quick SDF Project"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, _context):
-        return bpy.ops.quicksdf.project_remove()
-
-
 class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
     bl_idname = "quicksdf.set_forward_from_view"
     bl_label = "Set Forward from View"
@@ -437,7 +426,9 @@ class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
         return runtime.active_project(context.scene) is not None and context.region_data is not None
 
     def execute(self, context):
-        project = _project(context)
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
         obj = project.target_object
         if obj is None or context.region_data is None:
             return {"CANCELLED"}
@@ -454,25 +445,6 @@ class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
             return {"CANCELLED"}
         project.dirty = True
         return {"FINISHED"}
-
-
-class QUICKSDF_OT_author_start(bpy.types.Operator):
-    bl_idname = "quicksdf.author_start"
-    bl_label = "Open Quick SDF Studio"
-    bl_description = "Compatibility alias for Quick SDF Studio"
-    bl_options = {"INTERNAL"}
-
-    def execute(self, context):
-        return bpy.ops.quicksdf.studio_enter()
-
-
-class QUICKSDF_OT_author_stop(bpy.types.Operator):
-    bl_idname = "quicksdf.author_stop"
-    bl_label = "Exit Quick SDF"
-    bl_options = {"INTERNAL"}
-
-    def execute(self, context):
-        return bpy.ops.quicksdf.studio_exit()
 
 
 class QUICKSDF_OT_create_and_edit(bpy.types.Operator):
@@ -569,38 +541,6 @@ class QUICKSDF_OT_bake_base(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         self.report({"INFO"}, "Base updated; painted corrections were preserved")
-        return {"FINISHED"}
-
-
-class QUICKSDF_OT_create_workspace(bpy.types.Operator):
-    bl_idname = "quicksdf.create_workspace"
-    bl_label = "Create Author Workspace"
-    bl_description = "Duplicate the current workspace and add a synchronized Image Editor"
-
-    def execute(self, context):
-        if context.window is None or bpy.app.background:
-            self.report({"WARNING"}, "Workspace creation requires an interactive Blender window")
-            return {"CANCELLED"}
-        project = _require_project(self, context)
-        if project is None:
-            return {"CANCELLED"}
-        workspace_name = f"Quick SDF - {project.name}"
-        existing = bpy.data.workspaces.get(workspace_name)
-        if existing is not None:
-            context.window.workspace = existing
-        else:
-            try:
-                bpy.ops.workspace.duplicate()
-            except RuntimeError as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
-            context.window.workspace.name = workspace_name
-        screen = context.window.screen
-        if screen and not any(area.type == "IMAGE_EDITOR" for area in screen.areas):
-            candidates = [area for area in screen.areas if area.type != "VIEW_3D"]
-            if candidates:
-                max(candidates, key=lambda area: area.width * area.height).type = "IMAGE_EDITOR"
-        runtime.sync_canvas(context, project)
         return {"FINISHED"}
 
 
@@ -733,8 +673,6 @@ class QUICKSDF_OT_back_to_paint(bpy.types.Operator):
 def _assign_angle_layers(project, item, display, base, coverage) -> None:
     item.display_image = display
     item.display_image_name = display.name
-    item.image = display
-    item.image_name = display.name
     item.base_image = base
     item.base_image_name = base.name
     item.coverage_image = coverage
@@ -1242,90 +1180,6 @@ def _symmetry_island_pairs(project, shape):
     return pairs
 
 
-class QUICKSDF_OT_apply_symmetry(bpy.types.Operator):
-    bl_idname = "quicksdf.apply_symmetry"
-    bl_label = "Apply Symmetry"
-    bl_description = "Generate negative-angle base masks from positive-angle masks while preserving paint overrides"
-    bl_options = {"REGISTER", "UNDO"}
-
-    force: BoolProperty(name="Confirm Low Confidence", default=False, options={"HIDDEN"})
-
-    def invoke(self, context, event):
-        project = _project(context)
-        if project is not None and project.symmetry_mode == "AUTO" and not self.force:
-            self.force = True
-            return context.window_manager.invoke_confirm(self, event)
-        return self.execute(context)
-
-    def execute(self, context):
-        import numpy as np
-
-        project = _require_project(self, context)
-        if project is None:
-            return {"CANCELLED"}
-        clear_histories(str(project.uuid))
-        from .core import validate_monotonic
-        from .symmetry import SymmetryMode, analyze_symmetry, apply_symmetry_to_stack
-
-        mode_name = str(project.symmetry_mode)
-        if mode_name == "INDEPENDENT":
-            self.report({"INFO"}, "Independent mode does not generate mirrored masks")
-            return {"CANCELLED"}
-        mode_map = {
-            "OVERLAPPED_UV": SymmetryMode.OVERLAPPED,
-            "TEXTURE_MIRROR": SymmetryMode.TEXTURE_MIRROR,
-            "ISLAND_PAIR": SymmetryMode.ISLAND_PAIR,
-            "AUTO": SymmetryMode.AUTO,
-        }
-        try:
-            masks, angles = runtime.project_mask_stack(project)
-            pairs = _symmetry_island_pairs(project, masks.shape[1:]) if mode_name in {"ISLAND_PAIR", "AUTO"} else []
-            if mode_name == "AUTO":
-                positive = np.logical_or.reduce(masks[angles > 0.0])
-                negative = np.logical_or.reduce(masks[angles < 0.0])
-                analysis = analyze_symmetry(positive, negative)
-                project.symmetry_confidence = analysis.confidence
-                if analysis.requires_confirmation and not self.force:
-                    project.warning_message = (
-                        f"Auto symmetry confidence is {analysis.confidence:.0%}; review the generated side."
-                    )
-                    raise ValueError(project.warning_message)
-            generated = apply_symmetry_to_stack(
-                masks, angles, mode_map[mode_name], island_pairs=pairs or None
-            )
-            staged = []
-            final_masks = masks.copy()
-            for index, angle in enumerate(angles):
-                if angle >= 0.0:
-                    continue
-                image = runtime.resolve_angle_image(project, project.angles[index])
-                rgba = runtime.image_rgba(image)
-                generated_region = rgba[..., 3] <= 0.5
-                values = generated[index].astype(np.float32)
-                for channel in range(3):
-                    rgba[..., channel][generated_region] = values[generated_region]
-                final_masks[index] = rgba[..., 0] >= 0.5
-                staged.append((index, image, rgba))
-            report = validate_monotonic(final_masks, angles)
-            project.has_violations = not report.is_valid
-            if not report.is_valid:
-                raise ValueError(
-                    f"Mirrored result has {report.violation_pixel_count} monotonic violation pixels"
-                )
-            for index, image, rgba in staged:
-                image.pixels.foreach_set(np.flip(rgba, axis=0).ravel())
-                image.update()
-                project.angles[index].is_generated = True
-                project.angles[index].dirty = True
-            project.dirty = True
-            runtime.sync_canvas(context, project)
-        except (RuntimeError, ValueError) as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        self.report({"INFO"}, f"Applied {mode_name.replace('_', ' ').title()} symmetry")
-        return {"FINISHED"}
-
-
 class QUICKSDF_OT_clear_overrides(bpy.types.Operator):
     bl_idname = "quicksdf.clear_overrides"
     bl_label = "Clear Paint Overrides"
@@ -1355,11 +1209,11 @@ class QUICKSDF_OT_clear_overrides(bpy.types.Operator):
         snapshots = {}
         if project.boundary_tracks:
             for angle_item in project.angles:
-                image = runtime.resolve_angle_image(project, angle_item)
+                image = runtime.resolve_display_image(project, angle_item)
                 if image is not None:
                     snapshots[image.name] = runtime.image_rgba(image)
         for index in indices:
-            image = runtime.resolve_angle_image(project, project.angles[int(index)])
+            image = runtime.resolve_display_image(project, project.angles[int(index)])
             if image is not None:
                 runtime.clear_image_alpha(image)
         try:
@@ -2109,7 +1963,7 @@ def _compute_threshold_rgba(inputs, cancel_flag=None):
     try:
         from . import native
 
-        if native.available() and native.version() >= 2:
+        if native.available() and native.version() >= 5:
             channels = native.generate_threshold_pair(
                 right, right_angles, left, left_angles, cancel_flag=cancel_flag
             )
@@ -2636,7 +2490,7 @@ def _write_mask_png(path: Path, mask, overwrite: bool) -> None:
 class QUICKSDF_OT_export_mask_sequence(bpy.types.Operator):
     bl_idname = "quicksdf.export_mask_sequence"
     bl_label = "Export Review Masks"
-    bl_description = "Export the 13 binary authoring masks as 8-bit grayscale PNG files"
+    bl_description = "Export the binary authoring masks as 8-bit grayscale PNG files"
 
     directory: StringProperty(name="Directory", subtype="DIR_PATH", default="")
 
@@ -2662,15 +2516,11 @@ class QUICKSDF_OT_export_mask_sequence(bpy.types.Operator):
 CLASSES = (
     QUICKSDF_OT_project_create,
     QUICKSDF_OT_project_remove,
-    QUICKSDF_OT_project_delete,
     QUICKSDF_OT_set_forward_from_view,
-    QUICKSDF_OT_author_start,
-    QUICKSDF_OT_author_stop,
     QUICKSDF_OT_create_and_edit,
     QUICKSDF_OT_studio_enter,
     QUICKSDF_OT_studio_exit,
     QUICKSDF_OT_bake_base,
-    QUICKSDF_OT_create_workspace,
     QUICKSDF_OT_angle_set,
     QUICKSDF_OT_angle_step,
     QUICKSDF_OT_key_select,
@@ -2688,7 +2538,6 @@ CLASSES = (
     QUICKSDF_OT_symmetry_choose,
     QUICKSDF_OT_break_mirror,
     QUICKSDF_OT_mirror_toggle,
-    QUICKSDF_OT_apply_symmetry,
     QUICKSDF_OT_clear_overrides,
     QUICKSDF_OT_propagate_overrides,
     QUICKSDF_OT_paint_snapshot,

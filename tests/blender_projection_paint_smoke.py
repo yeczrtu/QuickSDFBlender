@@ -138,7 +138,7 @@ def _paint() -> float | None:
 
         project.preview_mode = "MASK"
         project.paint_value = 0  # Shadow over the all-white initialization.
-        canvas = runtime.resolve_angle_image(project, runtime.active_angle(project))
+        canvas = runtime.resolve_display_image(project, runtime.active_angle(project))
         coverage = runtime.resolve_coverage_image(project, runtime.active_angle(project))
         assert canvas is not None and coverage is not None
         runtime.sync_canvas(bpy.context, project)

@@ -147,12 +147,6 @@ class QSDF_PT_launcher(bpy.types.Panel):
                 warning = layout.box()
                 warning.label(text="Base needs update", icon="ERROR")
                 warning.operator("quicksdf.bake_base", text="Rebake Base", icon="FILE_REFRESH")
-            if str(getattr(project, "base_source", "LEGACY")) == "LEGACY":
-                guide = layout.box()
-                guide.label(text="Start with a shadow guide from the model", icon="LIGHT_SUN")
-                guide.operator(
-                    "quicksdf.bake_base", text="Create Normal Shadow Guide", icon="SHADING_RENDERED"
-                )
             if bool(getattr(project, "guide_direction_warning", False)):
                 direction = layout.box()
                 direction.alert = True
@@ -170,12 +164,6 @@ class QSDF_PT_launcher(bpy.types.Panel):
             button = layout.column()
             button.scale_y = 1.7
             button.operator("quicksdf.studio_enter", text="Open Quick SDF Studio", icon="WORKSPACE")
-            if str(getattr(project, "base_source", "LEGACY")) == "LEGACY":
-                guide = layout.box()
-                guide.label(text="Start with a shadow guide from the model", icon="LIGHT_SUN")
-                guide.operator(
-                    "quicksdf.bake_base", text="Create Normal Shadow Guide", icon="SHADING_RENDERED"
-                )
             _mirror_confirmation(layout, project)
 
 

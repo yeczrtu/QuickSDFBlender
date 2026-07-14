@@ -98,16 +98,14 @@ def _project_for_context(context: Any) -> Any | None:
 
 
 def _image_for_key(project: Any, item: Any) -> Any | None:
-    for name in ("display_image", "image"):
-        image = getattr(item, name, None)
+    image = getattr(item, "display_image", None)
+    if image is not None:
+        return image
+    image_name = str(getattr(item, "display_image_name", ""))
+    if image_name:
+        image = bpy.data.images.get(image_name)
         if image is not None:
             return image
-    for name in ("display_image_name", "image_name"):
-        image_name = str(getattr(item, name, ""))
-        if image_name:
-            image = bpy.data.images.get(image_name)
-            if image is not None:
-                return image
     return None
 
 

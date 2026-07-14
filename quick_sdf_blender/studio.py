@@ -1162,9 +1162,10 @@ def _continue_enter() -> float | None:
                 project.seek_angle = session.paint_key_angle
                 project.review_angle = _side_signed_angle(project, active_item)
             session.show_first_stroke_hint = not bool(getattr(project, "first_stroke_complete", False))
-            if str(getattr(project, "base_source", "LEGACY")) == "NORMAL_GUIDE":
+            if str(getattr(project, "base_source", "NORMAL_GUIDE")) == "NORMAL_GUIDE":
                 session.first_hint_text = (
-                    "A normal-based shadow guide is ready. Paint only the areas you want to adjust."
+                    "A light-sweep guide from rear oblique to full light is ready. "
+                    "Paint only the areas you want to adjust."
                 )
             else:
                 session.first_hint_text = "Choose an angle · choose Light or Shadow · paint"
@@ -1326,8 +1327,9 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
         session.export_review_active = False
         session.show_first_stroke_hint = not bool(getattr(project, "first_stroke_complete", False))
         session.first_hint_text = (
-            "A normal-based shadow guide is ready. Paint only the areas you want to adjust."
-            if str(getattr(project, "base_source", "LEGACY")) == "NORMAL_GUIDE"
+            "A light-sweep guide from rear oblique to full light is ready. "
+            "Paint only the areas you want to adjust."
+            if str(getattr(project, "base_source", "NORMAL_GUIDE")) == "NORMAL_GUIDE"
             else "Choose an angle · choose Light or Shadow · paint"
         )
         _configure_session_target(context, session, project, frame_content=True)
@@ -1647,10 +1649,10 @@ def _save_post(_unused: Any) -> None:
             scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
             if window is not None and scene is not None:
                 _apply_projection_settings(scene, _SESSION, window, getattr(project, "target_object", None))
-            from .runtime import active_angle, resolve_angle_image
+            from .runtime import active_angle, resolve_display_image
 
             item = active_angle(project)
-            image = resolve_angle_image(project, item) if item else None
+            image = resolve_display_image(project, item) if item else None
             _assign_preview(project, image)
             if _SESSION.view_mode == "PREVIEW":
                 from .live_preview import update_seek_preview

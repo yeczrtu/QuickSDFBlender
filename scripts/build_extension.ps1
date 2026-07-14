@@ -10,7 +10,7 @@ $buildDirectory = Join-Path $repositoryRoot 'build'
 $nativeBuild = Join-Path $repositoryRoot 'native\build.ps1'
 $smokeTest = Join-Path $repositoryRoot 'tests\blender_smoke.py'
 $previewRenderSmokeTest = Join-Path $repositoryRoot 'tests\blender_preview_render_probe.py'
-$migrationSmokeTest = Join-Path $repositoryRoot 'tests\blender_migration_smoke.py'
+$schemaSmokeTest = Join-Path $repositoryRoot 'tests\blender_schema4_smoke.py'
 $studioSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_smoke.py'
 $studioSwitchSmokeTest = Join-Path $repositoryRoot 'tests\blender_studio_switch_smoke.py'
 $projectionPaintSmokeTest = Join-Path $repositoryRoot 'tests\blender_projection_paint_smoke.py'
@@ -80,11 +80,11 @@ try {
         throw "Blender preview render smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 5/13 Verify schema v1/v2 to v3 save/reload migration'
+    Write-Host '==> 5/13 Verify schema-4 save/reload persistence'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
-        --python $migrationSmokeTest
+        --python $schemaSmokeTest
     if ($LASTEXITCODE -ne 0) {
-        throw "Blender migration smoke test failed with exit code $LASTEXITCODE"
+        throw "Blender schema-4 smoke test failed with exit code $LASTEXITCODE"
     }
 
     Write-Host '==> 6/13 Run Blender 5.1 interactive Studio lifecycle smoke test'

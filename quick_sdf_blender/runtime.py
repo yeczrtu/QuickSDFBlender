@@ -14,19 +14,15 @@ import bpy
 from bpy.app.handlers import persistent
 
 from .model import DEFAULT_ANGLES, SCHEMA_VERSION
-from .migration import is_project_supported, unsupported_project_message
 
 
 PROJECT_UUID_KEY = "quick_sdf_project_uuid"
 ANGLE_UUID_KEY = "quick_sdf_angle_uuid"
 ROLE_KEY = "quick_sdf_role"
 IMAGE_REVISION_KEY = "quick_sdf_revision"
-LEGACY_MASK_ROLE = "angle_mask"
 DISPLAY_ROLE = "angle_display"
 BASE_ROLE = "angle_base"
 COVERAGE_ROLE = "angle_coverage"
-# Backward-compatible public name.  New images use DISPLAY_ROLE.
-MASK_ROLE = DISPLAY_ROLE
 THRESHOLD_ROLE = "threshold_preview"
 EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
 PALETTE_NAME = "Quick SDF Light Shadow"
@@ -82,8 +78,6 @@ def compute_base_signature(project: Any, scene: bpy.types.Scene | None = None) -
 
 
 def refresh_base_staleness(project: Any, scene: bpy.types.Scene | None = None) -> bool:
-    if not is_project_supported(project):
-        return False
     previous = str(getattr(project, "base_signature", ""))
     current = compute_base_signature(project, scene)
     stale = bool(previous and current and previous != current)
@@ -118,29 +112,20 @@ _LAYER_FIELDS = {
 }
 
 
-def _image_matches_role(image: bpy.types.Image, role: str, *, allow_legacy: bool) -> bool:
-    actual = str(image.get(ROLE_KEY, ""))
-    if actual == role:
-        return True
-    return role == DISPLAY_ROLE and allow_legacy and actual in {"", LEGACY_MASK_ROLE}
+def _image_matches_role(image: bpy.types.Image, role: str) -> bool:
+    return str(image.get(ROLE_KEY, "")) == role
 
 
 def resolve_angle_data_image(
     project: Any,
     angle_item: Any,
     role: str,
-    *,
-    allow_legacy: bool = False,
 ) -> bpy.types.Image | None:
     """Resolve one angle layer without confusing same-UUID sibling images."""
 
     if role not in _LAYER_FIELDS:
         raise ValueError(f"Unknown angle image role: {role!r}")
     pointer_name, string_name = _LAYER_FIELDS[role]
-    if not is_project_supported(project):
-        # Reading a direct pointer is safe, but repairing an old pointer or
-        # image-name field would mutate an unsupported project on load.
-        return getattr(angle_item, pointer_name, None)
     candidates: list[bpy.types.Image] = []
     pointer = getattr(angle_item, pointer_name, None)
     if pointer is not None:
@@ -149,19 +134,11 @@ def resolve_angle_data_image(
     named = bpy.data.images.get(stored_name) if stored_name else None
     if named is not None and named not in candidates:
         candidates.append(named)
-    if role == DISPLAY_ROLE and allow_legacy:
-        legacy_pointer = getattr(angle_item, "image", None)
-        if legacy_pointer is not None and legacy_pointer not in candidates:
-            candidates.append(legacy_pointer)
-        legacy_name = str(getattr(angle_item, "image_name", ""))
-        named = bpy.data.images.get(legacy_name) if legacy_name else None
-        if named is not None and named not in candidates:
-            candidates.append(named)
     candidate = next(
         (
             image
             for image in candidates
-            if _image_matches_role(image, role, allow_legacy=allow_legacy)
+            if _image_matches_role(image, role)
         ),
         None,
     )
@@ -170,25 +147,18 @@ def resolve_angle_data_image(
             if (
                 image.get(PROJECT_UUID_KEY) == project.uuid
                 and image.get(ANGLE_UUID_KEY) == angle_item.uuid
-                and _image_matches_role(image, role, allow_legacy=allow_legacy)
+                and _image_matches_role(image, role)
             ):
                 candidate = image
                 break
     if candidate is not None:
         setattr(angle_item, pointer_name, candidate)
         setattr(angle_item, string_name, candidate.name)
-        if role == DISPLAY_ROLE:
-            angle_item.image = candidate
-            angle_item.image_name = candidate.name
     return candidate
 
 
-def resolve_display_image(
-    project: Any, angle_item: Any, *, allow_legacy: bool = True
-) -> bpy.types.Image | None:
-    return resolve_angle_data_image(
-        project, angle_item, DISPLAY_ROLE, allow_legacy=allow_legacy
-    )
+def resolve_display_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
+    return resolve_angle_data_image(project, angle_item, DISPLAY_ROLE)
 
 
 def resolve_base_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
@@ -197,12 +167,6 @@ def resolve_base_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
 
 def resolve_coverage_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
     return resolve_angle_data_image(project, angle_item, COVERAGE_ROLE)
-
-
-def resolve_angle_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
-    """Compatibility alias returning the opaque display image."""
-
-    return resolve_display_image(project, angle_item, allow_legacy=True)
 
 
 def tag_image(
@@ -263,18 +227,7 @@ def create_angle_layer_image(
     return image
 
 
-def create_mask_image(project_uuid: str, angle_uuid: str, angle: float, resolution: int) -> bpy.types.Image:
-    """Compatibility constructor for a schema-v2 display image."""
-
-    return create_angle_layer_image(
-        project_uuid, angle_uuid, angle, resolution, DISPLAY_ROLE
-    )
-
-
 def create_project_images(project: Any, source: bpy.types.Image | None = None) -> None:
-    # Mark this as current before allocating layers so a failed creation can
-    # safely clean up only its own new images.
-    project.schema_version = SCHEMA_VERSION
     for value in DEFAULT_ANGLES:
         angle_item = project.angles.add()
         angle_item.uuid = new_uuid()
@@ -294,8 +247,6 @@ def create_project_images(project: Any, source: bpy.types.Image | None = None) -
         )
         angle_item.display_image = display
         angle_item.display_image_name = display.name
-        angle_item.image = display
-        angle_item.image_name = display.name
         angle_item.base_image = base
         angle_item.base_image_name = base.name
         angle_item.coverage_image = coverage
@@ -531,12 +482,12 @@ def ensure_palette(scene: bpy.types.Scene) -> bpy.types.Palette:
 
 def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.types.Image | None:
     project = project or active_project(context.scene)
-    if project is None or not is_project_supported(project):
+    if project is None:
         return None
     angle_item = active_angle(project)
     if angle_item is None:
         return None
-    image = resolve_angle_image(project, angle_item)
+    image = resolve_display_image(project, angle_item)
     if image is None:
         return None
     try:
@@ -550,8 +501,8 @@ def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.t
             if session is not None:
                 studio_window_pointer = int(session.window_pointer)
         except (ImportError, AttributeError, ReferenceError, RuntimeError):
-            # ``studio`` is optional during staged upgrades.  Legacy operators
-            # set IMAGE mode themselves before calling this helper.
+            # ``studio`` is optional while the add-on is registering or
+            # unregistering, so canvas synchronization remains defensive.
             studio_active = False
         if studio_active:
             context.scene.tool_settings.image_paint.mode = "IMAGE"
@@ -638,7 +589,7 @@ def image_rgba8(image: bpy.types.Image) -> Any:
 
 def capture_paint_snapshot(project: Any) -> None:
     angle_item = active_angle(project)
-    image = resolve_angle_image(project, angle_item) if angle_item is not None else None
+    image = resolve_display_image(project, angle_item) if angle_item is not None else None
     if image is None:
         raise ValueError("The active angle image is missing")
     _PAINT_SNAPSHOTS[str(project.uuid)] = image_rgba(image)
@@ -683,7 +634,7 @@ def discard_interactive_paint_snapshot(project: Any) -> None:
 
 
 def has_paint_snapshot(project: Any) -> bool:
-    """Return whether an explicit legacy propagation snapshot is pending."""
+    """Return whether an explicit propagation snapshot is pending."""
 
     return str(getattr(project, "uuid", "")) in _PAINT_SNAPSHOTS
 
@@ -692,11 +643,10 @@ def consume_paint_snapshot(project: Any) -> Any | None:
     snapshot = _PAINT_SNAPSHOTS.pop(str(project.uuid), None)
     if snapshot is not None:
         return snapshot
-    # Compatibility for the old explicit "Propagate" operator.  Its fallback
-    # read display alpha as coverage, which is no longer possible because the
-    # display is intentionally opaque.  Encode coverage as a harmless G-channel
-    # difference while leaving R (the baseline mask consumed by that operator)
-    # unchanged.
+    # The script-facing explicit "Propagate" operator cannot read display
+    # alpha as coverage because the display is intentionally opaque. Encode
+    # coverage as a harmless G-channel difference while leaving R (the
+    # baseline mask consumed by that operator) unchanged.
     angle_item = active_angle(project)
     display = resolve_display_image(project, angle_item) if angle_item is not None else None
     coverage = resolve_coverage_image(project, angle_item) if angle_item is not None else None
@@ -865,9 +815,9 @@ def mark_override_region(
 
 
 def project_mask_stack(project: Any) -> tuple[Any, Any]:
-    """Return the legacy signed-stack view of schema-v2 side-local keys.
+    """Return a signed-stack adapter over the side-local authoring keys.
 
-    A separate LEFT zero-degree key cannot be represented by the v1 API, so the
+    A separate LEFT zero-degree key cannot be represented by a signed stack, so the
     RIGHT zero is used as its shared zero.  New generation code should consume
     :func:`project_side_stack` instead.
     """
@@ -884,7 +834,7 @@ def project_mask_stack(project: Any) -> tuple[Any, Any]:
         local_angle = abs(float(angle_item.angle))
         if side == "LEFT" and math.isclose(local_angle, 0.0, abs_tol=1.0e-7) and has_right_zero:
             continue
-        image = resolve_angle_image(project, angle_item)
+        image = resolve_display_image(project, angle_item)
         if image is None:
             raise ValueError(f"Mask image is missing for {angle_item.angle:+g} degrees")
         signed = -local_angle if side == "LEFT" else local_angle
@@ -1102,19 +1052,13 @@ def update_export_adjustment_preview(project: Any, heatmap: Any) -> bpy.types.Im
 
 
 def clear_image_alpha(image: bpy.types.Image) -> None:
-    """Compatibility alias clearing separate overrides and restoring base RGB."""
+    """Clear separate overrides and restore the current base RGB."""
     import numpy as np
 
     coverage = _coverage_for_display(image)
     base = _base_for_display(image)
     if coverage is None or base is None:
-        # True v1 fallback used only before migration has had a chance to run.
-        rgba = image_rgba(image)
-        overridden = rgba[..., 3] > 0.0
-        rgba[..., :3][overridden] = 1.0
-        rgba[..., 3] = 1.0
-        write_image_rgba(image, rgba)
-        return
+        raise ValueError("The paint override layers are incomplete")
     overridden = coverage_mask(coverage)
     rgba = image_rgba(image)
     base_rgba = image_rgba(base)
@@ -1125,8 +1069,6 @@ def clear_image_alpha(image: bpy.types.Image) -> None:
 
 
 def remove_project_images(project: Any) -> None:
-    if not is_project_supported(project):
-        return
     for image in tuple(bpy.data.images):
         if image.get(PROJECT_UUID_KEY) == project.uuid:
             bpy.data.images.remove(image)
@@ -1140,8 +1082,6 @@ _TOPOLOGY_MODIFIERS = {
 
 
 def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[list[str], list[str], Any | None]:
-    if not is_project_supported(project):
-        return [unsupported_project_message(project)], [], None
     errors: list[str] = []
     warnings: list[str] = []
     report = None
@@ -1199,16 +1139,15 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
     if not side_values["RIGHT"] and not side_values["LEFT"]:
         errors.append("Project has no angle keys.")
     for angle_item in project.angles:
-        image = resolve_angle_image(project, angle_item)
+        image = resolve_display_image(project, angle_item)
         if image is None:
             errors.append(f"Missing mask at {angle_item.angle:+g} degrees.")
         elif tuple(image.size[:]) != (int(project.resolution), int(project.resolution)):
             errors.append(f"Mask size differs at {angle_item.angle:+g} degrees.")
-        if int(getattr(project, "schema_version", 1)) >= 2:
-            if resolve_base_image(project, angle_item) is None:
-                errors.append(f"Missing base mask at {angle_item.angle:+g} degrees.")
-            if resolve_coverage_image(project, angle_item) is None:
-                errors.append(f"Missing override coverage at {angle_item.angle:+g} degrees.")
+        if resolve_base_image(project, angle_item) is None:
+            errors.append(f"Missing base mask at {angle_item.angle:+g} degrees.")
+        if resolve_coverage_image(project, angle_item) is None:
+            errors.append(f"Missing override coverage at {angle_item.angle:+g} degrees.")
     if include_monotonic and not errors:
         from .core import validate_monotonic
 
@@ -1237,10 +1176,8 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
 
 def repair_project_references(scene: bpy.types.Scene) -> None:
     for project in getattr(scene, "quick_sdf_projects", ()):
-        if not is_project_supported(project):
-            continue
         for angle_item in project.angles:
-            resolve_display_image(project, angle_item, allow_legacy=True)
+            resolve_display_image(project, angle_item)
             resolve_base_image(project, angle_item)
             resolve_coverage_image(project, angle_item)
 
@@ -1298,12 +1235,6 @@ def _load_or_undo_post(_unused: Any) -> None:
         invalidate()
     except ImportError:
         pass
-    try:
-        from .migration import migrate_all_scenes
-
-        migrate_all_scenes()
-    except (ImportError, AttributeError, ReferenceError, RuntimeError):
-        pass
     for scene in bpy.data.scenes:
         repair_project_references(scene)
     context = bpy.context
@@ -1312,16 +1243,6 @@ def _load_or_undo_post(_unused: Any) -> None:
             sync_canvas(context)
         except (AttributeError, ReferenceError, RuntimeError):
             pass
-
-
-def _deferred_migrate() -> None:
-    try:
-        from .migration import migrate_all_scenes
-
-        migrate_all_scenes()
-    except (ImportError, AttributeError, ReferenceError, RuntimeError):
-        pass
-    return None
 
 
 @persistent
@@ -1420,8 +1341,6 @@ def register_runtime() -> None:
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         if _load_or_undo_post not in handlers:
             handlers.append(_load_or_undo_post)
-    if not bpy.app.timers.is_registered(_deferred_migrate):
-        bpy.app.timers.register(_deferred_migrate, first_interval=0.0)
     if _save_project_images not in bpy.app.handlers.save_pre:
         bpy.app.handlers.save_pre.append(_save_project_images)
     if _depsgraph_base_update not in bpy.app.handlers.depsgraph_update_post:
@@ -1442,8 +1361,6 @@ def unregister_runtime() -> None:
         pass
     _BASE_BAKE_UUIDS.clear()
     _PENDING_BASE_SIGNATURES.clear()
-    if bpy.app.timers.is_registered(_deferred_migrate):
-        bpy.app.timers.unregister(_deferred_migrate)
     if bpy.app.timers.is_registered(_deferred_base_check):
         bpy.app.timers.unregister(_deferred_base_check)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):

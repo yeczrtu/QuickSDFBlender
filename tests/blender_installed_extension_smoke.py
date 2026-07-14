@@ -9,6 +9,7 @@ import sys
 import tomllib
 
 import bpy
+import numpy as np
 
 
 def _arguments() -> argparse.Namespace:
@@ -54,6 +55,40 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     dll = native._load()
     assert hasattr(dll, "qsdf_repair_side_monotonic")
     assert hasattr(dll, "qsdf_generate_threshold_pair_cancelable")
+
+    # Exercise the DLL through the installed package, not merely its symbol
+    # table. Fractional 8-stage angles catch stale pre-ABI-5 builds that would
+    # otherwise truncate authoring angles or use the old reserved endpoints.
+    core = importlib.import_module(f"{module_name}.core")
+    angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
+    steps = np.arange(8, dtype=np.int64)[:, None]
+    right = (steps >= np.array([0, 1, 4, 8])[None, :]).reshape(8, 1, 4)
+    left = (steps >= np.array([7, 5, 2, 0])[None, :]).reshape(8, 1, 4)
+    expected = core.generate_threshold_pair(right, angles, left, angles)
+    actual = native.generate_threshold_pair(right, angles, left, angles)
+    np.testing.assert_array_equal(actual, expected[..., :2])
+    assert expected[0, 0, 0] == 65535
+    assert expected[0, 3, 0] == 0
+
+    triangle_uvs = np.array(
+        [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=np.float32
+    )
+    corner_normals = np.array(
+        [[[0.0, -1.0, 0.0]] * 3], dtype=np.float32
+    )
+    guide, occupancy = native.bake_face_shadow_guide(
+        triangle_uvs,
+        corner_normals,
+        angles,
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        "RIGHT",
+        50.0,
+        8,
+    )
+    assert guide.shape == (8, 8, 8)
+    assert occupancy.any()
+    np.testing.assert_array_equal(guide[-1], occupancy)
 
     assert hasattr(bpy.types.Scene, "quick_sdf_projects")
     addon.unregister()

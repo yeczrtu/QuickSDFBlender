@@ -101,7 +101,7 @@ def _assert_project_is_fully_active(project, obj, runtime, studio) -> None:
     assert runtime.active_project(bpy.context.scene) == project
     assert bpy.context.view_layer.objects.active == obj
     assert obj.mode == "TEXTURE_PAINT"
-    expected = runtime.resolve_angle_image(project, runtime.active_angle(project))
+    expected = runtime.resolve_display_image(project, runtime.active_angle(project))
     assert expected is not None
     assert bpy.context.scene.tool_settings.image_paint.canvas == expected
     assert _studio_image() == expected
@@ -126,7 +126,7 @@ def _project_is_fully_active(project, obj, runtime, studio) -> bool:
         return False
     if bpy.context.view_layer.objects.active != obj or obj.mode != "TEXTURE_PAINT":
         return False
-    expected = runtime.resolve_angle_image(project, runtime.active_angle(project))
+    expected = runtime.resolve_display_image(project, runtime.active_angle(project))
     if expected is None:
         return False
     if bpy.context.scene.tool_settings.image_paint.canvas != expected:

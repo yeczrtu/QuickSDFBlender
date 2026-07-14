@@ -2,7 +2,7 @@
 
 This interactive Blender 5.1 smoke test reproduces the model and defaults from
 the reported black-viewport regression. It keeps the default normal guide,
-45-degree key, and Overlay preview, then drives the public 3D paint macro.
+middle light-sweep key, and Overlay preview, then drives the public 3D paint macro.
 
 The test deliberately checks rendered UI pixels in addition to node topology:
 an acyclic graph can still show a stale or wrong image, while a purely
@@ -402,7 +402,11 @@ def _tick() -> float | None:
         if phase == "PAINT":
             active = runtime.active_angle(project)
             assert active is not None
-            assert abs(float(active.angle) - 45.0) < 0.001, float(active.angle)
+            expected = min(
+                (float(item.angle) for item in project.angles),
+                key=lambda value: abs(value - 45.0),
+            )
+            assert abs(float(active.angle) - expected) < 0.001, float(active.angle)
             assert str(active.side) == "RIGHT"
             assert str(project.base_source) == "NORMAL_GUIDE"
             assert int(project.resolution) == 1024
@@ -768,7 +772,11 @@ def _start() -> None:
         assert bpy.ops.quicksdf.project_create() == {"FINISHED"}
         project = runtime.active_project(scene)
         assert project is not None
-        assert abs(float(runtime.active_angle(project).angle) - 45.0) < 0.001
+        expected = min(
+            (float(item.angle) for item in project.angles),
+            key=lambda value: abs(value - 45.0),
+        )
+        assert abs(float(runtime.active_angle(project).angle) - expected) < 0.001
         # Studio restores the paint settings present at its own entry point.
         # ``project_create`` intentionally synchronizes the new project canvas
         # before this separate ``studio_enter`` call.

@@ -454,7 +454,7 @@ if bpy is not None:
             project = resolve_session_project() if session is not None else None
             if project is not None and str(project.uuid) == uuid:
                 angle = runtime.active_angle(project)
-                image = runtime.resolve_angle_image(project, angle) if angle is not None else None
+                image = runtime.resolve_display_image(project, angle) if angle is not None else None
                 assign_preview_material(project, image)
         except (ImportError, RuntimeError, ReferenceError, ValueError):
             # Saving must never fail merely because the temporary overlay could
@@ -521,6 +521,8 @@ if bpy is not None:
         bl_options = {"REGISTER"}
 
         def execute(self, context):
+            from . import runtime
+
             project = _active_project(context.scene)
             if project is None:
                 return {"CANCELLED"}
@@ -529,9 +531,11 @@ if bpy is not None:
             if angles:
                 index = max(0, min(int(getattr(project, "active_angle_index", 0)), len(angles) - 1))
                 angle_item = angles[index]
-            image = getattr(angle_item, "image", None) if angle_item is not None else None
-            if image is None and angle_item is not None and getattr(angle_item, "image_name", ""):
-                image = bpy.data.images.get(angle_item.image_name)
+            image = (
+                runtime.resolve_display_image(project, angle_item)
+                if angle_item is not None
+                else None
+            )
             try:
                 assign_preview_material(project, image)
             except ValueError as exc:

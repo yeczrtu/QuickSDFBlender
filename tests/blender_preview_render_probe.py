@@ -128,7 +128,7 @@ assert project is not None
 project.preview_mode = "MASK"
 assert bpy.ops.quicksdf.preview_enable() == {"FINISHED"}
 
-canvas = runtime.resolve_angle_image(project, runtime.active_angle(project))
+canvas = runtime.resolve_display_image(project, runtime.active_angle(project))
 assert canvas is not None
 runtime.sync_canvas(bpy.context, project)
 assert scene.tool_settings.image_paint.canvas == canvas

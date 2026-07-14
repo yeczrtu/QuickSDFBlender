@@ -453,9 +453,9 @@ if bpy is not None:
 
 
     def _angle_image(angle_item: Any) -> Any | None:
-        image = getattr(angle_item, "image", None)
-        if image is None and getattr(angle_item, "image_name", ""):
-            image = bpy.data.images.get(angle_item.image_name)
+        image = getattr(angle_item, "display_image", None)
+        if image is None and getattr(angle_item, "display_image_name", ""):
+            image = bpy.data.images.get(angle_item.display_image_name)
         return image
 
 
