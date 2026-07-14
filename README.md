@@ -1,4 +1,4 @@
-# Quick SDF Studio 0.3.3
+# Quick SDF Studio 0.4.0
 
 Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作るWindows向けExtensionです。法線から作られた影ガイドを下描きにして、気になる部分だけを直せます。
 
@@ -17,13 +17,11 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 4. `Light` または `Shadow` を選んで、3Dか2Dへ塗る
 5. `Export Face Shadow Texture`
 
-`Create & Edit` は、現在のポーズと評価済み法線から7角度（0～90°）の影ガイドを作り、45°を選択した状態で専用のQuick SDF Studioを開きます。左右対称は既定でONです。片側だけ直せば反対側の出力も自動生成されます。
+`Create & Edit` は、現在のポーズと評価済み法線から8段階（0～90°）の影ガイドを作り、中央付近のキーを選択した状態で専用のQuick SDF Studioを開きます。0°では斜め後ろから光が入り始め、45°で真横、90°で顔全体が明部になります。左右対称は既定でONです。片側だけ直せば反対側の出力も自動生成されます。
 
 一筆はBlender標準Texture Paintの操作感を保ったまま、選択中の角度へ即時反映されます。書き出し時に角度のつながりを非破壊で自動調整するため、Propagate、Validate、反対側生成の追加操作は不要です。
 
-0.3.3では、角度タイムラインを1本のプレイヘッドへ統合しました。ドラッグ中だけ2D／3Dで補間結果を確認し、離すと最も近い既存キーへ吸着します。通常のペイントからキーを自動追加せず、ペイント開始時に別角度へ戻る表示切替もありません。
-
-0.3.2では、3Dプレビューが黒くなるMaterial接続、ペンを離した後の待ち時間、Light／ShadowとBrush Assetの不一致、誤解を招く無変更エラーを修正しました。1024pxでの連続3Dペイント、タイムライン上のUndo、Studio終了時の復元をBlender 5.1実機テストへ追加しています。
+0.4.0では、lilToon／liltoonUEで直接利用するライトスイープへ一本化しました。白い明部が斜め後ろから顔全体へ広がる8枚を編集し、R=右光、G=左光、B=0、A=65535の16-bit PNGを書き出します。
 
 詳しい使い方は[日本語ユーザーガイド](docs/USER_GUIDE_JA.md)を参照してください。
 
@@ -31,7 +29,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 対応環境はBlender 5.1、Windows x64です。
 
-1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.3.3-windows-x64.zip` を取得する
+1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.4.0-windows-x64.zip` を取得する
 2. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
 3. 右上メニューから `ディスクからインストール` を選ぶ
 4. 取得したZIPを展開せずに選択する
@@ -53,7 +51,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 ## 出力
 
-`Export Face Shadow Texture`を押すと、検証・生成・保存を一度に行い、16-bit RGBA PNGを1枚出力します。角度のつながりに矛盾があっても、元のペイントを変更せず、書き出し用データだけを自動調整します。初回だけ保存先を選び、同じパスへの上書き時は確認が表示されます。エンジンではNon-Color／Dataテクスチャとして扱ってください。
+`Export Face Shadow Texture`を押すと、検証・生成・保存を一度に行い、lilToon用16-bit RGBA PNGを1枚出力します。Rは右光、Gは左光、Bは0、Aは65535です。角度のつながりに矛盾があっても、元のペイントを変更せず、書き出し用データだけを自動調整します。初回だけ保存先を選び、同じパスへの上書き時は確認が表示されます。エンジンではNon-Color／Dataテクスチャとして扱ってください。
 
 最終生成はバックグラウンドで実行されます。高解像度ではStudio内に進捗と `Cancel` が表示されるため、Blenderを固めずに中止できます。保存先やディスクの問題で失敗した場合は、パスを保持したまま `Retry Export` できます。
 

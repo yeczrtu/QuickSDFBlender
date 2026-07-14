@@ -6,7 +6,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Quick SDF Studio",
     "author": "Quick SDF contributors",
-    "version": (0, 3, 2),
+    "version": (0, 4, 0),
     "blender": (5, 1, 0),
     "location": "3D View > Sidebar > Quick SDF",
     "description": "Paint production-ready toon face shadows with an artist-first angle timeline",
