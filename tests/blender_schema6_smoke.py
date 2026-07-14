@@ -26,7 +26,7 @@ from quick_sdf_blender.bitplane import (  # noqa: E402
     decode_bitplane,
     inspect_bitplane_header,
 )
-from quick_sdf_blender.model import SCHEMA_VERSION  # noqa: E402
+from quick_sdf_blender.model import SCHEMA_VERSION, validate_schema  # noqa: E402
 
 
 def _project_angle_images(project_uuid: str) -> tuple[bpy.types.Image, ...]:
@@ -161,6 +161,18 @@ def main() -> None:
             )
             assert not hasattr(item, "base_image")
             assert not hasattr(item, "coverage_image")
+
+        legacy = scene.quick_sdf_projects.add()
+        legacy.uuid = "unsupported-schema-5"
+        legacy.schema_version = 5
+        legacy_state = (legacy.uuid, int(legacy.schema_version), len(legacy.angles))
+        try:
+            validate_schema(legacy)
+        except ValueError as error:
+            assert "schema 6 is required" in str(error)
+        else:
+            raise AssertionError("Schema 5 was unexpectedly accepted or migrated")
+        assert (legacy.uuid, int(legacy.schema_version), len(legacy.angles)) == legacy_state
     finally:
         quick_sdf_blender.unregister()
 

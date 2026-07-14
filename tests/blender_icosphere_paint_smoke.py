@@ -606,9 +606,9 @@ def _tick() -> float | None:
             )
             assert_paint_settings_restored()
 
-            # A same-colour no-op must be silent and successful. Filling the
-            # hidden source image black makes the expected no-op deterministic
-            # regardless of the brush asset's falloff curve.
+            # A same-colour 3D no-op remains successful and must use only the
+            # quiet Studio hint; it must never become a warning/error banner.
+            # Filling the source black makes the no-op deterministic.
             all_shadow = np.array(latest, copy=True)
             all_shadow[..., :3] = 0.0
             all_shadow[..., 3] = 1.0
@@ -624,7 +624,9 @@ def _tick() -> float | None:
             )
             assert no_op_result == {"FINISHED"}, no_op_result
             np.testing.assert_array_equal(runtime.image_rgba(canvas), all_shadow)
-            assert not session.projection_hint
+            assert session.projection_hint == (
+                "No paint landed · move back or press Numpad 5"
+            )
             assert not project.warning_message
             assert not project.diagnostic_message
             assert no_op_seconds < 0.75, no_op_seconds
