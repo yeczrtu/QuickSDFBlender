@@ -10,6 +10,7 @@ paint state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
 import time
 from typing import Any, Callable
 
@@ -23,6 +24,7 @@ WORKSPACE_LAYOUT_VERSION = 2
 WORKSPACE_BASENAME = "Quick SDF Studio"
 TIMELINE_HEIGHT = 104
 TIMELINE_SPACE_TYPE = "NODE_EDITOR"
+PROVISIONAL_DISPLAY_ROLE = "provisional_display"
 
 
 class StudioError(RuntimeError):
@@ -74,6 +76,20 @@ class StudioSession:
     editing_aux_mask_uuid: str = ""
     aux_previous_preview_mode: str = ""
     aux_previous_onion_enabled: bool = False
+    provisional_uuid: str = ""
+    provisional_angle: float = -1.0
+    provisional_side: str = ""
+    provisional_image_name: str = ""
+    provisional_base_blob: bytes = b""
+    provisional_coverage_blob: bytes = b""
+    provisional_base_revision: int = 0
+    provisional_coverage_revision: int = 0
+    provisional_state: str = "NONE"
+    provisional_source_token: tuple[Any, ...] = ()
+    provisional_promoting: bool = False
+    provisional_previous_key_uuid: str = ""
+    provisional_rebuild_after_save: bool = False
+    provisional_rebuild_angle: float = -1.0
 
 
 @dataclass(slots=True)
@@ -93,6 +109,7 @@ _SESSION: StudioSession | None = None
 _PENDING: _PendingEnter | None = None
 _SWITCH_PENDING: _PendingSwitch | None = None
 _HANDLERS_REGISTERED = False
+_PROVISIONAL_JOB: dict[str, Any] | None = None
 
 
 def current_session() -> StudioSession | None:
@@ -235,6 +252,10 @@ def select_paint_key(
 ) -> bool:
     """Select one edit key and atomically synchronize every paint surface."""
 
+    session = active_session(context)
+    if session is not None and session.provisional_uuid and not session.provisional_promoting:
+        discard_provisional(context, project)
+
     resolved_index, item = _resolve_paint_key(project, key_uuid=key_uuid, index=index)
     if item is None or resolved_index is None:
         return False
@@ -260,6 +281,7 @@ def select_paint_key(
         session.paint_key_uuid = str(getattr(item, "uuid", ""))
         session.paint_key_angle = angle
         session.seek_angle = angle
+        session.projection_hint = ""
 
     from .runtime import sync_canvas
 
@@ -279,6 +301,7 @@ def enter_aux_mask_edit(context: Any, project: Any, mask_uuid: str) -> bool:
     session = active_session(context)
     if session is None or session.project_uuid != str(getattr(project, "uuid", "")):
         raise StudioError("Open Quick SDF Studio before editing an additional mask")
+    discard_provisional(context, project)
     from . import runtime
 
     item = runtime.aux_mask_for_uuid(project, mask_uuid)
@@ -412,6 +435,505 @@ def leave_export_adjustment_review(
     return True
 
 
+def _provisional_lane(project: Any, side: str) -> list[Any]:
+    return sorted(
+        (item for item in project.angles if str(getattr(item, "side", "RIGHT")) == side),
+        key=lambda item: float(item.angle),
+    )
+
+
+def _provisional_token(project: Any, side: str) -> tuple[Any, ...]:
+    from . import runtime
+
+    records = []
+    for item in _provisional_lane(project, side):
+        image = runtime.resolve_display_image(project, item)
+        records.append(
+            (
+                str(item.uuid),
+                float(item.angle),
+                "" if image is None else str(image.name),
+                -1
+                if image is None
+                else int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+                runtime.bitplane_revision_token(item, "BASE"),
+                runtime.bitplane_revision_token(item, "COVERAGE"),
+            )
+        )
+    return tuple(records)
+
+
+def _cancel_provisional_job() -> None:
+    global _PROVISIONAL_JOB
+
+    job = _PROVISIONAL_JOB
+    _PROVISIONAL_JOB = None
+    if job is None:
+        return
+    flag = job.get("cancel_flag")
+    if flag is not None:
+        flag.value = 1
+    manager = job.get("manager")
+    if manager is not None:
+        try:
+            manager.cancel()
+            manager.shutdown(wait=False)
+        except RuntimeError:
+            pass
+    if bpy.app.timers.is_registered(_poll_provisional_job):
+        bpy.app.timers.unregister(_poll_provisional_job)
+
+
+def _remove_provisional_image(session: StudioSession) -> None:
+    image = bpy.data.images.get(str(session.provisional_image_name))
+    if image is None:
+        return
+    try:
+        from . import runtime
+
+        if str(image.get(runtime.ROLE_KEY, "")) == PROVISIONAL_DISPLAY_ROLE:
+            bpy.data.images.remove(image)
+    except (ReferenceError, RuntimeError):
+        pass
+
+
+def discard_provisional(
+    context: Any | None = None,
+    project: Any | None = None,
+    *,
+    keep_preview_angle: bool = False,
+) -> None:
+    """Cancel and remove the session-only in-between paint key."""
+
+    session = _SESSION
+    if session is None:
+        _cancel_provisional_job()
+        return
+    project = project or resolve_session_project(session)
+    _cancel_provisional_job()
+    if session.provisional_promoting and project is not None and session.provisional_uuid:
+        index = next(
+            (
+                index
+                for index, item in enumerate(project.angles)
+                if str(item.uuid) == session.provisional_uuid
+                and bool(item.get("_qsdf_provisional", False))
+            ),
+            -1,
+        )
+        if index >= 0:
+            project.angles.remove(index)
+    _remove_provisional_image(session)
+    angle = session.provisional_angle
+    session.provisional_uuid = ""
+    session.provisional_angle = -1.0
+    session.provisional_side = ""
+    session.provisional_image_name = ""
+    session.provisional_base_blob = b""
+    session.provisional_coverage_blob = b""
+    session.provisional_base_revision = 0
+    session.provisional_coverage_revision = 0
+    session.provisional_state = "NONE"
+    session.provisional_source_token = ()
+    session.provisional_promoting = False
+    session.provisional_previous_key_uuid = ""
+    if keep_preview_angle and angle >= 0.0:
+        session.seek_angle = angle
+
+
+def _compute_provisional_masks(
+    lower_display: Any,
+    upper_display: Any,
+    lower_base: Any,
+    upper_base: Any,
+    lower_coverage: Any,
+    upper_coverage: Any,
+    factor: float,
+    cancel_flag: Any,
+) -> tuple[Any, Any, Any]:
+    import numpy as np
+
+    from .native import interpolate_binary_masks
+
+    display = interpolate_binary_masks(
+        lower_display, upper_display, factor, cancel_flag=cancel_flag
+    )
+    base = interpolate_binary_masks(
+        lower_base, upper_base, factor, cancel_flag=cancel_flag
+    )
+    inherited_coverage = np.ascontiguousarray(
+        lower_coverage | upper_coverage, dtype=np.bool_
+    )
+    return display, base, inherited_coverage
+
+
+def _assign_provisional_canvas(
+    context: Any,
+    project: Any,
+    session: StudioSession,
+    image: Any,
+) -> None:
+    window = find_window(session.window_pointer)
+    scene = bpy.data.scenes.get(session.scene_name) or getattr(window, "scene", None)
+    if scene is None:
+        raise StudioError("The Studio scene disappeared while preparing this angle")
+    scene.tool_settings.image_paint.mode = "IMAGE"
+    scene.tool_settings.image_paint.canvas = image
+    if window is not None:
+        for area in window.screen.areas:
+            if area.type == "IMAGE_EDITOR":
+                area.spaces.active.image = image
+            area.tag_redraw()
+    try:
+        _assign_preview(project, image)
+    except (ReferenceError, RuntimeError, ValueError):
+        pass
+    tag_studio_redraw()
+
+
+def _publish_provisional_result(job: dict[str, Any], result: tuple[Any, Any, Any]) -> None:
+    import numpy as np
+
+    from . import runtime
+    from .bitplane import BitplaneRole, encode_bitplane
+
+    session = _SESSION
+    project = resolve_session_project(session)
+    if (
+        session is None
+        or project is None
+        or session.project_uuid != job["project_uuid"]
+        or session.provisional_uuid != job["provisional_uuid"]
+    ):
+        return
+    if (
+        session.provisional_source_token != job["source_token"]
+        or _provisional_token(project, job["side"]) != job["source_token"]
+    ):
+        discard_provisional(bpy.context, project, keep_preview_angle=True)
+        return
+    interpolated_display, base, inherited_coverage = result
+    resolution = int(project.resolution)
+    if interpolated_display.shape != (resolution, resolution):
+        raise StudioError("The prepared angle has an unexpected resolution")
+    # Boundary is a generated layer, never a hand-painted override. Evaluate it
+    # at the provisional angle before deriving Coverage so Boundary-only pixels
+    # cannot accidentally become permanent paint when the key is promoted.
+    generated = base
+    if getattr(project, "boundary_tracks", None):
+        from .boundary import evaluate_boundary_mask
+
+        generated = evaluate_boundary_mask(
+            project,
+            float(job["angle"]),
+            str(job["side"]),
+            base,
+        )
+    coverage = np.ascontiguousarray(inherited_coverage, dtype=np.bool_)
+    display = np.ascontiguousarray(
+        np.where(coverage, interpolated_display, generated), dtype=np.bool_
+    )
+    _remove_provisional_image(session)
+    image = bpy.data.images.new(
+        f"QSDF Pending {str(project.uuid)[:8]} {float(job['angle']):04.1f}",
+        width=resolution,
+        height=resolution,
+        alpha=True,
+        float_buffer=False,
+    )
+    runtime.tag_image(
+        image,
+        str(project.uuid),
+        str(job["provisional_uuid"]),
+        PROVISIONAL_DISPLAY_ROLE,
+    )
+    runtime.make_image_opaque(image)
+    rgba = np.ones((resolution, resolution, 4), dtype=np.float32)
+    rgba[..., :3] = np.asarray(display, dtype=np.float32)[..., None]
+    runtime.write_image_rgba(image, rgba)
+    session.provisional_image_name = image.name
+    session.provisional_base_blob = encode_bitplane(
+        np.ascontiguousarray(base, dtype=np.bool_), BitplaneRole.BASE
+    )
+    session.provisional_coverage_blob = encode_bitplane(
+        np.ascontiguousarray(coverage, dtype=np.bool_), BitplaneRole.COVERAGE
+    )
+    session.provisional_base_revision = 1
+    session.provisional_coverage_revision = 1
+    session.provisional_state = "READY"
+    session.view_mode = "PROVISIONAL"
+    _assign_provisional_canvas(bpy.context, project, session, image)
+
+
+def _poll_provisional_job() -> float | None:
+    global _PROVISIONAL_JOB
+
+    job = _PROVISIONAL_JOB
+    if job is None:
+        return None
+    from .jobs import JobState
+
+    manager = job["manager"]
+    state = manager.poll()
+    if state in {JobState.PENDING, JobState.RUNNING}:
+        return 0.05
+    _PROVISIONAL_JOB = None
+    try:
+        result = manager.take_result()
+        _publish_provisional_result(job, result)
+    except Exception as exc:
+        session = _SESSION
+        if session is not None and session.provisional_uuid == job["provisional_uuid"]:
+            session.provisional_state = "FAILED"
+            session.projection_hint = f"Could not prepare this angle: {exc}"
+    finally:
+        manager.shutdown(wait=False)
+    return None
+
+
+def settle_seek(context: Any, project: Any, angle: float) -> float:
+    """Snap to an existing key or prepare a session-only key for painting."""
+
+    from . import runtime
+    from .jobs import GenerationJobManager
+    from .model import AUTO_KEY_ANGLE_STEP, AUTO_KEY_SNAP_DEGREES, MAX_KEYS_PER_SIDE
+
+    session = active_session(context)
+    if session is None or session.project_uuid != str(project.uuid):
+        return seek_preview(context, project, angle)
+    clamped = max(0.0, min(90.0, float(angle)))
+    value = float(int(clamped / AUTO_KEY_ANGLE_STEP + 0.5)) * AUTO_KEY_ANGLE_STEP
+    if (
+        session.provisional_uuid
+        and not session.provisional_promoting
+        and abs(float(session.provisional_angle) - value) <= 1.0e-6
+        and session.provisional_state in {"PREPARING", "READY", "LIMIT"}
+    ):
+        project.seek_angle = value
+        session.seek_angle = value
+        tag_studio_redraw()
+        return value
+    mode = str(getattr(project, "symmetry_mode", "AUTO"))
+    side = str(
+        getattr(project, "active_side", "RIGHT")
+        if mode == "INDEPENDENT"
+        else getattr(project, "authoring_side", "RIGHT")
+    )
+    items = _provisional_lane(project, side)
+    if not items:
+        return seek_preview(context, project, value)
+    nearest = min(items, key=lambda item: abs(float(item.angle) - value))
+    if abs(float(nearest.angle) - value) <= AUTO_KEY_SNAP_DEGREES:
+        discard_provisional(context, project)
+        select_paint_key(context, project, key_uuid=str(nearest.uuid))
+        return float(nearest.angle)
+
+    seek_preview(context, project, value, show_in_image_editor=True)
+    discard_provisional(context, project, keep_preview_angle=True)
+    session.provisional_uuid = runtime.new_uuid()
+    session.provisional_angle = value
+    session.provisional_side = side
+    session.provisional_previous_key_uuid = session.paint_key_uuid
+    session.seek_angle = value
+    session.view_mode = "PREVIEW"
+    if len(items) >= MAX_KEYS_PER_SIDE:
+        session.provisional_state = "LIMIT"
+        session.projection_hint = (
+            f"Maximum {MAX_KEYS_PER_SIDE} keys. Select or delete an existing key."
+        )
+        tag_studio_redraw()
+        return value
+
+    lower = max((item for item in items if float(item.angle) < value), key=lambda item: float(item.angle))
+    upper = min((item for item in items if float(item.angle) > value), key=lambda item: float(item.angle))
+    lower_angle = float(lower.angle)
+    upper_angle = float(upper.angle)
+    factor = (value - lower_angle) / (upper_angle - lower_angle)
+    token = _provisional_token(project, side)
+    session.provisional_source_token = token
+    session.provisional_state = "PREPARING"
+    session.projection_hint = f"Preparing {value:.0f} degrees..."
+    manager = GenerationJobManager(thread_name_prefix="QuickSDFAutoKey")
+    cancel_flag = ctypes.c_int(0)
+    manager.submit(
+        _compute_provisional_masks,
+        runtime.image_mask(runtime.resolve_display_image(project, lower)),
+        runtime.image_mask(runtime.resolve_display_image(project, upper)),
+        runtime.base_mask(lower).copy(),
+        runtime.base_mask(upper).copy(),
+        runtime.coverage_mask(lower).copy(),
+        runtime.coverage_mask(upper).copy(),
+        factor,
+        cancel_flag,
+    )
+    global _PROVISIONAL_JOB
+    _PROVISIONAL_JOB = {
+        "manager": manager,
+        "cancel_flag": cancel_flag,
+        "project_uuid": str(project.uuid),
+        "provisional_uuid": session.provisional_uuid,
+        "source_token": token,
+        "side": side,
+        "angle": value,
+    }
+    if not bpy.app.timers.is_registered(_poll_provisional_job):
+        bpy.app.timers.register(_poll_provisional_job, first_interval=0.05)
+    tag_studio_redraw()
+    return value
+
+
+def activate_provisional_for_stroke(context: Any, project: Any) -> Any | None:
+    """Temporarily insert the ready key so the native Paint macro can use it."""
+
+    from . import runtime
+
+    session = active_session(context)
+    if session is None or not session.provisional_uuid:
+        return None
+    if session.provisional_state == "PREPARING":
+        raise StudioError("This angle is still being prepared")
+    if session.provisional_state == "LIMIT":
+        raise StudioError("Maximum 16 keys. Select or delete an existing key")
+    if session.provisional_state != "READY":
+        raise StudioError("This angle is not ready for painting")
+    image = bpy.data.images.get(session.provisional_image_name)
+    if image is None:
+        raise StudioError("The prepared paint canvas is missing")
+    provisional_uuid = str(session.provisional_uuid)
+    provisional_angle = float(session.provisional_angle)
+    provisional_side = str(session.provisional_side)
+    item = project.angles.add()
+    item.uuid = provisional_uuid
+    item.angle = provisional_angle
+    item.side = provisional_side
+    item.display_image = image
+    item.display_image_name = image.name
+    for property_name, payload in (
+        (runtime.BASE_BITPLANE_KEY, session.provisional_base_blob),
+        (runtime.COVERAGE_BITPLANE_KEY, session.provisional_coverage_blob),
+    ):
+        if property_name in item:
+            del item[property_name]
+        item[property_name] = bytes(payload)
+    item.base_revision = session.provisional_base_revision
+    item.coverage_revision = session.provisional_coverage_revision
+    item["_qsdf_provisional"] = True
+    runtime.tag_image(image, str(project.uuid), provisional_uuid, runtime.DISPLAY_ROLE)
+    desired = [
+        str(candidate.uuid)
+        for candidate in sorted(
+            project.angles,
+            key=lambda candidate: (
+                0 if str(candidate.side) == "RIGHT" else 1,
+                float(candidate.angle),
+            ),
+        )
+    ]
+    for target, candidate_uuid in enumerate(desired):
+        current = next(
+            index
+            for index, candidate in enumerate(project.angles)
+            if str(candidate.uuid) == candidate_uuid
+        )
+        if current != target:
+            project.angles.move(current, target)
+    # Collection.move() can rebind an existing PropertyGroup wrapper to a
+    # different element. Resolve the promoted key again by its captured UUID.
+    index = next(
+        index
+        for index, candidate in enumerate(project.angles)
+        if str(candidate.uuid) == provisional_uuid
+    )
+    item = project.angles[index]
+    project.active_angle_index = index
+    project.active_angle_uuid = provisional_uuid
+    project.active_side = provisional_side
+    project.seek_angle = provisional_angle
+    project.review_angle = _side_signed_angle(project, item)
+    session.provisional_promoting = True
+    session.view_mode = "PROVISIONAL_STROKE"
+    runtime.sync_canvas(context, project)
+    return project.angles[index]
+
+
+def provisional_created_metadata(project: Any, item: Any) -> dict[str, Any] | None:
+    session = _SESSION
+    if (
+        session is None
+        or not session.provisional_promoting
+        or str(getattr(item, "uuid", "")) != session.provisional_uuid
+    ):
+        return None
+    from . import runtime
+
+    return {
+        "kind": "CREATE_KEY",
+        "uuid": str(item.uuid),
+        "angle": float(item.angle),
+        "side": str(item.side),
+        "display_image_name": str(item.display_image_name),
+        "base_blob": runtime.bitplane_blob(item, "BASE"),
+        "coverage_blob": runtime.bitplane_blob(item, "COVERAGE"),
+        "base_revision": int(item.base_revision),
+        "coverage_revision": int(item.coverage_revision),
+    }
+
+
+def finish_provisional_stroke(context: Any, project: Any, *, changed: bool) -> None:
+    session = active_session(context)
+    if session is None or not session.provisional_promoting:
+        return
+    uuid = session.provisional_uuid
+    item = next((candidate for candidate in project.angles if str(candidate.uuid) == uuid), None)
+    image = bpy.data.images.get(session.provisional_image_name)
+    if changed and item is not None:
+        if "_qsdf_provisional" in item:
+            del item["_qsdf_provisional"]
+        if image is not None:
+            from . import runtime
+
+            runtime.tag_image(image, str(project.uuid), uuid, runtime.DISPLAY_ROLE)
+        session.provisional_uuid = ""
+        session.provisional_image_name = ""
+        session.provisional_base_blob = b""
+        session.provisional_coverage_blob = b""
+        session.provisional_state = "NONE"
+        session.provisional_promoting = False
+        session.view_mode = "EDIT"
+        session.paint_key_uuid = uuid
+        session.paint_key_angle = float(item.angle)
+        return
+    if item is not None:
+        index = next(index for index, candidate in enumerate(project.angles) if str(candidate.uuid) == uuid)
+        project.angles.remove(index)
+    if image is not None:
+        from . import runtime
+
+        runtime.tag_image(image, str(project.uuid), uuid, PROVISIONAL_DISPLAY_ROLE)
+    session.provisional_promoting = False
+    session.provisional_state = "READY"
+    session.view_mode = "PROVISIONAL"
+    previous = next(
+        (
+            candidate
+            for candidate in project.angles
+            if str(candidate.uuid) == session.provisional_previous_key_uuid
+        ),
+        None,
+    )
+    if previous is not None:
+        previous_index = next(
+            index
+            for index, candidate in enumerate(project.angles)
+            if str(candidate.uuid) == str(previous.uuid)
+        )
+        project.active_angle_index = previous_index
+        project.active_angle_uuid = str(previous.uuid)
+        project.active_side = str(previous.side)
+    if image is not None:
+        _assign_provisional_canvas(context, project, session, image)
+
+
 def seek_preview(
     context: Any,
     project: Any,
@@ -423,6 +945,13 @@ def seek_preview(
 
     value = max(0.0, min(90.0, float(angle)))
     session = active_session(context)
+    if (
+        session is not None
+        and session.provisional_uuid
+        and not session.provisional_promoting
+        and abs(float(session.provisional_angle) - value) > 1.0e-6
+    ):
+        discard_provisional(context, project)
     if (
         session is not None
         and session.project_uuid == str(getattr(project, "uuid", ""))
@@ -459,6 +988,18 @@ def back_to_paint(context: Any, project: Any) -> bool:
     """Return Preview to the stored edit key before any mutating action."""
 
     session = active_session(context)
+    if (
+        session is not None
+        and session.project_uuid == str(getattr(project, "uuid", ""))
+        and session.provisional_uuid
+    ):
+        if session.provisional_state == "READY" and not session.provisional_promoting:
+            image = bpy.data.images.get(session.provisional_image_name)
+            if image is not None:
+                _assign_provisional_canvas(context, project, session, image)
+                return True
+        if session.provisional_state in {"PREPARING", "LIMIT", "FAILED"}:
+            return False
     if (
         session is not None
         and session.project_uuid == str(getattr(project, "uuid", ""))
@@ -665,6 +1206,14 @@ def _stroke_restore_watchdog() -> float | None:
             discard_interactive_paint_snapshot(project)
         except (AttributeError, ImportError, ReferenceError, RuntimeError):
             pass
+        # If Blender cancelled the native modal stroke, the propagation macro
+        # never gets a chance to decide whether an auto key changed. Roll the
+        # temporary collection item back and keep its prepared canvas available.
+        if session.provisional_promoting:
+            try:
+                finish_provisional_stroke(bpy.context, project, changed=False)
+            except (AttributeError, ReferenceError, RuntimeError):
+                discard_provisional(bpy.context, project)
     return None
 
 
@@ -703,17 +1252,16 @@ def _discard_project_paint_snapshot(project: Any | None) -> None:
 
 
 def set_projection_hint(context: Any | None, *, no_change: bool) -> None:
-    """Clear the retired no-op warning without interrupting native painting.
-
-    A same-colour stroke and a projection miss are indistinguishable after the
-    native operator returns. Treating either as a red error was misleading and
-    occupied the standard Brush Asset controls in the Tool Header.
-    """
+    """Show a quiet 3D-only projection hint after a no-op native stroke."""
 
     session = active_session(context or bpy.context)
     if session is None:
         return
-    session.projection_hint = ""
+    session.projection_hint = (
+        "No paint landed · move back or press Numpad 5"
+        if no_change and session.stroke_from_view3d
+        else ""
+    )
     tag_studio_redraw()
 
 
@@ -1272,7 +1820,7 @@ def _continue_enter() -> float | None:
             if str(getattr(project, "base_source", "NORMAL_GUIDE")) == "NORMAL_GUIDE":
                 session.first_hint_text = (
                     "A light-sweep guide from rear oblique to full light is ready. "
-                    "Paint only the areas you want to adjust."
+                    "Paint only the areas you want to adjust. Paint between keys to add that angle."
                 )
             else:
                 session.first_hint_text = "Choose an angle · choose Light or Shadow · paint"
@@ -1395,6 +1943,7 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
     old_project = resolve_session_project(session)
     if old_project is None:
         raise StudioError("The current Quick SDF Studio target is unavailable")
+    discard_provisional(context, old_project)
     if session.editing_aux_mask_uuid:
         leave_aux_mask_edit(context, old_project)
     old_scene, old_index = _project_location(old_project)
@@ -1446,7 +1995,7 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
         session.show_first_stroke_hint = not bool(getattr(project, "first_stroke_complete", False))
         session.first_hint_text = (
             "A light-sweep guide from rear oblique to full light is ready. "
-            "Paint only the areas you want to adjust."
+            "Paint only the areas you want to adjust. Paint between keys to add that angle."
             if str(getattr(project, "base_source", "NORMAL_GUIDE")) == "NORMAL_GUIDE"
             else "Choose an angle · choose Light or Shadow · paint"
         )
@@ -1673,6 +2222,7 @@ def exit_studio(
     context = context or bpy.context
     window = find_window(session.window_pointer)
     project = resolve_session_project(session)
+    discard_provisional(context, project)
     if project is not None and session.editing_aux_mask_uuid:
         session.editing_aux_mask_uuid = ""
         if session.aux_previous_preview_mode and hasattr(project, "preview_mode"):
@@ -1744,6 +2294,21 @@ def _save_pre(_unused: Any) -> None:
     if _SESSION is None:
         return
     project = resolve_session_project()
+    # Provisional canvases and structural Redo images are process-only state.
+    # Never serialize them into the .blend. A ready angle is reconstructed
+    # after saving so the artist can continue without changing the playhead.
+    if _SESSION.provisional_uuid:
+        _SESSION.provisional_rebuild_after_save = bool(
+            _SESSION.provisional_state in {"PREPARING", "READY"}
+            and not _SESSION.provisional_promoting
+        )
+        _SESSION.provisional_rebuild_angle = float(_SESSION.provisional_angle)
+        discard_provisional(bpy.context, project, keep_preview_angle=True)
+    else:
+        _SESSION.provisional_rebuild_after_save = False
+        _SESSION.provisional_rebuild_angle = -1.0
+    if project is not None:
+        _release_project_history(project)
     if (
         project is not None
         and _SESSION.editing_aux_mask_uuid
@@ -1805,6 +2370,15 @@ def _save_post(_unused: Any) -> None:
                 update_seek_preview(project, float(_SESSION.seek_angle))
             if _SESSION.onion_suspended:
                 project.onion_enabled = True
+            if (
+                _SESSION.provisional_rebuild_after_save
+                and _SESSION.provisional_rebuild_angle >= 0.0
+                and not _SESSION.editing_aux_mask_uuid
+            ):
+                angle = float(_SESSION.provisional_rebuild_angle)
+                _SESSION.provisional_rebuild_after_save = False
+                _SESSION.provisional_rebuild_angle = -1.0
+                settle_seek(bpy.context, project, angle)
         except (ImportError, ReferenceError, RuntimeError, ValueError):
             pass
     _SESSION.preview_suspended = False
@@ -1827,6 +2401,7 @@ def _load_pre(_unused: Any) -> None:
         window = find_window(_SESSION.window_pointer)
         scene = bpy.data.scenes.get(_SESSION.scene_name) or getattr(window, "scene", None)
         project = resolve_session_project(_SESSION)
+        discard_provisional(bpy.context, project)
         if project is not None and _SESSION.editing_aux_mask_uuid:
             if _SESSION.aux_previous_preview_mode and hasattr(project, "preview_mode"):
                 project.preview_mode = _SESSION.aux_previous_preview_mode
@@ -1886,6 +2461,7 @@ def unregister_studio() -> None:
         bpy.app.timers.unregister(_continue_switch)
     if bpy.app.timers.is_registered(_continue_enter):
         bpy.app.timers.unregister(_continue_enter)
+    _cancel_provisional_job()
     _cancel_stroke_watchdog()
     if _PENDING is not None:
         _rollback_pending()
@@ -1911,13 +2487,15 @@ CLASSES: tuple[type, ...] = ()
 __all__ = [
     "CLASSES", "StudioBusyError", "StudioError", "StudioSession", "StudioUnavailableError",
     "WORKSPACE_PROJECT_TAG", "active_session", "configure_workspace", "current_session",
-    "back_to_paint", "dismiss_first_stroke_hint", "ensure_studio_material_preview",
+    "activate_provisional_for_stroke", "back_to_paint", "discard_provisional",
+    "dismiss_first_stroke_hint", "ensure_studio_material_preview",
     "enter_aux_mask_edit", "leave_aux_mask_edit",
     "enter_studio", "exit_studio", "open_or_switch_studio",
     "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
     "TIMELINE_SPACE_TYPE",
     "reconcile_view_state", "register_studio", "show_export_adjustment_review",
-    "prepare_stroke_brush", "resolve_session_project", "restore_stroke_brush", "seek_preview",
+    "finish_provisional_stroke", "prepare_stroke_brush", "provisional_created_metadata",
+    "resolve_session_project", "restore_stroke_brush", "seek_preview", "settle_seek",
     "select_paint_key", "set_projection_hint", "studio_areas", "tag_studio_redraw",
     "unregister_studio",
 ]

@@ -27,6 +27,18 @@ _UNDO_FENCES: set[str] = set()
 _EXPORT_JOB: dict[str, object] | None = None
 
 
+def _purge_history_orphans(project_uuid: str = "") -> None:
+    for image in tuple(bpy.data.images):
+        if str(image.get(runtime.ROLE_KEY, "")) != "history_orphan_display":
+            continue
+        if project_uuid and str(image.get(runtime.PROJECT_UUID_KEY, "")) != str(project_uuid):
+            continue
+        try:
+            bpy.data.images.remove(image)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
 def clear_histories(
     project_uuid: str | None = None,
     *,
@@ -35,9 +47,11 @@ def clear_histories(
     if project_uuid is None:
         _HISTORIES.clear()
         _UNDO_FENCES.clear()
+        _purge_history_orphans()
     else:
         uuid = str(project_uuid)
         _HISTORIES.pop(uuid, None)
+        _purge_history_orphans(uuid)
         if release_fence:
             _UNDO_FENCES.discard(uuid)
 
@@ -57,6 +71,17 @@ def _require_project(operator: bpy.types.Operator, context: bpy.types.Context):
     if project is None:
         operator.report({"ERROR"}, "Create or select a Quick SDF project first")
     return project
+
+
+def _discard_provisional(context: bpy.types.Context, project) -> None:
+    """Drop a session-only auto key before a non-paint structural action."""
+
+    try:
+        from .studio import discard_provisional
+
+        discard_provisional(context, project)
+    except (ImportError, AttributeError, ReferenceError, RuntimeError):
+        pass
 
 
 def _set_active_object(context: bpy.types.Context, obj: bpy.types.Object) -> None:
@@ -308,17 +333,15 @@ def _bake_project(context, project) -> None:
                     guide_message = "The guide is nearly uniform; confirm which way the face points"
             for item, mask in zip(items, masks):
                 display = runtime.resolve_display_image(project, item)
-                base = runtime.resolve_base_image(project, item)
-                coverage = runtime.resolve_coverage_image(project, item)
-                if display is None or base is None or coverage is None:
+                if display is None:
                     raise ValueError(f"Angle data is incomplete at {float(item.angle):g} degrees")
                 base_rgba = np.ones((*mask.shape, 4), dtype=np.float32)
                 base_rgba[..., :3] = mask[..., None]
                 old_display = runtime.image_rgba(display)
-                overridden = runtime.coverage_mask(coverage)
+                overridden = runtime.coverage_mask(item)
                 composed = base_rgba.copy()
                 composed[..., :3][overridden] = old_display[..., :3][overridden]
-                runtime.write_image_rgba(base, base_rgba)
+                runtime.set_base_mask(item, mask)
                 runtime.write_image_rgba(display, composed)
                 item.is_generated = True
                 item.dirty = True
@@ -602,6 +625,7 @@ class QUICKSDF_OT_bake_base(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         if bool(getattr(project, "onion_enabled", False)):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
@@ -741,13 +765,9 @@ class QUICKSDF_OT_back_to_paint(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-def _assign_angle_layers(project, item, display, base, coverage) -> None:
+def _assign_angle_layers(project, item, display) -> None:
     item.display_image = display
     item.display_image_name = display.name
-    item.base_image = base
-    item.base_image_name = base.name
-    item.coverage_image = coverage
-    item.coverage_image_name = coverage.name
 
 
 class QUICKSDF_OT_key_add(bpy.types.Operator):
@@ -790,7 +810,14 @@ class QUICKSDF_OT_key_add(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         side = str(project.active_side or project.authoring_side)
+        side_count = sum(1 for item in project.angles if str(item.side) == side)
+        from .model import MAX_KEYS_PER_SIDE
+
+        if side_count >= MAX_KEYS_PER_SIDE:
+            self.report({"ERROR"}, f"A side can contain at most {MAX_KEYS_PER_SIDE} angle keys")
+            return {"CANCELLED"}
         angle = float(project.seek_angle if self.angle < 0.0 else self.angle)
         angle = max(0.0, min(90.0, angle))
         if any(str(item.side) == side and abs(float(item.angle) - angle) < 1.0e-4 for item in project.angles):
@@ -798,39 +825,49 @@ class QUICKSDF_OT_key_add(bpy.types.Operator):
             return {"CANCELLED"}
         clear_histories(str(project.uuid))
         source = runtime.active_angle(project)
+        source_uuid = str(getattr(source, "uuid", ""))
         item = project.angles.add()
         item.uuid = runtime.new_uuid()
         new_uuid = str(item.uuid)
         item.angle = angle
         item.side = side
-        layers = []
-        for role in (runtime.DISPLAY_ROLE, runtime.BASE_ROLE, runtime.COVERAGE_ROLE):
-            layers.append(
-                runtime.create_angle_layer_image(
-                    project.uuid, item.uuid, angle, int(project.resolution), role, side=side
-                )
-            )
-        _assign_angle_layers(project, item, *layers)
+        display = runtime.create_angle_layer_image(
+            project.uuid,
+            item.uuid,
+            angle,
+            int(project.resolution),
+            runtime.DISPLAY_ROLE,
+            side=side,
+        )
+        _assign_angle_layers(project, item, display)
         try:
-            if self.duplicate and source is not None:
+            if self.duplicate and source_uuid:
+                source = next(
+                    value for value in project.angles if str(value.uuid) == source_uuid
+                )
                 if not project.boundary_tracks:
                     runtime.materialize_effective_coverage(project, (source,))
-                for resolver, destination in zip(
-                    (runtime.resolve_display_image, runtime.resolve_base_image, runtime.resolve_coverage_image),
-                    layers,
-                ):
-                    source_image = resolver(project, source)
-                    if source_image is not None:
-                        runtime.copy_image_pixels(source_image, destination, grayscale=False)
+                source_image = runtime.resolve_display_image(project, source)
+                if source_image is not None:
+                    runtime.copy_image_pixels(source_image, display, grayscale=False)
+                runtime.copy_angle_bitplanes(source, item)
                 item.is_manual = True
             else:
+                import numpy as np
+
+                resolution = int(project.resolution)
+                runtime.set_base_mask(
+                    item, np.ones((resolution, resolution), dtype=np.bool_)
+                )
+                runtime.set_coverage_mask(
+                    item, np.zeros((resolution, resolution), dtype=np.bool_)
+                )
                 _bake_project(context, project)
             _sort_angle_items(project)
             _select_angle_uuid(context, project, new_uuid)
         except Exception as exc:
-            for image in layers:
-                if image.users == 0:
-                    bpy.data.images.remove(image)
+            if display.users == 0:
+                bpy.data.images.remove(display)
             index = next(
                 (index for index, value in enumerate(project.angles) if value.uuid == new_uuid),
                 -1,
@@ -868,6 +905,7 @@ class QUICKSDF_OT_key_move(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         item = next((value for value in project.angles if value.uuid == self.uuid), runtime.active_angle(project))
         if item is None or abs(float(item.angle)) < 1.0e-5 or abs(float(item.angle) - 90.0) < 1.0e-5:
             self.report({"ERROR"}, "The 0 and 90 degree endpoints are locked")
@@ -901,17 +939,14 @@ class QUICKSDF_OT_key_delete(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         item = next((value for value in project.angles if value.uuid == self.uuid), runtime.active_angle(project))
         if item is None or abs(float(item.angle)) < 1.0e-5 or abs(float(item.angle) - 90.0) < 1.0e-5:
             self.report({"ERROR"}, "The 0 and 90 degree endpoints cannot be deleted")
             return {"CANCELLED"}
         clear_histories(str(project.uuid))
         index = next(index for index, value in enumerate(project.angles) if value.uuid == item.uuid)
-        images = (
-            runtime.resolve_display_image(project, item),
-            runtime.resolve_base_image(project, item),
-            runtime.resolve_coverage_image(project, item),
-        )
+        images = (runtime.resolve_display_image(project, item),)
         project.angles.remove(index)
         for image in images:
             if image is not None and image.get(runtime.PROJECT_UUID_KEY) == project.uuid:
@@ -953,6 +988,8 @@ def _record_aux_image_change(project, item, image, before, label: str) -> bool:
     if before.shape == after.shape and np.array_equal(before, after):
         return False
     history = _HISTORIES.setdefault(str(project.uuid), History(compression_level=1))
+    if history.can_redo:
+        _purge_history_orphans(str(project.uuid))
     if not history.push(label, {image.name: before}, {image.name: after}):
         history.clear()
     _UNDO_FENCES.add(str(project.uuid))
@@ -1255,6 +1292,7 @@ class QUICKSDF_OT_boundary_track_add(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         clear_histories(str(project.uuid))
         if not project.boundary_tracks:
             try:
@@ -1289,6 +1327,7 @@ class QUICKSDF_OT_boundary_track_remove(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None or not project.boundary_tracks:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         clear_histories(str(project.uuid))
         index = max(0, min(project.active_boundary_track_index, len(project.boundary_tracks) - 1))
         project.boundary_tracks.remove(index)
@@ -1366,6 +1405,7 @@ class QUICKSDF_OT_symmetry_choose(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None or self.mode not in {"TEXTURE_MIRROR", "ISLAND_PAIR", "OVERLAPPED_UV"}:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         project.symmetry_candidate = self.mode
         project.symmetry_mode = self.mode
         project.symmetry_requires_confirmation = False
@@ -1388,6 +1428,7 @@ class QUICKSDF_OT_break_mirror(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         if not bool(project.mirror_enabled):
             return {"FINISHED"}
         clear_histories(str(project.uuid))
@@ -1420,40 +1461,69 @@ class QUICKSDF_OT_break_mirror(bpy.types.Operator):
         created_images = []
         created_uuids = []
         try:
-            for source in sorted(
-                (item for item in project.angles if str(item.side) == source_side),
-                key=lambda item: float(item.angle),
-            ):
+            # Do not retain PropertyGroup wrappers while growing their owning
+            # collection. Blender may rebind those wrappers after add/move.
+            source_records = sorted(
+                (
+                    (str(item.uuid), float(item.angle))
+                    for item in project.angles
+                    if str(item.side) == source_side
+                ),
+                key=lambda record: record[1],
+            )
+            for source_uuid, source_angle in source_records:
+                source = next(
+                    item for item in project.angles if str(item.uuid) == source_uuid
+                )
+                source_image = runtime.resolve_display_image(project, source)
+                if source_image is None:
+                    raise ValueError("A mirrored source Display image is missing")
+                rgba = runtime.image_rgba(source_image)
+                source_base = runtime.base_mask(source).copy()
+                source_coverage = runtime.coverage_mask(source).copy()
                 target = project.angles.add()
                 target.uuid = runtime.new_uuid()
-                target.angle = float(source.angle)
+                target.angle = source_angle
                 target.side = target_side
                 created_uuids.append(target.uuid)
-                destinations = []
-                for role, resolver in (
-                    (runtime.DISPLAY_ROLE, runtime.resolve_display_image),
-                    (runtime.BASE_ROLE, runtime.resolve_base_image),
-                    (runtime.COVERAGE_ROLE, runtime.resolve_coverage_image),
-                ):
-                    source_image = resolver(project, source)
-                    destination = runtime.create_angle_layer_image(
-                        project.uuid,
-                        target.uuid,
-                        float(target.angle),
-                        int(project.resolution),
-                        role,
-                        side=target_side,
-                    )
-                    created_images.append(destination)
-                    rgba = runtime.image_rgba(source_image)
-                    mirrored = mirror_side_layer(
-                        rgba,
-                        mode_map.get(mode_name, "TEXTURE_MIRROR"),
-                        island_pairs=pairs,
-                    )
-                    runtime.write_image_rgba(destination, np.asarray(mirrored, dtype=np.float32))
-                    destinations.append(destination)
-                _assign_angle_layers(project, target, *destinations)
+                destination = runtime.create_angle_layer_image(
+                    project.uuid,
+                    target.uuid,
+                    float(target.angle),
+                    int(project.resolution),
+                    runtime.DISPLAY_ROLE,
+                    side=target_side,
+                )
+                created_images.append(destination)
+                mirrored = mirror_side_layer(
+                    rgba,
+                    mode_map.get(mode_name, "TEXTURE_MIRROR"),
+                    island_pairs=pairs,
+                )
+                runtime.write_image_rgba(destination, np.asarray(mirrored, dtype=np.float32))
+                runtime.set_base_mask(
+                    target,
+                    np.asarray(
+                        mirror_side_layer(
+                            source_base,
+                            mode_map.get(mode_name, "TEXTURE_MIRROR"),
+                            island_pairs=pairs,
+                        ),
+                        dtype=np.bool_,
+                    ),
+                )
+                runtime.set_coverage_mask(
+                    target,
+                    np.asarray(
+                        mirror_side_layer(
+                            source_coverage,
+                            mode_map.get(mode_name, "TEXTURE_MIRROR"),
+                            island_pairs=pairs,
+                        ),
+                        dtype=np.bool_,
+                    ),
+                )
+                _assign_angle_layers(project, target, destination)
             project.mirror_enabled = False
             project.symmetry_mode = "INDEPENDENT"
             _sort_angle_items(project)
@@ -1488,6 +1558,7 @@ class QUICKSDF_OT_mirror_toggle(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         if bool(project.mirror_enabled):
             return {"FINISHED"}
         clear_histories(str(project.uuid))
@@ -1497,11 +1568,7 @@ class QUICKSDF_OT_mirror_toggle(bpy.types.Operator):
         ]
         for index in reversed(remove):
             item = project.angles[index]
-            images = (
-                runtime.resolve_display_image(project, item),
-                runtime.resolve_base_image(project, item),
-                runtime.resolve_coverage_image(project, item),
-            )
+            images = (runtime.resolve_display_image(project, item),)
             project.angles.remove(index)
             for image in images:
                 if image is not None and image.get(runtime.PROJECT_UUID_KEY) == project.uuid:
@@ -1755,18 +1822,21 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
 
         interactive_snapshot = runtime.consume_interactive_paint_snapshot(project)
         if interactive_snapshot is not None:
-            active_uuid, display_name, before_rgba, coverage_name, coverage_before = interactive_snapshot
+            active_uuid, display_name, before_gray, coverage_uuid, coverage_before = interactive_snapshot
             active_item = runtime.active_angle(project)
             source_image = bpy.data.images.get(display_name)
-            coverage_image = bpy.data.images.get(coverage_name) if coverage_name else None
+            before_history: dict[str, np.ndarray] = {}
+            metadata_before: dict[str, tuple[bool, bool]] = {}
+            interactive_no_change = False
             try:
-                if source_image is None or (coverage_name and coverage_image is None):
+                if source_image is None:
                     raise ValueError("The active angle paint layers disappeared")
                 if active_item is None or str(active_item.uuid) != active_uuid:
                     raise ValueError("The active angle changed before the stroke finished")
                 source_rgba = runtime.image_rgba8(source_image)
-                if source_rgba.shape != before_rgba.shape or (
-                    coverage_before is not None and coverage_before.shape != before_rgba.shape
+                source_gray = source_rgba[..., 0].copy()
+                if source_gray.shape != before_gray.shape or (
+                    coverage_before is not None and coverage_before.shape != before_gray.shape
                 ):
                     raise ValueError("The active paint image changed size during the stroke")
                 # Work images are always opaque. Erase-alpha Brush Assets may
@@ -1775,51 +1845,156 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 if np.any(source_rgba[..., 3] != 255):
                     source_rgba[..., 3] = 255
                     runtime.write_image_rgba8(source_image, source_rgba)
-                touched = np.any(source_rgba[..., :3] != before_rgba[..., :3], axis=2)
+                touched = source_gray != before_gray
                 if not np.any(touched):
+                    interactive_no_change = True
+                    try:
+                        from .studio import finish_provisional_stroke
+
+                        finish_provisional_stroke(context, project, changed=False)
+                    except (ImportError, ReferenceError, RuntimeError):
+                        pass
                     return {"FINISHED"}
                 _UNDO_FENCES.add(str(project.uuid))
-                before_history = {source_image.name: before_rgba}
-                after_history = {source_image.name: source_rgba}
-                if coverage_image is not None and coverage_before is not None:
+                try:
+                    from .studio import provisional_created_metadata
+
+                    created_metadata = provisional_created_metadata(project, active_item)
+                except (ImportError, ReferenceError, RuntimeError):
+                    created_metadata = None
+                display_key = f"display:{active_uuid}"
+                before_history[display_key] = before_gray
+                after_history = {display_key: source_gray}
+                if coverage_uuid and coverage_before is not None:
                     coverage_after = coverage_before.copy()
-                    coverage_after[..., :3][touched] = 255
-                    coverage_after[..., 3] = 255
-                    runtime.write_image_rgba8(coverage_image, coverage_after)
-                    before_history[coverage_image.name] = coverage_before
-                    after_history[coverage_image.name] = coverage_after
+                    coverage_after[touched] = True
+                    coverage_key = f"coverage:{active_uuid}"
+                    before_history[coverage_key] = coverage_before
+                    after_history[coverage_key] = coverage_after
+                else:
+                    raise ValueError("The active angle Coverage is missing")
+
+                # Propagate only pixels that actually crossed the binary
+                # threshold. This retains Blender's native soft brush and
+                # pressure values on the edited key while keeping every other
+                # key monotonic without rewriting unrelated images.
+                became_light = touched & (before_gray < 128) & (source_gray >= 128)
+                became_shadow = touched & (before_gray >= 128) & (source_gray < 128)
+                active_angle = float(active_item.angle)
+                planned_writes = []
+                for candidate in sorted(
+                    (
+                        item
+                        for item in project.angles
+                        if str(item.side) == str(active_item.side)
+                        and str(item.uuid) != active_uuid
+                    ),
+                    key=lambda item: float(item.angle),
+                ):
+                    candidate_angle = float(candidate.angle)
+                    footprint = (
+                        became_light
+                        if candidate_angle > active_angle
+                        else became_shadow
+                        if candidate_angle < active_angle
+                        else None
+                    )
+                    if footprint is None or not np.any(footprint):
+                        continue
+                    image = runtime.resolve_display_image(project, candidate)
+                    if image is None:
+                        raise ValueError("A Smart Paint destination image is missing")
+                    destination_before = runtime.image_gray8(image)
+                    destination_after = destination_before.copy()
+                    if candidate_angle > active_angle:
+                        changed = footprint & (destination_before < 128)
+                    else:
+                        changed = footprint & (destination_before >= 128)
+                    if not np.any(changed):
+                        continue
+                    destination_after[changed] = source_gray[changed]
+                    destination_coverage_before = runtime.coverage_mask(candidate).copy()
+                    destination_coverage_after = destination_coverage_before.copy()
+                    destination_coverage_after[changed] = True
+                    candidate_display_key = f"display:{candidate.uuid}"
+                    candidate_coverage_key = f"coverage:{candidate.uuid}"
+                    before_history[candidate_display_key] = destination_before
+                    before_history[candidate_coverage_key] = destination_coverage_before
+                    after_history[candidate_display_key] = destination_after
+                    after_history[candidate_coverage_key] = destination_coverage_after
+                    metadata_before[str(candidate.uuid)] = (
+                        bool(getattr(candidate, "is_manual", False)),
+                        bool(getattr(candidate, "dirty", False)),
+                    )
+                    planned_writes.append(
+                        (
+                            candidate,
+                            image,
+                            destination_after,
+                            destination_coverage_after,
+                        )
+                    )
+
+                metadata_before[active_uuid] = (
+                    bool(getattr(active_item, "is_manual", False)),
+                    bool(getattr(active_item, "dirty", False)),
+                )
+                for candidate, image, destination_after, destination_coverage_after in planned_writes:
+                    runtime.write_image_gray8(image, destination_after)
+                    runtime.set_coverage_mask(candidate, destination_coverage_after)
+                    candidate.is_manual = True
+                    candidate.dirty = True
+                runtime.set_coverage_mask(active_item, coverage_after)
                 history = _HISTORIES.setdefault(
                     str(project.uuid),
                     History(compression_level=1),
                 )
-                if not history.push("Paint", before_history, after_history):
-                    # Never let Undo silently skip an unrecorded newest stroke
-                    # and apply an older entry instead.
-                    history.clear()
+                metadata = {"created_key": created_metadata} if created_metadata else None
+                had_redo = history.can_redo
+                if not history.push(
+                    "Paint + Auto Key" if created_metadata else "Smart Paint",
+                    before_history,
+                    after_history,
+                    metadata=metadata,
+                ):
+                    raise RuntimeError("This stroke is too large for the Quick SDF Undo history")
+                if had_redo:
+                    _purge_history_orphans(str(project.uuid))
+                from .studio import finish_provisional_stroke
+
+                finish_provisional_stroke(context, project, changed=True)
                 complete_active_stroke(active_item, source_image)
                 return {"FINISHED"}
             except Exception as exc:
                 clear_histories(str(project.uuid))
                 try:
-                    if source_image is not None:
-                        runtime.write_image_rgba8(source_image, before_rgba)
+                    if before_history:
+                        _write_history_values(project, before_history)
+                    elif source_image is not None:
+                        runtime.write_image_gray8(source_image, before_gray)
                 except Exception:
                     pass
+                for item_uuid, flags in metadata_before.items():
+                    candidate = next(
+                        (item for item in project.angles if str(item.uuid) == item_uuid),
+                        None,
+                    )
+                    if candidate is not None:
+                        candidate.is_manual, candidate.dirty = flags
                 try:
-                    if coverage_image is not None and coverage_before is not None:
-                        runtime.write_image_rgba8(coverage_image, coverage_before)
-                except Exception:
+                    from .studio import finish_provisional_stroke
+
+                    finish_provisional_stroke(context, project, changed=False)
+                except (ImportError, ReferenceError, RuntimeError):
                     pass
                 self.report({"ERROR"}, f"Could not finish the paint stroke: {exc}")
                 return {"CANCELLED"}
             finally:
-                finish_stroke()
+                finish_stroke(no_change=interactive_no_change)
 
-        # Interactive Studio paint deliberately stays on Blender's native fast
-        # path. The former implementation copied and rewrote every 1024px angle
-        # layer after each stroke, blocking input for seconds and repeatedly
-        # rebuilding the preview material. Explicit scripts that captured a
-        # snapshot retain the compatibility propagation path below.
+        # API callers that bypassed the Studio snapshot retain the older
+        # compatibility path below. Normal 3D/2D Studio paint has already been
+        # committed transactionally above.
         if not runtime.has_paint_snapshot(project):
             active_item = runtime.active_angle(project)
             source_image = runtime.resolve_display_image(project, active_item) if active_item else None
@@ -1876,7 +2051,7 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 axis=0,
             )
             coverage = np.stack(
-                [runtime.coverage_mask(runtime.resolve_coverage_image(project, item)) for item in items],
+                [runtime.coverage_mask(item) for item in items],
                 axis=0,
             )
             before_mask = snapshot[..., 0] >= 0.5
@@ -1895,44 +2070,45 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             for index in result.affected_indices:
                 item = items[index]
                 display = runtime.resolve_display_image(project, item)
-                coverage_image = runtime.resolve_coverage_image(project, item)
-                if display is None or coverage_image is None:
+                if display is None:
                     raise ValueError("A Smart Paint image is missing")
-                before_history[display.name] = (
-                    runtime.rgba_to_u8(snapshot)
+                display_key = f"display:{item.uuid}"
+                coverage_key = f"coverage:{item.uuid}"
+                before_history[display_key] = (
+                    runtime.rgba_to_u8(snapshot)[..., 0]
                     if item.uuid == active_item.uuid
-                    else runtime.image_rgba8(display)
+                    else runtime.image_gray8(display)
                 )
-                before_history[coverage_image.name] = runtime.image_rgba8(coverage_image)
+                before_history[coverage_key] = runtime.coverage_mask(item).copy()
                 metadata_before[str(item.uuid)] = (
                     bool(getattr(item, "is_manual", False)),
                     bool(getattr(item, "dirty", False)),
                 )
-                affected.append((index, item, display, coverage_image))
-            for index, item, display, coverage_image in affected:
+                affected.append((index, item, display))
+            for index, item, display in affected:
                 key_footprint = result.footprints[index]
                 runtime.write_mask_overrides(
                     display,
                     result.masks[index],
                     key_footprint,
-                    coverage_image=coverage_image,
+                    coverage_item=item,
                 )
                 if item.uuid == active_item.uuid:
                     antialiased = runtime.image_rgba(display)
                     antialiased[..., :3][touched] = source_rgba[..., :3][touched]
                     runtime.write_image_rgba(display, antialiased)
-            after_history = {
-                name: runtime.image_rgba8(bpy.data.images[name]) for name in before_history
-            }
+            after_history = _history_values(project, before_history)
             # Publish per-key metadata only after every image write and readback
             # succeeded.  A failed multi-image stroke can then roll pixels back
             # without leaving keys marked as manually edited.
-            for _index, item, _display, _coverage_image in affected:
+            for _index, item, _display in affected:
                 item.is_manual = True
                 item.dirty = True
             history = _HISTORIES.setdefault(
                 str(project.uuid), History(compression_level=1)
             )
+            if history.can_redo:
+                _purge_history_orphans(str(project.uuid))
             if not history.push("Smart Paint", before_history, after_history):
                 history.clear()
             try:
@@ -1952,23 +2128,20 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
         except Exception as exc:
             clear_histories(str(project.uuid))
             if before_history:
-                for name, rgba in before_history.items():
-                    image = bpy.data.images.get(name)
-                    if image is not None:
-                        try:
-                            runtime.write_image_rgba8(image, rgba)
-                        except Exception:
-                            pass
+                try:
+                    _write_history_values(project, before_history)
+                except Exception:
+                    pass
             # Collection can fail after earlier angle images were captured but
             # before the active canvas was added. Restore that native stroke as
             # well; a CANCELLED compatibility operation must never leave paint
             # behind merely because ``before_history`` is partially populated.
-            if source_image.name not in before_history:
+            if f"display:{active_item.uuid}" not in before_history:
                 try:
                     runtime.write_image_rgba(source_image, snapshot)
                 except Exception:
                     pass
-            for _index, item, _display, _coverage_image in affected:
+            for _index, item, _display in affected:
                 previous = metadata_before.get(str(getattr(item, "uuid", "")))
                 if previous is not None:
                     try:
@@ -1998,7 +2171,12 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
             return {"CANCELLED"}
         aux_mask_uuid = ""
         try:
-            from .studio import active_session, back_to_paint, is_studio_active
+            from .studio import (
+                activate_provisional_for_stroke,
+                active_session,
+                back_to_paint,
+                is_studio_active,
+            )
 
             if is_studio_active(context, str(project.uuid)):
                 session = active_session(context)
@@ -2007,10 +2185,14 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
                     if session is not None
                     else ""
                 )
-                if not aux_mask_uuid and not back_to_paint(context, project):
-                    return {"CANCELLED"}
-        except (ImportError, AttributeError, ReferenceError, RuntimeError):
-            pass
+                if not aux_mask_uuid:
+                    if session is not None and session.provisional_uuid:
+                        activate_provisional_for_stroke(context, project)
+                    elif not back_to_paint(context, project):
+                        return {"CANCELLED"}
+        except (ImportError, AttributeError, ReferenceError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         try:
             from .studio import prepare_stroke_brush
 
@@ -2028,7 +2210,7 @@ class QUICKSDF_OT_paint_snapshot(bpy.types.Operator):
             else:
                 runtime.capture_interactive_paint_snapshot(
                     project,
-                    include_coverage=bool(project.boundary_tracks),
+                    include_coverage=True,
                 )
         except (RuntimeError, ValueError) as exc:
             try:
@@ -2101,21 +2283,51 @@ def register_macros() -> None:
     propagated.properties.invert = True
 
 
-def _history_images(names) -> dict[str, object]:
+def _angle_for_history_key(project, key: str):
+    _kind, _separator, uuid = str(key).partition(":")
+    return next(
+        (item for item in project.angles if str(item.uuid) == uuid),
+        None,
+    )
+
+
+def _history_values(project, names) -> dict[str, object]:
     result = {}
     for name in names:
-        image = bpy.data.images.get(name)
-        if image is not None:
-            result[name] = runtime.image_rgba8(image)
+        if str(name).startswith("display:"):
+            item = _angle_for_history_key(project, name)
+            image = runtime.resolve_display_image(project, item) if item is not None else None
+            if image is not None:
+                result[name] = runtime.image_gray8(image)
+        elif str(name).startswith("coverage:"):
+            item = _angle_for_history_key(project, name)
+            if item is not None:
+                result[name] = runtime.coverage_mask(item).copy()
+        else:
+            image = bpy.data.images.get(name)
+            if image is not None:
+                result[name] = runtime.image_rgba8(image)
     return result
 
 
-def _write_history_images(values) -> None:
-    for name, rgba in values.items():
-        image = bpy.data.images.get(name)
-        if image is None:
-            raise ValueError(f"The history image {name!r} is missing")
-        runtime.write_image_rgba8(image, rgba)
+def _write_history_values(project, values) -> None:
+    for name, value in values.items():
+        if str(name).startswith("display:"):
+            item = _angle_for_history_key(project, name)
+            image = runtime.resolve_display_image(project, item) if item is not None else None
+            if image is None:
+                raise ValueError(f"The history Display {name!r} is missing")
+            runtime.write_image_gray8(image, value)
+        elif str(name).startswith("coverage:"):
+            item = _angle_for_history_key(project, name)
+            if item is None:
+                raise ValueError(f"The history Coverage {name!r} is missing")
+            runtime.set_coverage_mask(item, value)
+        else:
+            image = bpy.data.images.get(name)
+            if image is None:
+                raise ValueError(f"The history image {name!r} is missing")
+            runtime.write_image_rgba8(image, value)
 
 
 def _mark_history_images_changed(project, image_names) -> None:
@@ -2123,6 +2335,12 @@ def _mark_history_images_changed(project, image_names) -> None:
 
     aux_items = []
     for name in image_names:
+        if str(name).startswith(("display:", "coverage:")):
+            item = _angle_for_history_key(project, name)
+            if item is not None:
+                item.is_manual = True
+                item.dirty = True
+            continue
         image = bpy.data.images.get(name)
         if image is None or str(image.get(runtime.ROLE_KEY, "")) != runtime.AUX_MASK_ROLE:
             continue
@@ -2151,6 +2369,76 @@ def _history_context_active(context, project) -> bool:
         return False
 
 
+def _created_key_metadata(metadata):
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("created_key")
+    return value if isinstance(value, dict) and value.get("kind") == "CREATE_KEY" else None
+
+
+def _attach_history_key(project, metadata) -> bool:
+    """Reattach an auto-created key before replaying its Redo pixels."""
+
+    created = _created_key_metadata(metadata)
+    if created is None:
+        return False
+    uuid = str(created["uuid"])
+    if any(str(item.uuid) == uuid for item in project.angles):
+        return False
+    image = bpy.data.images.get(str(created["display_image_name"]))
+    if image is None:
+        raise ValueError("The auto-key Redo canvas is no longer available")
+    item = project.angles.add()
+    item.uuid = uuid
+    item.angle = float(created["angle"])
+    item.side = str(created["side"])
+    item.display_image = image
+    item.display_image_name = image.name
+    item[runtime.BASE_BITPLANE_KEY] = bytes(created["base_blob"])
+    item[runtime.COVERAGE_BITPLANE_KEY] = bytes(created["coverage_blob"])
+    item.base_revision = int(created["base_revision"])
+    item.coverage_revision = int(created["coverage_revision"])
+    item.is_manual = True
+    item.dirty = True
+    runtime.tag_image(image, str(project.uuid), uuid, runtime.DISPLAY_ROLE)
+    _sort_angle_items(project)
+    return True
+
+
+def _detach_history_key(context, project, metadata) -> bool:
+    """Detach an auto-created key after restoring its pre-stroke pixels."""
+
+    created = _created_key_metadata(metadata)
+    if created is None:
+        return False
+    uuid = str(created["uuid"])
+    index = next(
+        (index for index, item in enumerate(project.angles) if str(item.uuid) == uuid),
+        -1,
+    )
+    if index < 0:
+        return False
+    side = str(project.angles[index].side)
+    angle = float(project.angles[index].angle)
+    image = runtime.resolve_display_image(project, project.angles[index])
+    project.angles.remove(index)
+    if image is not None:
+        runtime.tag_image(
+            image,
+            str(project.uuid),
+            uuid,
+            "history_orphan_display",
+        )
+    replacement = min(
+        (item for item in project.angles if str(item.side) == side),
+        key=lambda item: abs(float(item.angle) - angle),
+        default=None,
+    )
+    if replacement is not None:
+        _select_angle_uuid(context, project, str(replacement.uuid))
+    return True
+
+
 class QUICKSDF_OT_history_undo(bpy.types.Operator):
     bl_idname = "quicksdf.history_undo"
     bl_label = "Undo Quick SDF Stroke"
@@ -2174,26 +2462,22 @@ class QUICKSDF_OT_history_undo(bpy.types.Operator):
         history = _HISTORIES.get(uuid)
         if history is None or not history.can_undo:
             return {"FINISHED"}
-        current = _history_images(history.undo_keys)
-        moved = False
+        current = _history_values(project, history.undo_keys)
+        metadata = history.undo_metadata
         try:
-            restored = history.undo(current)
-            moved = True
-            _write_history_images(restored)
-            _mark_history_images_changed(project, restored)
+            action = history.undo_action(current)
+            if action is None:
+                return {"FINISHED"}
+            _write_history_values(project, action.images)
+            _mark_history_images_changed(project, action.images)
+            _detach_history_key(context, project, action.metadata)
         except Exception as exc:
-            # ``History`` is pure array state, while Blender Image writes may
-            # fail halfway through. Move the entry back and restore every
-            # original buffer so one Ctrl+Z is transactional.
             try:
-                if moved:
-                    history.redo(current)
+                _attach_history_key(project, metadata)
+                _write_history_values(project, current)
             except Exception:
-                clear_histories(uuid)
-            try:
-                _write_history_images(current)
-            except Exception:
-                clear_histories(uuid)
+                pass
+            clear_histories(uuid)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -2222,23 +2506,26 @@ class QUICKSDF_OT_history_redo(bpy.types.Operator):
         history = _HISTORIES.get(str(project.uuid))
         if history is None or not history.can_redo:
             return {"FINISHED"}
-        current = _history_images(history.redo_keys)
-        moved = False
+        metadata = history.redo_metadata
+        attached = False
         try:
-            restored = history.redo(current)
-            moved = True
-            _write_history_images(restored)
-            _mark_history_images_changed(project, restored)
+            attached = _attach_history_key(project, metadata)
+            current = _history_values(project, history.redo_keys)
+            action = history.redo_action(current)
+            if action is None:
+                return {"FINISHED"}
+            _write_history_values(project, action.images)
+            _mark_history_images_changed(project, action.images)
+            created = _created_key_metadata(action.metadata)
+            if created is not None:
+                _select_angle_uuid(context, project, str(created["uuid"]))
         except Exception as exc:
             try:
-                if moved:
-                    history.undo(current)
+                if attached:
+                    _detach_history_key(context, project, metadata)
             except Exception:
-                clear_histories(str(project.uuid))
-            try:
-                _write_history_images(current)
-            except Exception:
-                clear_histories(str(project.uuid))
+                pass
+            clear_histories(str(project.uuid))
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -2402,22 +2689,18 @@ def _export_revision_token(project):
             str(getattr(value, "uuid", "")),
         ),
     ):
-        layers = []
-        for resolver in (
-            runtime.resolve_display_image,
-            runtime.resolve_base_image,
-            runtime.resolve_coverage_image,
-        ):
-            image = resolver(project, item)
-            layers.append(
-                None
-                if image is None
-                else (
-                    str(image.name),
-                    tuple(int(value) for value in image.size[:]),
-                    int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
-                )
-            )
+        image = runtime.resolve_display_image(project, item)
+        layers = [
+            None
+            if image is None
+            else (
+                str(image.name),
+                tuple(int(value) for value in image.size[:]),
+                int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+            ),
+            runtime.bitplane_revision_token(item, "BASE"),
+            runtime.bitplane_revision_token(item, "COVERAGE"),
+        ]
         entries.append(
             (
                 str(getattr(item, "uuid", "")),
@@ -2858,6 +3141,7 @@ class QUICKSDF_OT_packing_preview_channel(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         try:
             result = _generate_export(project, context)
             rgba = np.array(result["rgba"], copy=True, order="C")
@@ -2888,6 +3172,7 @@ class QUICKSDF_OT_generate(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         try:
             _generate(project, context)
         except Exception as exc:
@@ -2931,6 +3216,7 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
+        _discard_provisional(context, project)
         path_text = self.filepath or project.output_path
         if not path_text:
             self.report({"ERROR"}, "Choose an output PNG path")

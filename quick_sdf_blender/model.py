@@ -25,13 +25,16 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # Eight evenly spaced authoring stages.  The values are intentionally not
 # rounded: interpolation and export use the exact normalized position i / 7.
 DEFAULT_KEY_ANGLES = tuple(index * 90.0 / 7.0 for index in range(8))
 # Public name used by project creation. A linked/mirrored project authors one
 # 0..90 degree side; the opposite side is generated live.
 DEFAULT_ANGLES = DEFAULT_KEY_ANGLES
+MAX_KEYS_PER_SIDE = 16
+AUTO_KEY_ANGLE_STEP = 1.0
+AUTO_KEY_SNAP_DEGREES = 2.0
 
 
 SIDE_ITEMS = (
@@ -217,10 +220,12 @@ class QSDFAngle(PropertyGroup):
     side: EnumProperty(name="Side", items=SIDE_ITEMS, default="RIGHT")
     display_image: PointerProperty(name="Display Image", type=bpy.types.Image)
     display_image_name: StringProperty(name="Display Image Name", default="")
-    base_image: PointerProperty(name="Base Mask", type=bpy.types.Image)
-    base_image_name: StringProperty(name="Base Image Name", default="")
-    coverage_image: PointerProperty(name="Override Coverage", type=bpy.types.Image)
-    coverage_image_name: StringProperty(name="Coverage Image Name", default="")
+    # Base and override coverage are binary data, not paint canvases.  Their
+    # encoded payloads live in the ``_qsdf_base_bitplane`` and
+    # ``_qsdf_coverage_bitplane`` ID properties on this item so Blender never
+    # expands them into resident RGBA image buffers.
+    base_revision: IntProperty(name="Base Revision", default=0, min=0, options={"HIDDEN"})
+    coverage_revision: IntProperty(name="Coverage Revision", default=0, min=0, options={"HIDDEN"})
     retimed: BoolProperty(name="Retimed", default=False)
     is_manual: BoolProperty(name="Manual", default=False)
     is_generated: BoolProperty(name="Generated", default=True)
@@ -281,7 +286,9 @@ class QSDFProject(PropertyGroup):
     schema_version: IntProperty(
         name="Schema Version",
         default=SCHEMA_VERSION,
-        min=SCHEMA_VERSION,
+        # Keep the serialized value observable so older projects can be
+        # rejected explicitly instead of being silently clamped to schema 6.
+        min=1,
         max=SCHEMA_VERSION,
     )
     name: StringProperty(name="Name", default="Quick SDF")
@@ -504,7 +511,7 @@ def is_current_schema(project) -> bool:
 
 
 def validate_schema(project):
-    """Require schema 5 and return the validated project for call chaining."""
+    """Require schema 6 and return the validated project for call chaining."""
 
     actual = getattr(project, "schema_version", None)
     if not is_current_schema(project):

@@ -47,7 +47,12 @@ _IMAGE_SHADER: Any = None
 
 def _visible_keys(project: Any) -> list[tuple[int, Any]]:
     keys = list(enumerate(getattr(project, "angles", ())))
-    edit_side = str(getattr(project, "authoring_side", "RIGHT"))
+    independent = str(getattr(project, "symmetry_mode", "AUTO")) == "INDEPENDENT"
+    edit_side = str(
+        getattr(project, "active_side", "RIGHT")
+        if independent
+        else getattr(project, "authoring_side", "RIGHT")
+    )
     if keys and hasattr(keys[0][1], "side"):
         keys = [(index, item) for index, item in keys if str(item.side) == edit_side]
     else:
@@ -279,13 +284,12 @@ def _draw_timeline() -> None:
     geometry = build_geometry(context.region.width, context.region.height, keys)
     active = int(getattr(project, "active_angle_index", -1))
     affected = _affected_indices(project, keys)
-    previewing = bool(session is not None and session.view_mode == "PREVIEW")
-    show_hint = bool(session is not None and session.show_first_stroke_hint)
-    highlighted = (
-        _nearest_key_index(keys, _seek_value(project)) if previewing else active
+    previewing = bool(
+        session is not None
+        and session.view_mode in {"PREVIEW", "PROVISIONAL", "PROVISIONAL_STROKE"}
     )
-    if previewing and highlighted is not None:
-        affected = {highlighted}
+    show_hint = bool(session is not None and session.show_first_stroke_hint)
+    highlighted = active
     bbox_values = tuple(float(value) for value in getattr(project, "thumbnail_uv_bbox", (0.0, 0.0, 1.0, 1.0)))
     uv_bbox = bbox_values if (
         len(bbox_values) == 4
@@ -321,7 +325,7 @@ def _draw_timeline() -> None:
                 _rect(Rect(rect.x1 - 6, rect.y1 - 6, rect.x1 - 4, rect.y1 - 4), (0.70, 0.74, 0.80, 1.0))
         _rect(
             Rect(seek_x - 1.0, 4.0, seek_x + 1.0, geometry.rail.y1 + 5.0),
-            (0.25, 0.72, 1.0, 1.0),
+            (1.0, 0.48, 0.08, 1.0) if previewing else (0.25, 0.72, 1.0, 1.0),
         )
         from .i18n import tr
 
@@ -341,8 +345,55 @@ def _draw_timeline() -> None:
             color=semantic_color, size=9,
         )
         if not show_hint:
-            _rect(label_rect, (0.16, 0.48, 0.78, 1.0))
+            _rect(
+                label_rect,
+                (0.72, 0.30, 0.05, 1.0) if previewing else (0.16, 0.48, 0.78, 1.0),
+            )
             _text(label_text, label_rect.x0 + 4.0, label_rect.y0 + 2.0, size=10)
+        if session is not None:
+            from .model import MAX_KEYS_PER_SIDE
+
+            count = len(keys)
+            _text(
+                f"{count} / {MAX_KEYS_PER_SIDE}",
+                max(2.0, context.region.width - 54.0),
+                geometry.rail.y1 + 5.0,
+                color=(0.58, 0.62, 0.68, 1.0),
+                size=9,
+            )
+            state = str(getattr(session, "provisional_state", "NONE"))
+            if state == "PREPARING":
+                _text(
+                    f"{tr('Preparing this angle')} {float(session.provisional_angle):.0f}°…",
+                    geometry.rail.x0,
+                    geometry.rail.y1 + 5.0,
+                    color=(1.0, 0.63, 0.18, 1.0),
+                    size=11,
+                )
+            elif state == "READY":
+                _text(
+                    tr("Paint here to add this angle"),
+                    geometry.rail.x0,
+                    geometry.rail.y1 + 5.0,
+                    color=(1.0, 0.72, 0.24, 1.0),
+                    size=11,
+                )
+            elif state == "LIMIT":
+                _text(
+                    tr("Maximum 16 keys · select or delete a key"),
+                    geometry.rail.x0,
+                    geometry.rail.y1 + 5.0,
+                    color=(1.0, 0.28, 0.18, 1.0),
+                    size=11,
+                )
+            elif not show_hint and str(getattr(session, "projection_hint", "")):
+                _text(
+                    tr(str(session.projection_hint)),
+                    geometry.rail.x0,
+                    geometry.rail.y1 + 5.0,
+                    color=(0.72, 0.76, 0.82, 1.0),
+                    size=10,
+                )
         if show_hint and session is not None:
             message = session.first_hint_text or "Choose an angle · choose Light or Shadow · paint"
             _text(tr(message), geometry.rail.x0, geometry.rail.y1 + 5.0, size=11)
@@ -412,6 +463,16 @@ def _set_seek(context: Any, project: Any, value: float) -> None:
         project.seek_angle = value
     elif hasattr(project, "review_angle"):
         project.review_angle = value
+    tag_timeline_redraw()
+
+
+def _settle_seek(context: Any, project: Any, value: float) -> None:
+    try:
+        from .studio import settle_seek
+
+        settle_seek(context, project, value)
+    except (ImportError, AttributeError, ReferenceError, RuntimeError, ValueError):
+        _set_seek(context, project, value)
     tag_timeline_redraw()
 
 
@@ -499,12 +560,11 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
             geometry = build_geometry(context.region.width, context.region.height, _visible_keys(project))
             _set_seek(context, project, geometry.angle_from_x(float(event.mouse_region_x)))
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            keys = _visible_keys(project)
-            geometry = build_geometry(context.region.width, context.region.height, keys)
+            geometry = build_geometry(
+                context.region.width, context.region.height, _visible_keys(project)
+            )
             angle = geometry.angle_from_x(float(event.mouse_region_x))
-            index = _nearest_key_index(keys, angle)
-            if index is not None:
-                _select_key(context, project, index)
+            _settle_seek(context, project, angle)
             self._dragging = False
             return {"FINISHED"}
         return {"RUNNING_MODAL"}
@@ -519,9 +579,7 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
         if cancel:
             self._restore_initial_key(context, project)
         else:
-            index = _nearest_key_index(_visible_keys(project), _seek_value(project))
-            if index is not None:
-                _select_key(context, project, index)
+            _settle_seek(context, project, _seek_value(project))
         self._dragging = False
 
 

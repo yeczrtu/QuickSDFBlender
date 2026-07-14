@@ -13,7 +13,14 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 
-from .model import DEFAULT_ANGLES, SCHEMA_VERSION
+from .bitplane import (
+    BitplaneError,
+    BitplaneRole,
+    DecodedBitplaneCache,
+    encode_bitplane,
+    inspect_bitplane_header,
+)
+from .model import DEFAULT_ANGLES, MAX_KEYS_PER_SIDE, SCHEMA_VERSION
 
 
 PROJECT_UUID_KEY = "quick_sdf_project_uuid"
@@ -23,8 +30,6 @@ IMAGE_REVISION_KEY = "quick_sdf_revision"
 AUX_MASK_UUID_KEY = "quick_sdf_aux_mask_uuid"
 AUX_MASK_INITIALIZED_KEY = "quick_sdf_aux_mask_initialized"
 DISPLAY_ROLE = "angle_display"
-BASE_ROLE = "angle_base"
-COVERAGE_ROLE = "angle_coverage"
 AUX_MASK_ROLE = "aux_mask"
 THRESHOLD_ROLE = "threshold_preview"
 EXPORT_ADJUSTMENT_ROLE = "export_adjustment_preview"
@@ -34,6 +39,9 @@ _INTERACTIVE_PAINT_SNAPSHOTS: dict[str, tuple[str, str, Any, str, Any | None]] =
 _AUX_PAINT_SNAPSHOTS: dict[str, tuple[str, str, Any]] = {}
 _BASE_BAKE_UUIDS: set[str] = set()
 _PENDING_BASE_SIGNATURES: set[str] = set()
+BASE_BITPLANE_KEY = "_qsdf_base_bitplane"
+COVERAGE_BITPLANE_KEY = "_qsdf_coverage_bitplane"
+_BITPLANE_CACHE = DecodedBitplaneCache()
 
 
 def new_uuid() -> str:
@@ -111,8 +119,6 @@ def active_angle(project: Any) -> Any | None:
 
 _LAYER_FIELDS = {
     DISPLAY_ROLE: ("display_image", "display_image_name"),
-    BASE_ROLE: ("base_image", "base_image_name"),
-    COVERAGE_ROLE: ("coverage_image", "coverage_image_name"),
 }
 
 
@@ -165,12 +171,102 @@ def resolve_display_image(project: Any, angle_item: Any) -> bpy.types.Image | No
     return resolve_angle_data_image(project, angle_item, DISPLAY_ROLE)
 
 
-def resolve_base_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
-    return resolve_angle_data_image(project, angle_item, BASE_ROLE)
+def _bitplane_spec(role: BitplaneRole) -> tuple[str, str]:
+    return (
+        (BASE_BITPLANE_KEY, "base_revision")
+        if role is BitplaneRole.BASE
+        else (COVERAGE_BITPLANE_KEY, "coverage_revision")
+    )
 
 
-def resolve_coverage_image(project: Any, angle_item: Any) -> bpy.types.Image | None:
-    return resolve_angle_data_image(project, angle_item, COVERAGE_ROLE)
+def bitplane_blob(angle_item: Any, role: BitplaneRole | str) -> bytes:
+    semantic_role = BitplaneRole[role.upper()] if isinstance(role, str) else role
+    property_name, _revision_name = _bitplane_spec(semantic_role)
+    value = angle_item.get(property_name)
+    if not isinstance(value, bytes):
+        raise BitplaneError(f"Missing {semantic_role.name.title()} bitplane")
+    return value
+
+
+def _read_bitplane(angle_item: Any, role: BitplaneRole) -> Any:
+    property_name, revision_name = _bitplane_spec(role)
+    blob = angle_item.get(property_name)
+    if not isinstance(blob, bytes):
+        raise BitplaneError(f"Missing {role.name.title()} bitplane")
+    identifier = f"{getattr(angle_item, 'uuid', '')}:{role.name}"
+    return _BITPLANE_CACHE.decode(
+        identifier,
+        int(getattr(angle_item, revision_name, 0)),
+        blob,
+        expected_role=role,
+    )
+
+
+def base_mask(angle_item: Any) -> Any:
+    """Return the immutable top-down Base bitplane for an angle key."""
+
+    return _read_bitplane(angle_item, BitplaneRole.BASE)
+
+
+def coverage_mask(image_or_angle: Any) -> Any:
+    """Return the immutable top-down override bitplane for a key or Display."""
+
+    angle_item = image_or_angle
+    if isinstance(image_or_angle, bpy.types.Image):
+        _project, angle_item = _project_angle_for_image(image_or_angle)
+    if angle_item is None:
+        raise BitplaneError("The Display image is not attached to an angle key")
+    return _read_bitplane(angle_item, BitplaneRole.COVERAGE)
+
+
+def _set_bitplane(angle_item: Any, role: BitplaneRole, plane: Any) -> None:
+    import numpy as np
+
+    values = np.ascontiguousarray(plane, dtype=np.bool_)
+    if values.ndim != 2:
+        raise ValueError("Bitplane values must be a two-dimensional mask")
+    property_name, revision_name = _bitplane_spec(role)
+    # Blender 5.1's in-place assignment path for an existing byte-string
+    # IDProperty treats embedded NUL bytes as a C string terminator. Recreate
+    # the property so arbitrary binary payloads remain byte-exact.
+    if property_name in angle_item:
+        del angle_item[property_name]
+    angle_item[property_name] = encode_bitplane(values, role)
+    setattr(angle_item, revision_name, int(getattr(angle_item, revision_name, 0)) + 1)
+    _BITPLANE_CACHE.invalidate(f"{getattr(angle_item, 'uuid', '')}:{role.name}")
+
+
+def set_base_mask(angle_item: Any, plane: Any) -> None:
+    _set_bitplane(angle_item, BitplaneRole.BASE, plane)
+
+
+def set_coverage_mask(angle_item: Any, plane: Any) -> None:
+    _set_bitplane(angle_item, BitplaneRole.COVERAGE, plane)
+
+
+def copy_angle_bitplanes(source: Any, destination: Any) -> None:
+    """Copy compact Base/Coverage payloads without decoding them."""
+
+    for role in (BitplaneRole.BASE, BitplaneRole.COVERAGE):
+        property_name, revision_name = _bitplane_spec(role)
+        if property_name in destination:
+            del destination[property_name]
+        destination[property_name] = bytes(bitplane_blob(source, role))
+        setattr(destination, revision_name, int(getattr(source, revision_name, 0)))
+
+
+def bitplane_revision_token(angle_item: Any, role: BitplaneRole | str) -> tuple[Any, ...]:
+    semantic_role = BitplaneRole[role.upper()] if isinstance(role, str) else role
+    _property_name, revision_name = _bitplane_spec(semantic_role)
+    blob = bitplane_blob(angle_item, semantic_role)
+    header = inspect_bitplane_header(blob)
+    return (
+        int(getattr(angle_item, revision_name, 0)),
+        header.width,
+        header.height,
+        header.crc32,
+        len(blob),
+    )
 
 
 def resolve_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | None:
@@ -280,19 +376,14 @@ def create_angle_layer_image(
     *,
     side: str = "RIGHT",
 ) -> bpy.types.Image:
-    if role not in _LAYER_FIELDS:
+    if role != DISPLAY_ROLE:
         raise ValueError(f"Unknown angle image role: {role!r}")
     stem = project_uuid.split("-", 1)[0]
-    label = {
-        DISPLAY_ROLE: "Mask",
-        BASE_ROLE: "Base",
-        COVERAGE_ROLE: "Coverage",
-    }[role]
+    label = "Mask"
     name = f"QSDF {label} {stem} {side.title()} {angle:04.1f}"
     image = bpy.data.images.new(name, width=resolution, height=resolution, alpha=True, float_buffer=False)
     image.generated_type = "BLANK"
-    value = 0.0 if role == COVERAGE_ROLE else 1.0
-    image.generated_color = (value, value, value, 1.0)
+    image.generated_color = (1.0, 1.0, 1.0, 1.0)
     tag_image(image, project_uuid, angle_uuid, role)
     make_image_opaque(image)
     # generated_color is applied by Blender to the generated buffer.  Setting one
@@ -420,32 +511,29 @@ def copy_image_channel_to_aux(
 
 
 def create_project_images(project: Any, source: bpy.types.Image | None = None) -> None:
+    import numpy as np
+
+    resolution = int(project.resolution)
     for value in DEFAULT_ANGLES:
         angle_item = project.angles.add()
         angle_item.uuid = new_uuid()
         angle_item.angle = value
         angle_item.side = str(getattr(project, "authoring_side", "RIGHT"))
         display = create_angle_layer_image(
-            project.uuid, angle_item.uuid, value, int(project.resolution), DISPLAY_ROLE,
-            side=angle_item.side,
-        )
-        base = create_angle_layer_image(
-            project.uuid, angle_item.uuid, value, int(project.resolution), BASE_ROLE,
-            side=angle_item.side,
-        )
-        coverage = create_angle_layer_image(
-            project.uuid, angle_item.uuid, value, int(project.resolution), COVERAGE_ROLE,
+            project.uuid, angle_item.uuid, value, resolution, DISPLAY_ROLE,
             side=angle_item.side,
         )
         angle_item.display_image = display
         angle_item.display_image_name = display.name
-        angle_item.base_image = base
-        angle_item.base_image_name = base.name
-        angle_item.coverage_image = coverage
-        angle_item.coverage_image_name = coverage.name
         if source is not None:
             copy_image_pixels(source, display)
-            copy_image_pixels(source, base)
+            base = image_mask(display)
+        else:
+            base = np.ones((resolution, resolution), dtype=np.bool_)
+        set_base_mask(angle_item, base)
+        set_coverage_mask(
+            angle_item, np.zeros((resolution, resolution), dtype=np.bool_)
+        )
     project.active_angle_index = min(
         range(len(project.angles)),
         key=lambda index: abs(float(project.angles[index].angle) - 45.0),
@@ -645,14 +733,12 @@ def initialize_normal_sweep(project: Any) -> None:
         masks = masks[:, sample[:, None], sample[None, :]]
     for angle_item, mask in zip(project.angles, masks):
         display = resolve_display_image(project, angle_item)
-        base = resolve_base_image(project, angle_item)
         if display is None:
             continue
         rgba = np.ones((resolution, resolution, 4), dtype=np.float32)
         rgba[..., :3] = mask[..., None]
         write_image_rgba(display, rgba)
-        if base is not None:
-            write_image_rgba(base, rgba)
+        set_base_mask(angle_item, mask)
 
 
 def ensure_palette(scene: bpy.types.Scene) -> bpy.types.Palette:
@@ -830,6 +916,27 @@ def image_rgba8(image: bpy.types.Image) -> Any:
     return blender_float_rgba_to_top_down_u8(flat, width, height)
 
 
+def image_gray8(image: bpy.types.Image) -> Any:
+    """Return the logical grayscale channel used by a Display image."""
+
+    return image_rgba8(image)[..., 0].copy()
+
+
+def write_image_gray8(image: bpy.types.Image, values: Any) -> None:
+    """Expand a top-down uint8 plane into Blender's opaque RGBA canvas."""
+
+    import numpy as np
+
+    gray = np.asarray(values)
+    width, height = map(int, image.size[:])
+    if gray.shape != (height, width) or gray.dtype != np.uint8:
+        raise ValueError("Display history plane must be a matching uint8 image")
+    rgba = np.empty((height, width, 4), dtype=np.uint8)
+    rgba[..., :3] = gray[..., None]
+    rgba[..., 3] = 255
+    write_image_rgba8(image, rgba)
+
+
 def capture_paint_snapshot(project: Any) -> None:
     angle_item = active_angle(project)
     image = resolve_display_image(project, angle_item) if angle_item is not None else None
@@ -852,19 +959,15 @@ def capture_interactive_paint_snapshot(
 
     angle_item = active_angle(project)
     display = resolve_display_image(project, angle_item) if angle_item is not None else None
-    coverage = (
-        resolve_coverage_image(project, angle_item)
-        if include_coverage and angle_item is not None
-        else None
-    )
-    if angle_item is None or display is None or (include_coverage and coverage is None):
+    coverage = coverage_mask(angle_item).copy() if include_coverage and angle_item is not None else None
+    if angle_item is None or display is None:
         raise ValueError("The active angle paint layers are incomplete")
     _INTERACTIVE_PAINT_SNAPSHOTS[str(project.uuid)] = (
         str(angle_item.uuid),
         str(display.name),
-        image_rgba8(display),
-        str(coverage.name) if coverage is not None else "",
-        image_rgba8(coverage) if coverage is not None else None,
+        image_gray8(display),
+        str(angle_item.uuid) if coverage is not None else "",
+        coverage,
     )
 
 
@@ -915,11 +1018,10 @@ def consume_paint_snapshot(project: Any) -> Any | None:
     # baseline mask consumed by that operator) unchanged.
     angle_item = active_angle(project)
     display = resolve_display_image(project, angle_item) if angle_item is not None else None
-    coverage = resolve_coverage_image(project, angle_item) if angle_item is not None else None
-    if display is None or coverage is None:
+    if display is None or angle_item is None:
         return None
     current = image_rgba(display)
-    covered = image_mask(coverage)
+    covered = coverage_mask(angle_item)
     if not covered.any():
         return None
     synthetic = current.copy()
@@ -953,35 +1055,18 @@ def _project_angle_for_image(image: bpy.types.Image) -> tuple[Any | None, Any | 
     return None, None
 
 
-def _coverage_for_display(image: bpy.types.Image) -> bpy.types.Image | None:
+def _coverage_for_display(image: bpy.types.Image) -> Any | None:
     project, angle_item = _project_angle_for_image(image)
     if project is None or angle_item is None:
         return None
-    return resolve_coverage_image(project, angle_item)
+    return angle_item
 
 
-def _base_for_display(image: bpy.types.Image) -> bpy.types.Image | None:
+def _base_for_display(image: bpy.types.Image) -> Any | None:
     project, angle_item = _project_angle_for_image(image)
     if project is None or angle_item is None:
         return None
-    return resolve_base_image(project, angle_item)
-
-
-def coverage_mask(image_or_display: bpy.types.Image) -> Any:
-    """Return top-down override coverage for a coverage or display image."""
-
-    role = str(image_or_display.get(ROLE_KEY, ""))
-    coverage = (
-        image_or_display
-        if role == COVERAGE_ROLE
-        else _coverage_for_display(image_or_display)
-    )
-    if coverage is None:
-        import numpy as np
-
-        width, height = image_or_display.size[:]
-        return np.zeros((height, width), dtype=np.bool_)
-    return image_mask(coverage)
+    return angle_item
 
 
 def materialize_effective_coverage(
@@ -1001,46 +1086,37 @@ def materialize_effective_coverage(
     added = 0
     for angle_item in tuple(angle_items if angle_items is not None else project.angles):
         display = resolve_display_image(project, angle_item)
-        base = resolve_base_image(project, angle_item)
-        coverage = resolve_coverage_image(project, angle_item)
-        if display is None or base is None or coverage is None:
+        if display is None:
             raise ValueError("An angle paint layer is missing")
-        display_rgba = image_rgba(display)
-        base_rgba = image_rgba(base)
-        coverage_rgba = image_rgba(coverage)
-        stored = coverage_rgba[..., 0] >= 0.5
-        visible_delta = np.any(
-            np.abs(display_rgba[..., :3] - base_rgba[..., :3]) > (0.5 / 255.0),
-            axis=2,
-        )
+        display_values = image_rgba8(display)[..., 0]
+        base_values = base_mask(angle_item)
+        stored = coverage_mask(angle_item)
+        visible_delta = display_values != np.where(base_values, 255, 0)
         effective = stored | visible_delta
         newly_added = effective & ~stored
         if not np.any(newly_added):
             continue
-        coverage_rgba[..., :3][newly_added] = 1.0
-        coverage_rgba[..., 3] = 1.0
-        write_image_rgba(coverage, coverage_rgba)
+        set_coverage_mask(angle_item, effective)
         added += int(np.count_nonzero(newly_added))
     return added
 
 
-def _mark_coverage(coverage: bpy.types.Image, region: Any, value: bool) -> None:
+def _mark_coverage(angle_item: Any, region: Any, value: bool) -> None:
     import numpy as np
 
-    rgba = image_rgba(coverage)
+    coverage = np.array(coverage_mask(angle_item), copy=True)
     changed = np.asarray(region, dtype=np.bool_)
-    if changed.shape != rgba.shape[:2]:
+    if changed.shape != coverage.shape:
         raise ValueError("Override region must match the image dimensions")
-    rgba[..., :3][changed] = 1.0 if value else 0.0
-    rgba[..., 3] = 1.0
-    write_image_rgba(coverage, rgba)
+    coverage[changed] = bool(value)
+    set_coverage_mask(angle_item, coverage)
 
 
 def write_mask_overrides(
     image: bpy.types.Image,
     mask: Any,
     override: Any,
-    coverage_image: bpy.types.Image | None = None,
+    coverage_item: Any | None = None,
 ) -> None:
     """Write display RGB and mark its separate persistent coverage layer."""
     import numpy as np
@@ -1053,9 +1129,9 @@ def write_mask_overrides(
     rgba[..., :3][footprint] = binary[footprint, None].astype(np.float32)
     rgba[..., 3] = 1.0
     write_image_rgba(image, rgba)
-    coverage_image = coverage_image or _coverage_for_display(image)
-    if coverage_image is not None:
-        _mark_coverage(coverage_image, footprint, True)
+    coverage_item = coverage_item or _coverage_for_display(image)
+    if coverage_item is not None:
+        _mark_coverage(coverage_item, footprint, True)
 
 
 def restore_image_region(image: bpy.types.Image, snapshot: Any, region: Any) -> None:
@@ -1074,12 +1150,12 @@ def restore_image_region(image: bpy.types.Image, snapshot: Any, region: Any) -> 
 def mark_override_region(
     image: bpy.types.Image,
     region: Any,
-    coverage_image: bpy.types.Image | None = None,
+    coverage_item: Any | None = None,
 ) -> None:
-    coverage_image = coverage_image or _coverage_for_display(image)
-    if coverage_image is None:
+    coverage_item = coverage_item or _coverage_for_display(image)
+    if coverage_item is None:
         return
-    _mark_coverage(coverage_image, region, True)
+    _mark_coverage(coverage_item, region, True)
 
 
 def project_mask_stack(project: Any) -> tuple[Any, Any]:
@@ -1164,27 +1240,21 @@ def project_side_export_layers(project: Any, side: str) -> tuple[Any, Any, Any, 
     for item in selected:
         angle = float(item.angle)
         display = resolve_display_image(project, item)
-        base = resolve_base_image(project, item)
-        coverage = resolve_coverage_image(project, item)
         if display is None:
             raise ValueError(f"Missing {side.title()} mask at {angle:g} degrees")
-        if base is None:
-            raise ValueError(f"Missing {side.title()} base mask at {angle:g} degrees")
-        if coverage is None:
-            raise ValueError(f"Missing {side.title()} override coverage at {angle:g} degrees")
         display_mask = image_mask(display)
-        base_mask = image_mask(base)
-        coverage_values = coverage_mask(coverage)
+        base_values = base_mask(item)
+        coverage_values = coverage_mask(item)
         if expected_shape is None:
             expected_shape = display_mask.shape
         if (
             display_mask.shape != expected_shape
-            or base_mask.shape != expected_shape
+            or base_values.shape != expected_shape
             or coverage_values.shape != expected_shape
         ):
             raise ValueError("All export layers must use the same resolution")
         display_layers.append(display_mask)
-        base_layers.append(base_mask)
+        base_layers.append(base_values)
         coverage_layers.append(coverage_values)
         angles.append(angle)
     return (
@@ -1323,17 +1393,16 @@ def clear_image_alpha(image: bpy.types.Image) -> None:
     """Clear separate overrides and restore the current base RGB."""
     import numpy as np
 
-    coverage = _coverage_for_display(image)
-    base = _base_for_display(image)
-    if coverage is None or base is None:
+    angle_item = _coverage_for_display(image)
+    if angle_item is None:
         raise ValueError("The paint override layers are incomplete")
-    overridden = coverage_mask(coverage)
+    overridden = coverage_mask(angle_item)
     rgba = image_rgba(image)
-    base_rgba = image_rgba(base)
-    rgba[..., :3][overridden] = base_rgba[..., :3][overridden]
+    base_values = base_mask(angle_item)
+    rgba[..., :3][overridden] = base_values[overridden, None].astype(rgba.dtype)
     rgba[..., 3] = 1.0
     write_image_rgba(image, rgba)
-    _mark_coverage(coverage, np.ones(overridden.shape, dtype=np.bool_), False)
+    set_coverage_mask(angle_item, np.zeros(overridden.shape, dtype=np.bool_))
 
 
 def remove_project_images(project: Any) -> None:
@@ -1406,6 +1475,11 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
             errors.append(f"{side.title()} keys require a 0 degree endpoint.")
         if not any(math.isclose(value, 90.0, abs_tol=1.0e-4) for value in values):
             errors.append(f"{side.title()} keys require a 90 degree endpoint.")
+        if len(values) > MAX_KEYS_PER_SIDE:
+            errors.append(
+                f"{side.title()} has {len(values)} angle keys; the maximum is "
+                f"{MAX_KEYS_PER_SIDE}."
+            )
     if not side_values["RIGHT"] and not side_values["LEFT"]:
         errors.append("Project has no angle keys.")
     for angle_item in project.angles:
@@ -1414,10 +1488,13 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
             errors.append(f"Missing mask at {angle_item.angle:+g} degrees.")
         elif tuple(image.size[:]) != (int(project.resolution), int(project.resolution)):
             errors.append(f"Mask size differs at {angle_item.angle:+g} degrees.")
-        if resolve_base_image(project, angle_item) is None:
-            errors.append(f"Missing base mask at {angle_item.angle:+g} degrees.")
-        if resolve_coverage_image(project, angle_item) is None:
-            errors.append(f"Missing override coverage at {angle_item.angle:+g} degrees.")
+        for label, getter in (("base mask", base_mask), ("override coverage", coverage_mask)):
+            try:
+                plane = getter(angle_item)
+                if plane.shape != (int(project.resolution), int(project.resolution)):
+                    errors.append(f"{label.title()} size differs at {angle_item.angle:+g} degrees.")
+            except (BitplaneError, TypeError, ValueError):
+                errors.append(f"Missing or corrupt {label} at {angle_item.angle:+g} degrees.")
     aux_uuids: set[str] = set()
     aux_roles: dict[str, int] = {}
     for item in getattr(project, "aux_masks", ()):
@@ -1465,8 +1542,6 @@ def repair_project_references(scene: bpy.types.Scene) -> None:
     for project in getattr(scene, "quick_sdf_projects", ()):
         for angle_item in project.angles:
             resolve_display_image(project, angle_item)
-            resolve_base_image(project, angle_item)
-            resolve_coverage_image(project, angle_item)
         for aux_item in getattr(project, "aux_masks", ()):
             resolve_aux_mask_image(project, aux_item)
 
@@ -1512,6 +1587,7 @@ def _load_or_undo_post(_unused: Any) -> None:
     _PAINT_SNAPSHOTS.clear()
     _INTERACTIVE_PAINT_SNAPSHOTS.clear()
     _AUX_PAINT_SNAPSHOTS.clear()
+    _BITPLANE_CACHE.clear()
     try:
         from .operators import clear_histories
 
@@ -1542,7 +1618,7 @@ def _save_project_images(_unused: Any) -> None:
     # Export review is derived data.  Never serialize a potentially 4K
     # heatmap into the artist's source-of-truth blend file.
     cleanup_export_adjustment_previews()
-    persistent_roles = {DISPLAY_ROLE, BASE_ROLE, COVERAGE_ROLE, AUX_MASK_ROLE}
+    persistent_roles = {DISPLAY_ROLE, AUX_MASK_ROLE}
     for image in tuple(bpy.data.images):
         if image.get(ROLE_KEY) not in persistent_roles or not image.get(PROJECT_UUID_KEY):
             continue
@@ -1651,6 +1727,7 @@ def unregister_runtime() -> None:
         pass
     _BASE_BAKE_UUIDS.clear()
     _PENDING_BASE_SIGNATURES.clear()
+    _BITPLANE_CACHE.clear()
     if bpy.app.timers.is_registered(_deferred_base_check):
         bpy.app.timers.unregister(_deferred_base_check)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import floor, hypot
-from typing import Any, Iterable, MutableSequence, Sequence
+from typing import Any, Callable, Iterable, MutableSequence, Sequence
 
 
 EPSILON = 1.0e-9
@@ -196,6 +196,51 @@ def validate_curve(points: Sequence[Any], closed: bool = False) -> tuple[bool, s
     if curve_self_intersects(source, closed=closed):
         return False, "Boundary self-intersects"
     return True, ""
+
+
+def _evaluate_boundary_tracks(
+    base_mask: Any,
+    angle: float,
+    side: str,
+    tracks: Iterable[Any],
+    region_resolver: Callable[[Any, Sequence[Any], int, int], Sequence[int | bool]],
+) -> Any:
+    """Return a binary Base copy with matching Boundary Tracks applied.
+
+    ``region_resolver`` is the only Blender-facing part of Boundary evaluation.
+    Keeping interpolation, validation, side filtering and top-down conversion
+    here lets transient keys and persistent regeneration share identical rules.
+    """
+
+    import numpy as np
+
+    source = np.asarray(base_mask, dtype=np.bool_)
+    if source.ndim != 2 or not source.size:
+        raise ValueError("Base mask must be a non-empty two-dimensional plane")
+    generated = np.array(source, dtype=np.bool_, copy=True, order="C")
+    height, width = generated.shape
+    value = float(angle)
+    lane = str(side)
+    for track in tracks:
+        if not bool(getattr(track, "enabled", True)):
+            continue
+        if str(getattr(track, "side", lane)) != lane:
+            continue
+        closed = bool(getattr(track, "closed", True))
+        points = interpolate_angle_keys(track.keys, value, closed=closed)
+        minimum = 3 if closed else 2
+        if len(points) < minimum:
+            continue
+        valid, message = validate_curve(points, closed=closed)
+        if not valid:
+            raise ValueError(f"{getattr(track, 'name', 'Boundary')}: {message}")
+        region = region_resolver(track, points, width, height)
+        area = np.asarray(region, dtype=np.bool_).reshape(height, width)
+        # Rasterizer rows follow Blender's image buffer. Runtime bitplanes are
+        # top-down, so conversion happens exactly once at this layer boundary.
+        area = np.flip(area, axis=0)
+        generated[area] = float(getattr(track, "paint_value", 0.0)) >= 0.5
+    return generated
 
 
 def closest_boundary_index(point: Any, island_boundary: Sequence[Any]) -> tuple[int, float]:
@@ -621,14 +666,50 @@ if bpy is not None:
         return True
 
 
+    def evaluate_boundary_mask(
+        project: Any,
+        angle: float,
+        side: str,
+        base_mask: Any,
+        *,
+        uv_perimeters: Sequence[Sequence[Any]] | None = None,
+    ) -> Any:
+        """Evaluate Boundary Tracks over ``base_mask`` without mutating data.
+
+        The returned top-down boolean plane owns its memory. Display images,
+        Base storage and Coverage are never read or written, which makes this
+        suitable for a transient angle key before its first paint stroke.
+        """
+
+        perimeters = (
+            _project_uv_boundaries(project)
+            if uv_perimeters is None
+            else list(uv_perimeters)
+        )
+        return _evaluate_boundary_tracks(
+            base_mask,
+            float(angle),
+            str(side),
+            getattr(project, "boundary_tracks", ()),
+            lambda track, points, width, height: _region_for_boundary(
+                project,
+                track,
+                points,
+                width,
+                height,
+                perimeters,
+            ),
+        )
+
+
     def regenerate_boundary_images(project: Any, *, allow_violations: bool = True) -> int:
         """Rebuild generated pixels for every angle from all enabled tracks.
 
         All regions are validated/rasterized before the first Image datablock is
         written.  A bad interpolated curve therefore cannot leave a half-updated
-        project. Alpha-one paint overrides are copied through unchanged.
+        project. Paint overrides selected by the Coverage bitplane are copied
+        through unchanged.
         """
-        tracks = [track for track in getattr(project, "boundary_tracks", ()) if getattr(track, "enabled", True)]
         perimeters = _project_uv_boundaries(project)
         import numpy as np
 
@@ -637,36 +718,28 @@ if bpy is not None:
         pending: list[tuple[Any, np.ndarray, str, float]] = []
         for angle_item in getattr(project, "angles", ()):
             image = runtime.resolve_display_image(project, angle_item)
-            base = runtime.resolve_base_image(project, angle_item)
-            coverage = runtime.resolve_coverage_image(project, angle_item)
             if image is None or not getattr(image, "has_data", False):
                 continue
             width, height = image.size
             current = runtime.image_rgba(image)
-            generated = runtime.image_rgba(base) if base is not None else np.ones_like(current)
-            generated[..., 3] = 1.0
+            base = runtime.base_mask(angle_item)
+            coverage = runtime.coverage_mask(angle_item)
             angle = _angle_value(angle_item)
-            for track in tracks:
-                track_side = str(getattr(track, "side", getattr(angle_item, "side", "RIGHT")))
-                if track_side != str(getattr(angle_item, "side", "RIGHT")):
-                    continue
-                closed = bool(getattr(track, "closed", True))
-                points = interpolate_angle_keys(track.keys, angle, closed=closed)
-                minimum = 3 if closed else 2
-                if len(points) < minimum:
-                    continue
-                valid, message = validate_curve(points, closed=closed)
-                if not valid:
-                    raise ValueError(f"{getattr(track, 'name', 'Boundary')}: {message}")
-                region = _region_for_boundary(project, track, points, width, height, perimeters)
-                area = np.asarray(region, dtype=np.bool_).reshape(height, width)
-                # Rasterizer rows follow the image buffer; runtime arrays are
-                # top-down, therefore flip once at the layer boundary.
-                area = np.flip(area, axis=0)
-                value = float(getattr(track, "paint_value", 0.0))
-                generated[..., :3][area] = value
-            overridden = runtime.coverage_mask(coverage) if coverage is not None else np.zeros((height, width), dtype=np.bool_)
-            generated[..., :3][overridden] = current[..., :3][overridden]
+            if base.shape != (height, width) or coverage.shape != (height, width):
+                raise ValueError(
+                    f"Angle {angle:g} bitplane dimensions do not match its Display image"
+                )
+            boundary_mask = evaluate_boundary_mask(
+                project,
+                angle,
+                str(getattr(angle_item, "side", "RIGHT")),
+                base,
+                uv_perimeters=perimeters,
+            )
+            generated = np.ones_like(current)
+            generated[..., :3] = boundary_mask[..., None]
+            generated[..., 3] = 1.0
+            generated[..., :3][coverage] = current[..., :3][coverage]
             pending.append((image, generated, str(getattr(angle_item, "side", "RIGHT")), angle))
         if not allow_violations and pending:
             from .core import validate_side_monotonic
@@ -780,6 +853,13 @@ if bpy is not None:
 
         def execute(self, context):
             project = _active_project(context.scene)
+            if project is not None:
+                try:
+                    from .studio import discard_provisional
+
+                    discard_provisional(context, project)
+                except (ImportError, AttributeError, ReferenceError, RuntimeError):
+                    pass
             track = _active_track(project) if project is not None else None
             angle_item = _active_angle(project) if project is not None else None
             angle = _angle_value(angle_item) if angle_item is not None else 0.0
@@ -840,6 +920,13 @@ if bpy is not None:
 
         def execute(self, context):
             project = _active_project(context.scene)
+            if project is not None:
+                try:
+                    from .studio import discard_provisional
+
+                    discard_provisional(context, project)
+                except (ImportError, AttributeError, ReferenceError, RuntimeError):
+                    pass
             track = _active_track(project) if project is not None else None
             angle_item = _active_angle(project) if project is not None else None
             if track is None or angle_item is None:
@@ -889,6 +976,7 @@ __all__ = [
     "composite_generated_region",
     "cubic_bezier",
     "curve_self_intersects",
+    "evaluate_boundary_mask",
     "interpolate_angle_keys",
     "interpolate_curves",
     "polygon_signed_area",

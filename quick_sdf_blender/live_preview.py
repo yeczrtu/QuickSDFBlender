@@ -20,10 +20,12 @@ def _revision(image: Any) -> int:
     return int(image.get(runtime.IMAGE_REVISION_KEY, 0))
 
 
-def _sample_mask(image: Any, maximum: int = 512):
+def _sample_plane(values: Any, maximum: int = 512):
     import numpy as np
 
-    mask = runtime.image_mask(image)
+    mask = np.asarray(values, dtype=np.bool_)
+    if mask.ndim != 2:
+        raise ValueError(f"Preview masks must be two-dimensional, got {mask.shape}")
     height, width = mask.shape
     scale = min(1.0, float(maximum) / max(height, width))
     target_height = max(1, int(round(height * scale)))
@@ -33,6 +35,10 @@ def _sample_mask(image: Any, maximum: int = 512):
     ys = np.minimum(np.arange(target_height) * height // target_height, height - 1)
     xs = np.minimum(np.arange(target_width) * width // target_width, width - 1)
     return mask[ys[:, None], xs[None, :]]
+
+
+def _sample_mask(image: Any, maximum: int = 512):
+    return _sample_plane(runtime.image_mask(image), maximum)
 
 
 def _sdf(image: Any):
@@ -54,26 +60,35 @@ def _repaired_preview_stack(project: Any, items: list[Any]):
     records = []
     for item in items:
         display = runtime.resolve_display_image(project, item)
-        base = runtime.resolve_base_image(project, item)
-        coverage = runtime.resolve_coverage_image(project, item)
-        if display is None or base is None or coverage is None:
+        if display is None:
             return None, None
-        records.append((display, base, coverage))
+        records.append((item, display))
     key = (
         str(project.uuid),
         str(getattr(items[0], "side", "RIGHT")),
         512,
         tuple(
-            (image.name, _revision(image))
-            for record in records
-            for image in record
+            (
+                str(getattr(item, "uuid", "")),
+                display.name,
+                _revision(display),
+                int(getattr(item, "base_revision", 0)),
+                int(getattr(item, "coverage_revision", 0)),
+            )
+            for item, display in records
         ),
     )
     cached = _REPAIR_CACHE.get(key)
     if cached is None:
-        display_stack = np.stack([_sample_mask(record[0]) for record in records], axis=0)
-        base_stack = np.stack([_sample_mask(record[1]) for record in records], axis=0)
-        coverage_stack = np.stack([_sample_mask(record[2]) for record in records], axis=0)
+        display_stack = np.stack([_sample_mask(display) for _item, display in records], axis=0)
+        base_stack = np.stack(
+            [_sample_plane(runtime.base_mask(item)) for item, _display in records],
+            axis=0,
+        )
+        coverage_stack = np.stack(
+            [_sample_plane(runtime.coverage_mask(item)) for item, _display in records],
+            axis=0,
+        )
         try:
             from . import native
 

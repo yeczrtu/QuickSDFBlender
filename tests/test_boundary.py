@@ -1,6 +1,10 @@
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
 
 from quick_sdf_blender.boundary import (
+    _evaluate_boundary_tracks,
     curve_self_intersects,
     interpolate_curves,
     rasterize_closed_curve,
@@ -10,6 +14,48 @@ from quick_sdf_blender.boundary import (
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_transient_evaluation_applies_matching_track_without_mutating_base(self):
+        square = [(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)]
+        keys = [
+            SimpleNamespace(angle=0.0, points=square),
+            SimpleNamespace(angle=90.0, points=square),
+        ]
+        track = SimpleNamespace(
+            enabled=True,
+            side="RIGHT",
+            closed=True,
+            name="Face Shadow",
+            paint_value=0,
+            keys=keys,
+        )
+        base = np.ones((32, 32), dtype=np.bool_)
+        result = _evaluate_boundary_tracks(
+            base,
+            45.0,
+            "RIGHT",
+            [track],
+            lambda _track, points, width, height: rasterize_closed_curve(
+                points, width, height
+            ),
+        )
+
+        self.assertTrue(base.all())
+        self.assertIsNot(result, base)
+        self.assertFalse(result[16, 16])
+        self.assertTrue(result[0, 0])
+        np.testing.assert_array_equal(
+            _evaluate_boundary_tracks(
+                base,
+                45.0,
+                "LEFT",
+                [track],
+                lambda _track, points, width, height: rasterize_closed_curve(
+                    points, width, height
+                ),
+            ),
+            base,
+        )
+
     def test_closed_square_rasterizes_inside(self):
         square = [(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
         valid, message = validate_curve(square, closed=True)
