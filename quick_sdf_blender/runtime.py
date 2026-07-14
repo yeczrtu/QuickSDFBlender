@@ -43,6 +43,11 @@ _PENDING_BASE_SIGNATURES: set[str] = set()
 BASE_BITPLANE_KEY = "_qsdf_base_bitplane"
 COVERAGE_BITPLANE_KEY = "_qsdf_coverage_bitplane"
 _BITPLANE_CACHE = DecodedBitplaneCache()
+_GRAY_CACHE_NAME = ""
+_GRAY_CACHE_REVISION = -1
+_GRAY_CACHE_VALUE: Any | None = None
+_GRAY_UPLOAD_BUFFER: Any | None = None
+_GRAY_UPLOAD_CACHE_LIMIT = 2048 * 2048 * 4
 
 
 def new_uuid() -> str:
@@ -69,8 +74,12 @@ def compute_base_signature(project: Any, scene: bpy.types.Scene | None = None) -
     digest.update(struct.pack("<q", int(getattr(scene, "frame_current", 0))))
     mesh = obj.data
     digest.update(struct.pack("<qqq", len(mesh.vertices), len(mesh.edges), len(mesh.polygons)))
-    for vertex in mesh.vertices:
-        digest.update(struct.pack("<3f", *map(float, vertex.co)))
+    if mesh.vertices:
+        import numpy as np
+
+        coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", coordinates)
+        digest.update(coordinates.tobytes(order="C"))
     shape_keys = getattr(mesh, "shape_keys", None)
     if shape_keys is not None:
         for block in shape_keys.key_blocks:
@@ -444,6 +453,12 @@ def create_aux_mask(
 def remove_aux_mask_image(project: Any, aux_item: Any) -> None:
     image = resolve_aux_mask_image(project, aux_item)
     if image is not None:
+        try:
+            from .residency import forget_image
+
+            forget_image(image)
+        except ImportError:
+            pass
         bpy.data.images.remove(image)
 
 
@@ -451,9 +466,8 @@ def fill_aux_mask_image(image: bpy.types.Image, value: float) -> None:
     import numpy as np
 
     width, height = image.size[:]
-    rgba = np.ones((height, width, 4), dtype=np.float32)
-    rgba[..., :3] = max(0.0, min(1.0, float(value)))
-    write_image_rgba(image, rgba)
+    quantized = np.uint8(round(max(0.0, min(1.0, float(value))) * 255.0))
+    write_image_gray8(image, np.full((height, width), quantized, dtype=np.uint8))
     image[AUX_MASK_INITIALIZED_KEY] = True
 
 
@@ -505,9 +519,8 @@ def copy_image_channel_to_aux(
         top = plane[y0[:, None], x0[None, :]] * (1.0 - wx) + plane[y0[:, None], x1[None, :]] * wx
         bottom = plane[y1[:, None], x0[None, :]] * (1.0 - wx) + plane[y1[:, None], x1[None, :]] * wx
         plane = top * (1.0 - wy) + bottom * wy
-    output = np.ones((target_height, target_width, 4), dtype=np.float32)
-    output[..., :3] = np.clip(plane, 0.0, 1.0)[..., None]
-    write_image_rgba(destination, output)
+    output = np.rint(np.clip(plane, 0.0, 1.0) * 255.0).astype(np.uint8)
+    write_image_gray8(destination, output)
     destination[AUX_MASK_INITIALIZED_KEY] = True
 
 
@@ -579,6 +592,54 @@ def copy_image_pixels(
     destination[IMAGE_REVISION_KEY] = int(destination.get(IMAGE_REVISION_KEY, 0)) + 1
     make_image_opaque(destination)
     destination.update()
+    try:
+        from .residency import mark_changed
+
+        mark_changed(destination)
+    except ImportError:
+        pass
+
+
+def _write_blender_flat(image: bpy.types.Image, pixels: Any) -> None:
+    """Commit one contiguous bottom-up flat float32 RGBA buffer."""
+
+    import numpy as np
+
+    flat = np.asarray(pixels)
+    width, height = image.size[:]
+    if flat.dtype != np.float32 or flat.ndim != 1 or not flat.flags.c_contiguous:
+        raise ValueError("Blender RGBA upload must be contiguous flat float32")
+    if flat.size != height * width * 4:
+        raise ValueError(
+            f"RGBA upload has {flat.size} samples; expected {height * width * 4}"
+        )
+    # Blender keeps a separate projection-paint buffer for the active canvas.
+    # Python pixel writes to a packed canvas can otherwise be overwritten by
+    # that stale buffer. Detach only for the duration of this atomic write.
+    detached = []
+    for scene in bpy.data.scenes:
+        image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
+        if image_paint is not None and getattr(image_paint, "canvas", None) == image:
+            detached.append(image_paint)
+            image_paint.canvas = None
+    try:
+        image.pixels.foreach_set(flat)
+        image[IMAGE_REVISION_KEY] = int(image.get(IMAGE_REVISION_KEY, 0)) + 1
+        make_image_opaque(image)
+        image.update()
+        # Material/Image Editor uploads can reload a generated Image from
+        # generated_color. Keep the current display pixels in its packed source
+        # before reattaching an active projection-paint canvas.
+        role = str(image.get(ROLE_KEY, ""))
+        if role in {DISPLAY_ROLE, AUX_MASK_ROLE}:
+            from .residency import mark_changed
+
+            mark_changed(image, synchronous=bool(detached))
+        elif role == PROVISIONAL_DISPLAY_ROLE:
+            image.pack()
+    finally:
+        for image_paint in detached:
+            image_paint.canvas = image
 
 
 def _write_blender_rows(image: bpy.types.Image, blender_rows: Any) -> None:
@@ -592,32 +653,7 @@ def _write_blender_rows(image: bpy.types.Image, blender_rows: Any) -> None:
         raise ValueError(
             f"RGBA shape {pixels.shape} does not match image {(height, width, 4)}"
         )
-    # Blender keeps a separate projection-paint buffer for the active canvas.
-    # Python pixel writes to a packed canvas can otherwise be overwritten by
-    # that stale buffer. Detach only for the duration of this atomic write.
-    detached = []
-    for scene in bpy.data.scenes:
-        image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
-        if image_paint is not None and getattr(image_paint, "canvas", None) == image:
-            detached.append(image_paint)
-            image_paint.canvas = None
-    try:
-        image.pixels.foreach_set(pixels.ravel())
-        image[IMAGE_REVISION_KEY] = int(image.get(IMAGE_REVISION_KEY, 0)) + 1
-        make_image_opaque(image)
-        image.update()
-        # Material/Image Editor uploads can reload a generated Image from
-        # generated_color. Keep the current display pixels in its packed source
-        # before reattaching an active projection-paint canvas.
-        if str(image.get(ROLE_KEY, "")) in {
-            DISPLAY_ROLE,
-            PROVISIONAL_DISPLAY_ROLE,
-            AUX_MASK_ROLE,
-        }:
-            image.pack()
-    finally:
-        for image_paint in detached:
-            image_paint.canvas = image
+    _write_blender_flat(image, pixels.reshape(-1))
 
 
 def write_image_rgba(image: bpy.types.Image, rgba: Any) -> None:
@@ -740,9 +776,7 @@ def initialize_normal_sweep(project: Any) -> None:
         display = resolve_display_image(project, angle_item)
         if display is None:
             continue
-        rgba = np.ones((resolution, resolution, 4), dtype=np.float32)
-        rgba[..., :3] = mask[..., None]
-        write_image_rgba(display, rgba)
+        write_image_gray8(display, mask.astype(np.uint8) * np.uint8(255))
         set_base_mask(angle_item, mask)
 
 
@@ -795,6 +829,9 @@ def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.t
             image = resolve_display_image(project, angle_item) if angle_item is not None else None
         if image is None:
             return None
+        from .residency import activate
+
+        activate(project, image)
         if studio_active:
             context.scene.tool_settings.image_paint.mode = "IMAGE"
         context.scene.tool_settings.image_paint.canvas = image
@@ -828,6 +865,12 @@ def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.t
             update_onion_preview(project)
         except (ImportError, ReferenceError, RuntimeError, ValueError):
             pass
+    try:
+        from .residency import reconcile_project
+
+        reconcile_project(project, image)
+    except (ImportError, ReferenceError, RuntimeError):
+        pass
     return image
 
 
@@ -921,10 +964,50 @@ def image_rgba8(image: bpy.types.Image) -> Any:
     return blender_float_rgba_to_top_down_u8(flat, width, height)
 
 
-def image_gray8(image: bpy.types.Image) -> Any:
-    """Return the logical grayscale channel used by a Display image."""
+def _clear_gray_cache(image_name: str = "") -> None:
+    global _GRAY_CACHE_NAME, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
 
-    return image_rgba8(image)[..., 0].copy()
+    if image_name and image_name != _GRAY_CACHE_NAME:
+        return
+    _GRAY_CACHE_NAME = ""
+    _GRAY_CACHE_REVISION = -1
+    _GRAY_CACHE_VALUE = None
+
+
+def _store_gray_cache(image: bpy.types.Image, values: Any) -> None:
+    global _GRAY_CACHE_NAME, _GRAY_CACHE_REVISION, _GRAY_CACHE_VALUE
+
+    import numpy as np
+
+    _GRAY_CACHE_NAME = str(image.name)
+    _GRAY_CACHE_REVISION = int(image.get(IMAGE_REVISION_KEY, 0))
+    _GRAY_CACHE_VALUE = np.array(values, copy=True, order="C")
+
+
+def image_gray8(image: bpy.types.Image, *, use_cache: bool = False) -> Any:
+    """Return Display gray8 without constructing a full RGBA8 intermediate."""
+
+    import numpy as np
+
+    revision = int(image.get(IMAGE_REVISION_KEY, 0))
+    if (
+        use_cache
+        and str(image.name) == _GRAY_CACHE_NAME
+        and revision == _GRAY_CACHE_REVISION
+        and _GRAY_CACHE_VALUE is not None
+    ):
+        return np.array(_GRAY_CACHE_VALUE, copy=True, order="C")
+    from .pixel_buffer import blender_float_rgba_to_top_down_gray8
+    from .residency import ensure_loaded
+
+    ensure_loaded(image)
+    width, height = map(int, image.size[:])
+    flat = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(flat)
+    result = blender_float_rgba_to_top_down_gray8(flat, width, height)
+    if use_cache:
+        _store_gray_cache(image, result)
+    return result
 
 
 def write_image_gray8(image: bpy.types.Image, values: Any) -> None:
@@ -936,10 +1019,22 @@ def write_image_gray8(image: bpy.types.Image, values: Any) -> None:
     width, height = map(int, image.size[:])
     if gray.shape != (height, width) or gray.dtype != np.uint8:
         raise ValueError("Display history plane must be a matching uint8 image")
-    rgba = np.empty((height, width, 4), dtype=np.uint8)
-    rgba[..., :3] = gray[..., None]
-    rgba[..., 3] = 255
-    write_image_rgba8(image, rgba)
+    from .pixel_buffer import top_down_gray8_to_blender_float_rgba
+
+    global _GRAY_UPLOAD_BUFFER
+    required = height * width * 4
+    if required <= _GRAY_UPLOAD_CACHE_LIMIT:
+        if (
+            _GRAY_UPLOAD_BUFFER is None
+            or getattr(_GRAY_UPLOAD_BUFFER, "size", 0) != required
+        ):
+            _GRAY_UPLOAD_BUFFER = np.empty(required, dtype=np.float32)
+        upload = _GRAY_UPLOAD_BUFFER
+    else:
+        upload = np.empty(required, dtype=np.float32)
+    top_down_gray8_to_blender_float_rgba(gray, out=upload)
+    _write_blender_flat(image, upload)
+    _store_gray_cache(image, gray)
 
 
 def capture_paint_snapshot(project: Any) -> None:
@@ -992,7 +1087,7 @@ def capture_interactive_paint_snapshot_values(
 
     import numpy as np
 
-    before = image_gray8(display)
+    before = image_gray8(display, use_cache=True)
     coverage_copy = None
     coverage_uuid = ""
     if coverage is not None:
@@ -1017,7 +1112,7 @@ def capture_aux_paint_snapshot(project: Any, mask_uuid: str) -> None:
     _AUX_PAINT_SNAPSHOTS[str(project.uuid)] = (
         str(item.uuid),
         str(image.name),
-        image_rgba8(image),
+        image_gray8(image, use_cache=True),
     )
 
 
@@ -1159,14 +1254,13 @@ def write_mask_overrides(
     """Write display RGB and mark its separate persistent coverage layer."""
     import numpy as np
 
-    rgba = image_rgba(image)
+    gray = image_gray8(image)
     binary = np.asarray(mask, dtype=np.bool_)
     footprint = np.asarray(override, dtype=np.bool_)
-    if binary.shape != rgba.shape[:2] or footprint.shape != binary.shape:
+    if binary.shape != gray.shape or footprint.shape != binary.shape:
         raise ValueError("Mask and override arrays must match the image dimensions")
-    rgba[..., :3][footprint] = binary[footprint, None].astype(np.float32)
-    rgba[..., 3] = 1.0
-    write_image_rgba(image, rgba)
+    gray[footprint] = binary[footprint].astype(np.uint8) * np.uint8(255)
+    write_image_gray8(image, gray)
     coverage_item = coverage_item or _coverage_for_display(image)
     if coverage_item is not None:
         _mark_coverage(coverage_item, footprint, True)
@@ -1351,20 +1445,34 @@ def update_threshold_preview(project: Any, rgba16: Any) -> bpy.types.Image:
     import numpy as np
 
     rgba = np.asarray(rgba16, dtype=np.uint16)
+    source_height, source_width = rgba.shape[:2]
+    if max(source_height, source_width) > 512:
+        scale = 512.0 / float(max(source_height, source_width))
+        height = max(1, int(round(source_height * scale)))
+        width = max(1, int(round(source_width * scale)))
+        rows = np.rint(np.linspace(0, source_height - 1, height)).astype(np.intp)
+        columns = np.rint(np.linspace(0, source_width - 1, width)).astype(np.intp)
+        rgba = rgba[rows[:, None], columns[None, :]]
     height, width = rgba.shape[:2]
     image = getattr(project, "generated_image", None)
-    if image is None or tuple(image.size[:]) != (width, height):
+    if (
+        image is None
+        or tuple(image.size[:]) != (width, height)
+        or bool(getattr(image, "is_float", False))
+    ):
         if image is not None and image.get(PROJECT_UUID_KEY) == project.uuid:
             bpy.data.images.remove(image)
         image = bpy.data.images.new(
-            f"QSDF Threshold {project.uuid[:8]}", width=width, height=height, alpha=True, float_buffer=True
+            f"QSDF Threshold {project.uuid[:8]}",
+            width=width,
+            height=height,
+            alpha=True,
+            float_buffer=False,
         )
         _tag_image(image, project.uuid, role=THRESHOLD_ROLE)
         project.generated_image = image
-    # Core/PNG rows are top-down; Blender's image buffer starts at the bottom.
-    normalized = np.flip(rgba, axis=0).astype(np.float32) / 65535.0
-    image.pixels.foreach_set(normalized.ravel())
-    image.update()
+    preview = ((rgba.astype(np.uint32) + 128) // 257).astype(np.uint8)
+    write_image_rgba8(image, preview)
     return image
 
 
@@ -1401,6 +1509,19 @@ def update_export_adjustment_preview(project: Any, heatmap: Any) -> bpy.types.Im
     if values.ndim != 2 or any(size <= 0 for size in values.shape):
         raise ValueError("Export adjustment heatmap must be a non-empty 2D array")
     values = np.clip(values, 0.0, 1.0)
+    if max(values.shape) > 512:
+        block_y = max(1, int(math.ceil(values.shape[0] / 512.0)))
+        block_x = max(1, int(math.ceil(values.shape[1] / 512.0)))
+        padded_height = int(math.ceil(values.shape[0] / block_y) * block_y)
+        padded_width = int(math.ceil(values.shape[1] / block_x) * block_x)
+        padded = np.zeros((padded_height, padded_width), dtype=np.float32)
+        padded[: values.shape[0], : values.shape[1]] = values
+        values = padded.reshape(
+            padded_height // block_y,
+            block_y,
+            padded_width // block_x,
+            block_x,
+        ).max(axis=(1, 3))
     if not np.any(values > 0.0):
         clear_export_adjustment_preview(project)
         return None
@@ -1418,12 +1539,11 @@ def update_export_adjustment_preview(project: Any, heatmap: Any) -> bpy.types.Im
         )
         _tag_image(image, project.uuid, role=EXPORT_ADJUSTMENT_ROLE)
         project.export_adjustment_image = image
-    rgba = np.zeros((height, width, 4), dtype=np.float32)
-    rgba[..., 0] = values
-    rgba[..., 1] = values * 0.08
-    rgba[..., 3] = 1.0
-    image.pixels.foreach_set(np.flip(rgba, axis=0).ravel())
-    image.update()
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[..., 0] = np.rint(values * 255.0).astype(np.uint8)
+    rgba[..., 1] = np.rint(values * (255.0 * 0.08)).astype(np.uint8)
+    rgba[..., 3] = 255
+    write_image_rgba8(image, rgba)
     return image
 
 
@@ -1435,17 +1555,22 @@ def clear_image_alpha(image: bpy.types.Image) -> None:
     if angle_item is None:
         raise ValueError("The paint override layers are incomplete")
     overridden = coverage_mask(angle_item)
-    rgba = image_rgba(image)
+    gray = image_gray8(image)
     base_values = base_mask(angle_item)
-    rgba[..., :3][overridden] = base_values[overridden, None].astype(rgba.dtype)
-    rgba[..., 3] = 1.0
-    write_image_rgba(image, rgba)
+    gray[overridden] = base_values[overridden].astype(np.uint8) * np.uint8(255)
+    write_image_gray8(image, gray)
     set_coverage_mask(angle_item, np.zeros(overridden.shape, dtype=np.bool_))
 
 
 def remove_project_images(project: Any) -> None:
     for image in tuple(bpy.data.images):
         if image.get(PROJECT_UUID_KEY) == project.uuid:
+            try:
+                from .residency import forget_image
+
+                forget_image(image)
+            except ImportError:
+                pass
             bpy.data.images.remove(image)
 
 
@@ -1622,10 +1747,20 @@ def cleanup_export_adjustment_previews() -> None:
 
 @persistent
 def _load_or_undo_post(_unused: Any) -> None:
+    global _GRAY_UPLOAD_BUFFER
+
     _PAINT_SNAPSHOTS.clear()
     _INTERACTIVE_PAINT_SNAPSHOTS.clear()
     _AUX_PAINT_SNAPSHOTS.clear()
     _BITPLANE_CACHE.clear()
+    _clear_gray_cache()
+    _GRAY_UPLOAD_BUFFER = None
+    try:
+        from .residency import shutdown
+
+        shutdown()
+    except ImportError:
+        pass
     try:
         from .operators import clear_histories
 
@@ -1656,16 +1791,12 @@ def _save_project_images(_unused: Any) -> None:
     # Export review is derived data.  Never serialize a potentially 4K
     # heatmap into the artist's source-of-truth blend file.
     cleanup_export_adjustment_previews()
-    persistent_roles = {DISPLAY_ROLE, AUX_MASK_ROLE}
-    for image in tuple(bpy.data.images):
-        if image.get(ROLE_KEY) not in persistent_roles or not image.get(PROJECT_UUID_KEY):
-            continue
-        try:
-            image.pack()
-        except (OSError, ReferenceError, RuntimeError):
-            # Let Blender's save continue; diagnostics on next load will expose
-            # a genuinely missing layer without risking a corrupt half-save.
-            pass
+    try:
+        from .residency import flush_dirty
+
+        flush_dirty()
+    except ImportError:
+        pass
 
 
 def _watched_source_ids(project: Any) -> set[Any]:
@@ -1707,16 +1838,14 @@ def _depsgraph_base_update(scene: bpy.types.Scene, depsgraph: Any) -> None:
             geometry = bool(getattr(update, "is_updated_geometry", False))
             transform = bool(getattr(update, "is_updated_transform", False))
             if identifier is data or identifier is shape_keys:
-                _PENDING_BASE_SIGNATURES.add(str(project.uuid))
+                project.base_needs_update = True
                 break
             if identifier is obj and geometry:
-                _PENDING_BASE_SIGNATURES.add(str(project.uuid))
+                project.base_needs_update = True
                 break
             if identifier in modifier_ids and (geometry or transform):
-                _PENDING_BASE_SIGNATURES.add(str(project.uuid))
+                project.base_needs_update = True
                 break
-    if _PENDING_BASE_SIGNATURES and not bpy.app.timers.is_registered(_deferred_base_check):
-        bpy.app.timers.register(_deferred_base_check, first_interval=0.25)
 
 
 @persistent
@@ -1754,6 +1883,8 @@ def register_runtime() -> None:
 
 
 def unregister_runtime() -> None:
+    global _GRAY_UPLOAD_BUFFER
+
     cleanup_export_adjustment_previews()
     _PAINT_SNAPSHOTS.clear()
     _INTERACTIVE_PAINT_SNAPSHOTS.clear()
@@ -1766,6 +1897,14 @@ def unregister_runtime() -> None:
     _BASE_BAKE_UUIDS.clear()
     _PENDING_BASE_SIGNATURES.clear()
     _BITPLANE_CACHE.clear()
+    _clear_gray_cache()
+    _GRAY_UPLOAD_BUFFER = None
+    try:
+        from .residency import shutdown
+
+        shutdown()
+    except ImportError:
+        pass
     if bpy.app.timers.is_registered(_deferred_base_check):
         bpy.app.timers.unregister(_deferred_base_check)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):

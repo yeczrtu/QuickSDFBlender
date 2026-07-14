@@ -4,7 +4,12 @@ import unittest
 
 import numpy as np
 
-from quick_sdf_blender.history import History, HistoryActionResult
+from quick_sdf_blender.history import (
+    DEFAULT_BYTE_BUDGET,
+    DEFAULT_SOFT_BYTE_BUDGET,
+    History,
+    HistoryActionResult,
+)
 
 
 class HistoryTests(unittest.TestCase):
@@ -320,6 +325,109 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "dtype"):
             history.undo({"image": after.astype(np.float64)})
         self.assertEqual(history.undo_count, 1)
+
+    def test_incremental_transaction_releases_callers_arrays(self) -> None:
+        first_before = np.zeros((128, 129), dtype=np.uint8)
+        first_after = first_before.copy()
+        first_after[4:80, 7:91] = 183
+        coverage_before = np.zeros((128, 129), dtype=np.bool_)
+        coverage_after = coverage_before.copy()
+        coverage_after[4:80, 7:91] = True
+
+        history = History(compression_level=1)
+        transaction = history.begin_transaction("streamed stroke")
+        self.assertTrue(transaction.add_delta("display", first_before, first_after))
+        self.assertTrue(history.add_delta("coverage", coverage_before, coverage_after))
+        first_before[:] = 99
+        coverage_before[:] = True
+        self.assertFalse(transaction.needs_rollback)
+        self.assertTrue(history.commit())
+        self.assertIsNone(history.active_transaction)
+
+        restored = history.undo(
+            {"display": first_after, "coverage": coverage_after}
+        )
+        np.testing.assert_array_equal(restored["display"], 0)
+        np.testing.assert_array_equal(restored["coverage"], False)
+
+    def test_hard_cap_keeps_transaction_available_for_rollback(self) -> None:
+        rng = np.random.default_rng(903)
+        before = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        after = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        history = History(byte_budget=64, soft_byte_budget=32, compression_level=0)
+        transaction = history.begin_transaction("too large")
+        transaction.add_delta("display", before, after)
+        self.assertTrue(transaction.needs_rollback)
+        self.assertFalse(transaction.commit())
+        self.assertIs(history.active_transaction, transaction)
+        restored = history.rollback({"display": after})
+        np.testing.assert_array_equal(restored["display"], before)
+        self.assertIsNone(history.active_transaction)
+        self.assertFalse(history.can_undo)
+
+    def test_restore_before_supports_key_at_a_time_rollback(self) -> None:
+        before_a = np.zeros((8, 8), dtype=np.uint8)
+        after_a = np.full((8, 8), 17, dtype=np.uint8)
+        before_b = np.zeros((8, 8), dtype=np.bool_)
+        after_b = np.ones((8, 8), dtype=np.bool_)
+        history = History()
+        transaction = history.begin_transaction("stream")
+        transaction.add_delta("a", before_a, after_a)
+        transaction.add_delta("b", before_b, after_b)
+        np.testing.assert_array_equal(
+            transaction.restore_before("a", after_a), before_a
+        )
+        np.testing.assert_array_equal(
+            transaction.restore_before("b", after_b), before_b
+        )
+        transaction.rollback()
+
+    def test_soft_cap_evicts_old_actions_but_keeps_newest(self) -> None:
+        rng = np.random.default_rng(919)
+        zero = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        one = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        two = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        history = History(
+            byte_budget=64 * 1024,
+            soft_byte_budget=1024,
+            compression_level=0,
+        )
+        self.assertTrue(history.push("one", {"a": zero}, {"a": one}))
+        self.assertGreater(history.bytes_used, history.soft_byte_budget)
+        self.assertTrue(history.push("two", {"a": one}, {"a": two}))
+        self.assertEqual(history.undo_count, 1)
+        self.assertEqual(history.undo_label, "two")
+
+    def test_dense_delta_selects_tile_bitmap_and_bool_values_are_bitpacked(self) -> None:
+        before = np.zeros((256, 256), dtype=np.bool_)
+        after = before.copy()
+        after[32:224, 24:232] = True
+        history = History(compression_level=1)
+        self.assertTrue(history.push("dense", {"coverage": before}, {"coverage": after}))
+        delta = history._undo[-1].images["coverage"]
+        self.assertEqual(delta.locator_kind, "tiles64")
+        self.assertEqual(delta.value_kind, "bits")
+        restored = history.undo({"coverage": after})["coverage"]
+        np.testing.assert_array_equal(restored, before)
+
+    def test_default_history_has_128_mib_soft_and_256_mib_hard_limits(self) -> None:
+        history = History()
+        self.assertEqual(history.soft_byte_budget, DEFAULT_SOFT_BYTE_BUDGET)
+        self.assertEqual(history.byte_budget, DEFAULT_BYTE_BUDGET)
+
+    def test_transaction_validation_and_lifecycle(self) -> None:
+        plane = np.zeros((2, 2), dtype=np.uint8)
+        history = History()
+        transaction = history.begin_transaction("test")
+        with self.assertRaisesRegex(RuntimeError, "already active"):
+            history.begin_transaction("nested")
+        self.assertFalse(transaction.add_delta("noop", plane, plane.copy()))
+        transaction.add_delta("changed", plane, np.ones_like(plane))
+        with self.assertRaisesRegex(ValueError, "already contains"):
+            transaction.add_delta("changed", plane, np.ones_like(plane))
+        self.assertTrue(transaction.commit())
+        with self.assertRaisesRegex(RuntimeError, "no longer active"):
+            transaction.commit()
 
 
 if __name__ == "__main__":

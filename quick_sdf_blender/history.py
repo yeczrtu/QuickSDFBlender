@@ -25,7 +25,13 @@ import zlib
 import numpy as np
 
 
+# ``byte_budget`` remains the compatibility name for the per-action hard cap.
+# The retained undo stack has a lower soft target: when it is exceeded older
+# actions are evicted, but the newest valid action remains available.
 DEFAULT_BYTE_BUDGET = 256 * 1024 * 1024
+DEFAULT_SOFT_BYTE_BUDGET = 128 * 1024 * 1024
+HISTORY_TILE_SIZE = 64
+_TILE_BITMAP_BYTES = HISTORY_TILE_SIZE * HISTORY_TILE_SIZE // 8
 
 MetadataScalar: TypeAlias = None | bool | int | float | str | bytes
 MetadataValue: TypeAlias = (
@@ -41,15 +47,18 @@ Metadata: TypeAlias = dict[str, MetadataValue]
 class _ArrayDelta:
     shape: tuple[int, ...]
     dtype: str
-    index_dtype: str
+    locator_kind: str
+    locator_dtype: str
+    locator_count: int
     count: int
-    indices: bytes
+    locator: bytes
+    value_kind: str
     before: bytes
     after: bytes
 
     @property
     def storage_bytes(self) -> int:
-        return len(self.indices) + len(self.before) + len(self.after)
+        return len(self.locator) + len(self.before) + len(self.after)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +147,57 @@ def _changed_pixel_mask(before: np.ndarray, after: np.ndarray) -> np.ndarray:
     return np.any(first_bytes != second_bytes, axis=2)
 
 
+def _tile_bitmap_locator(
+    changed: np.ndarray,
+    *,
+    compression_level: int,
+) -> tuple[str, int, bytes]:
+    """Encode touched 64x64 tiles without retaining a full-image bitmap."""
+
+    height, width = (int(changed.shape[0]), int(changed.shape[1]))
+    tiles_x = (width + HISTORY_TILE_SIZE - 1) // HISTORY_TILE_SIZE
+    tiles_y = (height + HISTORY_TILE_SIZE - 1) // HISTORY_TILE_SIZE
+    tile_count = tiles_x * tiles_y
+    tile_dtype = np.dtype("<u4" if tile_count <= np.iinfo(np.uint32).max else "<u8")
+    identifiers: list[int] = []
+    bitmaps = bytearray()
+    for tile_y in range(tiles_y):
+        y0 = tile_y * HISTORY_TILE_SIZE
+        y1 = min(height, y0 + HISTORY_TILE_SIZE)
+        for tile_x in range(tiles_x):
+            x0 = tile_x * HISTORY_TILE_SIZE
+            x1 = min(width, x0 + HISTORY_TILE_SIZE)
+            tile = changed[y0:y1, x0:x1]
+            local_flat = np.flatnonzero(tile.reshape(-1))
+            if local_flat.size == 0:
+                continue
+            local_y, local_x = np.divmod(local_flat, tile.shape[1])
+            local_indices = local_y * HISTORY_TILE_SIZE + local_x
+            bitmap = np.zeros(_TILE_BITMAP_BYTES, dtype=np.uint8)
+            np.bitwise_or.at(
+                bitmap,
+                local_indices // 8,
+                np.left_shift(
+                    np.uint8(1),
+                    np.asarray(local_indices % 8, dtype=np.uint8),
+                ),
+            )
+            identifiers.append(tile_y * tiles_x + tile_x)
+            bitmaps.extend(bitmap.tobytes(order="C"))
+
+    ids = np.asarray(identifiers, dtype=tile_dtype)
+    raw = ids.tobytes(order="C") + bytes(bitmaps)
+    return tile_dtype.str, len(identifiers), zlib.compress(raw, compression_level)
+
+
+def _pack_changed_values(values: np.ndarray, *, compression_level: int) -> tuple[str, bytes]:
+    contiguous = np.ascontiguousarray(values)
+    if contiguous.dtype == np.bool_:
+        raw = np.packbits(contiguous.reshape(-1), bitorder="little").tobytes(order="C")
+        return "bits", zlib.compress(raw, compression_level)
+    return "raw", zlib.compress(contiguous.tobytes(order="C"), compression_level)
+
+
 def _make_delta(
     before: np.ndarray, after: np.ndarray, *, compression_level: int
 ) -> _ArrayDelta | None:
@@ -148,20 +208,131 @@ def _make_delta(
     flat_indices = np.flatnonzero(changed.reshape(-1))
     index_dtype = np.dtype("<u4" if changed.size <= np.iinfo(np.uint32).max else "<u8")
     packed_indices = np.ascontiguousarray(flat_indices, dtype=index_dtype)
+    sparse_locator = zlib.compress(packed_indices.tobytes(order="C"), compression_level)
+    tile_dtype, tile_count, tile_locator = _tile_bitmap_locator(
+        changed,
+        compression_level=compression_level,
+    )
+    if len(tile_locator) < len(sparse_locator):
+        locator_kind = "tiles64"
+        locator_dtype = tile_dtype
+        locator_count = tile_count
+        locator = tile_locator
+    else:
+        locator_kind = "sparse"
+        locator_dtype = index_dtype.str
+        locator_count = int(flat_indices.size)
+        locator = sparse_locator
     components = _components_per_pixel(before)
     first = np.ascontiguousarray(before).reshape(-1, components)
     second = np.ascontiguousarray(after).reshape(-1, components)
     first_values = np.ascontiguousarray(first[flat_indices])
     second_values = np.ascontiguousarray(second[flat_indices])
+    value_kind, packed_before = _pack_changed_values(
+        first_values,
+        compression_level=compression_level,
+    )
+    second_kind, packed_after = _pack_changed_values(
+        second_values,
+        compression_level=compression_level,
+    )
+    assert second_kind == value_kind
     return _ArrayDelta(
         shape=tuple(int(dimension) for dimension in before.shape),
         dtype=before.dtype.str,
-        index_dtype=index_dtype.str,
+        locator_kind=locator_kind,
+        locator_dtype=locator_dtype,
+        locator_count=locator_count,
         count=int(flat_indices.size),
-        indices=zlib.compress(packed_indices.tobytes(order="C"), compression_level),
-        before=zlib.compress(first_values.tobytes(order="C"), compression_level),
-        after=zlib.compress(second_values.tobytes(order="C"), compression_level),
+        locator=locator,
+        value_kind=value_kind,
+        before=packed_before,
+        after=packed_after,
     )
+
+
+def _restore_indices(delta: _ArrayDelta) -> np.ndarray:
+    try:
+        raw_locator = zlib.decompress(delta.locator)
+    except zlib.error as error:
+        raise RuntimeError("corrupt compressed image history") from error
+    index_dtype = np.dtype(delta.locator_dtype)
+    pixel_count = delta.shape[0] * delta.shape[1]
+    if delta.locator_kind == "sparse":
+        expected = delta.count * index_dtype.itemsize
+        if delta.locator_count != delta.count or len(raw_locator) != expected:
+            raise RuntimeError("corrupt image history locator size")
+        indices = np.frombuffer(raw_locator, dtype=index_dtype).astype(np.uint64, copy=False)
+    elif delta.locator_kind == "tiles64":
+        expected = delta.locator_count * (index_dtype.itemsize + _TILE_BITMAP_BYTES)
+        if len(raw_locator) != expected:
+            raise RuntimeError("corrupt image history locator size")
+        ids_bytes = delta.locator_count * index_dtype.itemsize
+        tile_ids = np.frombuffer(raw_locator[:ids_bytes], dtype=index_dtype)
+        bitmap_rows = np.frombuffer(raw_locator[ids_bytes:], dtype=np.uint8).reshape(
+            delta.locator_count, _TILE_BITMAP_BYTES
+        )
+        height, width = delta.shape[:2]
+        tiles_x = (width + HISTORY_TILE_SIZE - 1) // HISTORY_TILE_SIZE
+        tiles_y = (height + HISTORY_TILE_SIZE - 1) // HISTORY_TILE_SIZE
+        if np.any(tile_ids >= tiles_x * tiles_y) or (
+            tile_ids.size > 1 and np.any(tile_ids[1:] <= tile_ids[:-1])
+        ):
+            raise RuntimeError("corrupt image history tile identifier")
+        indices = np.empty(delta.count, dtype=np.uint64)
+        cursor = 0
+        for tile_id, bitmap in zip(tile_ids, bitmap_rows, strict=True):
+            local = np.flatnonzero(
+                np.unpackbits(bitmap, count=HISTORY_TILE_SIZE**2, bitorder="little")
+            )
+            local_y, local_x = np.divmod(local, HISTORY_TILE_SIZE)
+            tile_y, tile_x = divmod(int(tile_id), tiles_x)
+            global_y = tile_y * HISTORY_TILE_SIZE + local_y
+            global_x = tile_x * HISTORY_TILE_SIZE + local_x
+            if np.any(global_y >= height) or np.any(global_x >= width):
+                raise RuntimeError("corrupt image history tile padding")
+            end = cursor + local.size
+            if end > delta.count:
+                raise RuntimeError("corrupt image history changed-pixel count")
+            indices[cursor:end] = global_y.astype(np.uint64) * width + global_x
+            cursor = end
+        if cursor != delta.count:
+            raise RuntimeError("corrupt image history changed-pixel count")
+        # Pixel values are stored in global row-major order for both locator
+        # encodings, so normalize tile traversal to that order in-place.
+        indices.sort()
+    else:
+        raise RuntimeError("corrupt image history locator encoding")
+
+    if np.any(indices >= pixel_count) or (
+        indices.size > 1 and np.any(indices[1:] <= indices[:-1])
+    ):
+        raise RuntimeError("corrupt image history pixel index")
+    return indices
+
+
+def _restore_values(delta: _ArrayDelta, payload: bytes, components: int) -> np.ndarray:
+    try:
+        raw = zlib.decompress(payload)
+    except zlib.error as error:
+        raise RuntimeError("corrupt compressed image history") from error
+    value_count = delta.count * components
+    dtype = np.dtype(delta.dtype)
+    if delta.value_kind == "bits":
+        expected = (value_count + 7) // 8
+        if dtype != np.bool_ or len(raw) != expected:
+            raise RuntimeError("corrupt image history payload size")
+        return np.unpackbits(
+            np.frombuffer(raw, dtype=np.uint8),
+            count=value_count,
+            bitorder="little",
+        ).astype(np.bool_, copy=False).reshape(delta.count, components)
+    if delta.value_kind != "raw":
+        raise RuntimeError("corrupt image history value encoding")
+    expected = value_count * dtype.itemsize
+    if len(raw) != expected:
+        raise RuntimeError("corrupt image history payload size")
+    return np.frombuffer(raw, dtype=dtype).reshape(delta.count, components)
 
 
 def _restore_patch(current: np.ndarray, delta: _ArrayDelta, payload: bytes) -> np.ndarray:
@@ -171,22 +342,9 @@ def _restore_patch(current: np.ndarray, delta: _ArrayDelta, payload: bytes) -> n
     if array.dtype.str != delta.dtype:
         raise TypeError(f"current image dtype {array.dtype} does not match history {delta.dtype}")
 
-    try:
-        raw_indices = zlib.decompress(delta.indices)
-        raw = zlib.decompress(payload)
-    except zlib.error as error:
-        raise RuntimeError("corrupt compressed image history") from error
-    index_dtype = np.dtype(delta.index_dtype)
     components = 1 if len(delta.shape) == 2 else 4
-    expected_index_bytes = delta.count * index_dtype.itemsize
-    expected_bytes = delta.count * components * array.dtype.itemsize
-    if len(raw_indices) != expected_index_bytes or len(raw) != expected_bytes:
-        raise RuntimeError("corrupt image history payload size")
-
-    indices = np.frombuffer(raw_indices, dtype=index_dtype)
-    if np.any(indices >= array.shape[0] * array.shape[1]):
-        raise RuntimeError("corrupt image history pixel index")
-    values = np.frombuffer(raw, dtype=np.dtype(delta.dtype)).reshape(delta.count, components)
+    indices = _restore_indices(delta)
+    values = _restore_values(delta, payload, components)
     restored = np.array(array, copy=True, order="C")
     restored.reshape(-1, components)[indices] = values
     return restored
@@ -253,6 +411,108 @@ def _unpack_metadata(payload: bytes | None) -> Metadata | None:
     return value
 
 
+class HistoryTransaction:
+    """Incrementally compressed multi-image history action.
+
+    Callers may release each ``before``/``after`` array immediately after
+    :meth:`add_delta`.  If :attr:`needs_rollback` becomes true, call
+    :meth:`rollback` with the current arrays (or restore individual keys with
+    :meth:`restore_before`) before discarding the transaction.
+    """
+
+    def __init__(
+        self,
+        owner: "History",
+        label: str,
+        metadata: Mapping[str, object] | None,
+    ) -> None:
+        if not isinstance(label, str):
+            raise TypeError("label must be a string")
+        self._owner = owner
+        self.label = label
+        self._metadata = _pack_metadata(metadata)
+        self._metadata_supplied = metadata is not None
+        self._images: dict[str, _ArrayDelta] = {}
+        self._closed = False
+
+    def _require_active(self) -> None:
+        if self._closed or self._owner.active_transaction is not self:
+            raise RuntimeError("history transaction is no longer active")
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(self._images)
+
+    @property
+    def storage_bytes(self) -> int:
+        metadata_bytes = len(self._metadata) if self._metadata is not None else 0
+        return metadata_bytes + sum(delta.storage_bytes for delta in self._images.values())
+
+    @property
+    def needs_rollback(self) -> bool:
+        """Whether the compressed action exceeds the per-action hard cap."""
+
+        return self.storage_bytes > self._owner.byte_budget
+
+    def add_delta(self, key: str, before: np.ndarray, after: np.ndarray) -> bool:
+        """Compress one key immediately; return false for an unchanged plane."""
+
+        self._require_active()
+        if not isinstance(key, str) or not key:
+            raise TypeError("image key must be a non-empty string")
+        if key in self._images:
+            raise ValueError(f"history transaction already contains key {key!r}")
+        validated = _validate_images({key: before}, {key: after})
+        _name, first, second = validated[0]
+        delta = _make_delta(
+            first,
+            second,
+            compression_level=self._owner.compression_level,
+        )
+        if delta is None:
+            return False
+        self._images[key] = delta
+        return True
+
+    def restore_before(self, key: str, current: np.ndarray) -> np.ndarray:
+        """Restore one key without materializing every transaction plane."""
+
+        self._require_active()
+        try:
+            delta = self._images[key]
+        except KeyError as error:
+            raise KeyError(f"history transaction has no key {key!r}") from error
+        return _restore_patch(current, delta, delta.before)
+
+    def commit(self) -> bool:
+        """Commit the action, or return false while leaving oversize data rollbackable."""
+
+        self._require_active()
+        return self._owner._commit_transaction(self)
+
+    def rollback(
+        self,
+        current: Mapping[str, np.ndarray] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Abort the transaction and optionally return every restored before plane."""
+
+        self._require_active()
+        restored: dict[str, np.ndarray] = {}
+        if current is not None:
+            if not isinstance(current, Mapping):
+                raise TypeError("current must be a mapping of image keys to arrays")
+            missing = self._images.keys() - current.keys()
+            if missing:
+                formatted = ", ".join(repr(key) for key in sorted(missing))
+                raise KeyError(f"current images are missing history keys: {formatted}")
+            # Validate and restore everything before closing, so a bad input
+            # leaves the transaction available for a corrected retry.
+            for key, delta in self._images.items():
+                restored[key] = _restore_patch(current[key], delta, delta.before)
+        self._owner._close_transaction(self)
+        return restored
+
+
 class History:
     """A bounded stack of compressed, multi-plane pixel actions.
 
@@ -266,21 +526,32 @@ class History:
         self,
         byte_budget: int = DEFAULT_BYTE_BUDGET,
         *,
+        soft_byte_budget: int | None = None,
         compression_level: int = 6,
     ) -> None:
         if isinstance(byte_budget, bool) or not isinstance(byte_budget, int):
             raise TypeError("byte_budget must be an integer")
         if byte_budget < 0:
             raise ValueError("byte_budget must not be negative")
+        if soft_byte_budget is None:
+            soft_byte_budget = min(DEFAULT_SOFT_BYTE_BUDGET, byte_budget)
+        if isinstance(soft_byte_budget, bool) or not isinstance(soft_byte_budget, int):
+            raise TypeError("soft_byte_budget must be an integer or None")
+        if soft_byte_budget < 0:
+            raise ValueError("soft_byte_budget must not be negative")
+        if soft_byte_budget > byte_budget:
+            raise ValueError("soft_byte_budget must not exceed byte_budget")
         if isinstance(compression_level, bool) or not isinstance(compression_level, int):
             raise TypeError("compression_level must be an integer")
         if not 0 <= compression_level <= 9:
             raise ValueError("compression_level must be in the range 0..9")
         self.byte_budget = byte_budget
+        self.soft_byte_budget = soft_byte_budget
         self.compression_level = compression_level
         self._undo: list[_Entry] = []
         self._redo: list[_Entry] = []
         self._bytes_used = 0
+        self._transaction: HistoryTransaction | None = None
 
     @property
     def can_undo(self) -> bool:
@@ -303,6 +574,10 @@ class History:
         """Compressed payload bytes retained across both stacks."""
 
         return self._bytes_used
+
+    @property
+    def active_transaction(self) -> HistoryTransaction | None:
+        return self._transaction
 
     @property
     def undo_label(self) -> str | None:
@@ -329,9 +604,94 @@ class History:
         return _unpack_metadata(self._redo[-1].metadata) if self._redo else None
 
     def clear(self) -> None:
+        if self._transaction is not None:
+            self._transaction._closed = True
+            self._transaction = None
         self._undo.clear()
         self._redo.clear()
         self._bytes_used = 0
+
+    def begin_transaction(
+        self,
+        label: str,
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> HistoryTransaction:
+        """Begin an incremental action; only one may be active per history."""
+
+        if self._transaction is not None:
+            raise RuntimeError("a history transaction is already active")
+        transaction = HistoryTransaction(self, label, metadata)
+        self._transaction = transaction
+        return transaction
+
+    def add_delta(self, key: str, before: np.ndarray, after: np.ndarray) -> bool:
+        """Compatibility convenience for the currently active transaction."""
+
+        if self._transaction is None:
+            raise RuntimeError("no history transaction is active")
+        return self._transaction.add_delta(key, before, after)
+
+    def commit(self) -> bool:
+        """Commit the active transaction."""
+
+        if self._transaction is None:
+            raise RuntimeError("no history transaction is active")
+        return self._transaction.commit()
+
+    def rollback(
+        self,
+        current: Mapping[str, np.ndarray] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Abort the active transaction, optionally restoring its before values."""
+
+        if self._transaction is None:
+            raise RuntimeError("no history transaction is active")
+        return self._transaction.rollback(current)
+
+    def _close_transaction(self, transaction: HistoryTransaction) -> None:
+        if self._transaction is not transaction:
+            raise RuntimeError("history transaction is no longer active")
+        transaction._closed = True
+        self._transaction = None
+
+    def _discard_redo(self) -> None:
+        self._bytes_used -= sum(entry.storage_bytes for entry in self._redo)
+        self._redo.clear()
+
+    def _append_entry(self, entry: _Entry, *, discard_redo_on_failure: bool) -> bool:
+        if entry.storage_bytes > self.byte_budget:
+            if discard_redo_on_failure:
+                self._discard_redo()
+            return False
+        self._discard_redo()
+        self._undo.append(entry)
+        self._bytes_used += entry.storage_bytes
+        # The newest action wins even when it is larger than the soft target.
+        while self._bytes_used > self.soft_byte_budget and len(self._undo) > 1:
+            removed = self._undo.pop(0)
+            self._bytes_used -= removed.storage_bytes
+        return True
+
+    def _commit_transaction(self, transaction: HistoryTransaction) -> bool:
+        if self._transaction is not transaction:
+            raise RuntimeError("history transaction is no longer active")
+        entry = _Entry(
+            label=transaction.label,
+            images=dict(transaction._images),
+            metadata=transaction._metadata,
+        )
+        if not entry.images and not transaction._metadata_supplied:
+            self._close_transaction(transaction)
+            return False
+        if entry.storage_bytes > self.byte_budget:
+            # Keep compressed before values alive so the caller can rollback
+            # already-published keys without retaining uncompressed snapshots.
+            return False
+        recorded = self._append_entry(entry, discard_redo_on_failure=False)
+        assert recorded
+        self._close_transaction(transaction)
+        return True
 
     def push(
         self,
@@ -353,20 +713,10 @@ class History:
         if not images and metadata is None:
             return False
 
-        # A newly performed operation always invalidates the redo branch, even
-        # if its compressed representation cannot fit into the configured cap.
-        self._bytes_used -= sum(entry.storage_bytes for entry in self._redo)
-        self._redo.clear()
         entry = _Entry(label=label, images=images, metadata=packed_metadata)
-        if entry.storage_bytes > self.byte_budget:
-            return False
-
-        self._undo.append(entry)
-        self._bytes_used += entry.storage_bytes
-        while self._bytes_used > self.byte_budget and self._undo:
-            removed = self._undo.pop(0)
-            self._bytes_used -= removed.storage_bytes
-        return True
+        # Preserve legacy push semantics: attempting a new operation clears a
+        # redo branch even when its representation exceeds the hard cap.
+        return self._append_entry(entry, discard_redo_on_failure=True)
 
     def _apply_action(
         self,
@@ -423,8 +773,11 @@ class History:
 
 __all__ = [
     "DEFAULT_BYTE_BUDGET",
+    "DEFAULT_SOFT_BYTE_BUDGET",
+    "HISTORY_TILE_SIZE",
     "History",
     "HistoryActionResult",
+    "HistoryTransaction",
     "Metadata",
     "MetadataValue",
 ]

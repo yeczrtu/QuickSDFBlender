@@ -10,9 +10,12 @@ from quick_sdf_blender.bitplane import (
     BitplaneError,
     BitplaneRole,
     DecodedBitplaneCache,
+    DEFAULT_CACHE_BYTE_BUDGET,
     HEADER_SIZE,
     decode_bitplane,
+    decode_bitplane_packed,
     encode_bitplane,
+    insert_bitplane_into_uint16,
     inspect_bitplane_header,
 )
 
@@ -72,6 +75,36 @@ class BitplaneRoundTripTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown bitplane role"):
             encode_bitplane(np.zeros((1, 1), dtype=np.bool_), "OTHER")
 
+    def test_validated_packed_payload_and_direct_bitfield_insert(self) -> None:
+        rng = np.random.default_rng(44)
+        first = rng.integers(0, 2, (17, 19), dtype=np.uint8).astype(np.bool_)
+        second = rng.integers(0, 2, (17, 19), dtype=np.uint8).astype(np.bool_)
+        first_blob = encode_bitplane(first, BitplaneRole.BASE)
+        second_blob = encode_bitplane(second, BitplaneRole.COVERAGE)
+        header, packed = decode_bitplane_packed(first_blob, expected_role="BASE")
+        self.assertEqual(header.shape, first.shape)
+        self.assertEqual(len(packed), (first.size + 7) // 8)
+
+        bitfield = np.zeros(first.shape, dtype=np.uint16)
+        insert_bitplane_into_uint16(
+            first_blob, 2, bitfield, expected_role=BitplaneRole.BASE, chunk_bytes=3
+        )
+        insert_bitplane_into_uint16(
+            second_blob, 11, bitfield, expected_role=BitplaneRole.COVERAGE, chunk_bytes=5
+        )
+        np.testing.assert_array_equal((bitfield & (1 << 2)) != 0, first)
+        np.testing.assert_array_equal((bitfield & (1 << 11)) != 0, second)
+
+    def test_direct_bitfield_insert_validates_output(self) -> None:
+        plane = np.zeros((3, 5), dtype=np.bool_)
+        blob = encode_bitplane(plane, BitplaneRole.BASE)
+        with self.assertRaisesRegex(ValueError, "0..15"):
+            insert_bitplane_into_uint16(blob, 16, np.zeros((3, 5), np.uint16))
+        with self.assertRaisesRegex(TypeError, "uint16"):
+            insert_bitplane_into_uint16(blob, 0, np.zeros((3, 5), np.uint8))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            insert_bitplane_into_uint16(blob, 0, np.zeros((4, 5), np.uint16))
+
 
 class BitplaneCorruptionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -111,6 +144,10 @@ class BitplaneCorruptionTests(unittest.TestCase):
 
 
 class DecodedBitplaneCacheTests(unittest.TestCase):
+    def test_default_budget_is_64_mib(self) -> None:
+        self.assertEqual(DEFAULT_CACHE_BYTE_BUDGET, 64 * 1024 * 1024)
+        self.assertEqual(DecodedBitplaneCache().byte_budget, DEFAULT_CACHE_BYTE_BUDGET)
+
     def test_cache_returns_read_only_plane_and_respects_revision(self) -> None:
         first = np.zeros((4, 5), dtype=np.bool_)
         second = first.copy()

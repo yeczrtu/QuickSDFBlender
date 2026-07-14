@@ -11,7 +11,10 @@ from quick_sdf_blender.core import (
 from quick_sdf_blender.smart_paint import (
     affected_key_indices,
     apply_smart_stroke,
+    apply_smart_transition_patch,
     apply_smart_transitions,
+    gray8_transition_masks,
+    iter_smart_transition_patches,
 )
 
 
@@ -91,6 +94,56 @@ class SmartPaintTests(unittest.TestCase):
                 np.ones((1, 1), dtype=np.bool_),
                 np.zeros((1, 1), dtype=np.bool_),
             )
+
+    def test_gray8_transition_masks_use_the_exact_binary_boundary(self):
+        before = np.asarray([[0, 127, 128, 255, 10]], dtype=np.uint8)
+        after = np.asarray([[1, 128, 127, 254, 10]], dtype=np.uint8)
+        touched, light, shadow = gray8_transition_masks(before, after)
+        np.testing.assert_array_equal(touched, [[True, True, True, True, False]])
+        np.testing.assert_array_equal(light, [[False, True, False, False, False]])
+        np.testing.assert_array_equal(shadow, [[False, False, True, False, False]])
+
+    def test_streamed_patches_match_compatibility_stack_result(self):
+        rng = np.random.default_rng(617)
+        masks = rng.integers(0, 2, (len(ANGLES), 9, 11), dtype=np.uint8).astype(bool)
+        # Start from a valid monotonic stack.
+        masks = np.maximum.accumulate(masks, axis=0)
+        coverage = rng.integers(0, 2, masks.shape, dtype=np.uint8).astype(bool)
+        before = rng.integers(0, 256, masks.shape[1:], dtype=np.uint8)
+        after = before.copy()
+        after[2:7, 3:9] = 255 - after[2:7, 3:9]
+        touched, became_light, became_shadow = gray8_transition_masks(before, after)
+        expected = apply_smart_transitions(
+            masks,
+            coverage,
+            ANGLES,
+            3,
+            touched,
+            became_light,
+            became_shadow,
+        )
+
+        streamed_masks = masks.copy()
+        streamed_coverage = coverage.copy()
+        streamed_footprints = np.zeros_like(masks)
+        patches = list(
+            iter_smart_transition_patches(
+                len(ANGLES), 3, touched, became_light, became_shadow
+            )
+        )
+        for patch in patches:
+            result = apply_smart_transition_patch(
+                streamed_masks[patch.index],
+                streamed_coverage[patch.index],
+                patch,
+            )
+            streamed_masks[patch.index] = result.mask
+            streamed_coverage[patch.index] = result.coverage
+            streamed_footprints[patch.index] = result.footprint
+        np.testing.assert_array_equal(streamed_masks, expected.masks)
+        np.testing.assert_array_equal(streamed_coverage, expected.coverage)
+        np.testing.assert_array_equal(streamed_footprints, expected.footprints)
+        self.assertEqual(tuple(patch.index for patch in patches), expected.affected_indices)
 
 
 class ThresholdPairChannelTests(unittest.TestCase):

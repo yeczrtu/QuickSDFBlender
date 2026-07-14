@@ -138,33 +138,56 @@ def _extract_evaluated_bake_input(context, project):
         if uv_layer is None:
             raise ValueError("The evaluated mesh no longer contains the project UV map")
         mesh.calc_loop_triangles()
-        corner_normals = mesh.corner_normals
-        triangles_uv = []
-        triangles_normal = []
-        triangle_centers = []
-        slot = int(project.material_slot_index)
-        for triangle in mesh.loop_triangles:
-            polygon = mesh.polygons[triangle.polygon_index]
-            if polygon.material_index != slot:
-                continue
-            triangles_uv.append([tuple(uv_layer.data[index].uv) for index in triangle.loops])
-            normals = []
-            for index in triangle.loops:
-                value = corner_normals[index]
-                vector = getattr(value, "vector", value)
-                normals.append(tuple(vector))
-            triangles_normal.append(normals)
-            center = sum(
-                (mesh.vertices[index].co for index in triangle.vertices),
-                mesh.vertices[triangle.vertices[0]].co * 0.0,
-            ) / 3.0
-            triangle_centers.append(tuple(center))
-        if not triangles_uv:
+        triangle_count = len(mesh.loop_triangles)
+        loop_count = len(mesh.loops)
+        polygon_count = len(mesh.polygons)
+        vertex_count = len(mesh.vertices)
+        triangle_polygons = np.empty(triangle_count, dtype=np.int32)
+        triangle_loops = np.empty(triangle_count * 3, dtype=np.int32)
+        triangle_vertices = np.empty(triangle_count * 3, dtype=np.int32)
+        polygon_materials = np.empty(polygon_count, dtype=np.int32)
+        uv_values = np.empty(loop_count * 2, dtype=np.float32)
+        normal_values = np.empty(loop_count * 3, dtype=np.float32)
+        vertex_values = np.empty(vertex_count * 3, dtype=np.float32)
+        try:
+            mesh.loop_triangles.foreach_get("polygon_index", triangle_polygons)
+            mesh.loop_triangles.foreach_get("loops", triangle_loops)
+            mesh.loop_triangles.foreach_get("vertices", triangle_vertices)
+            mesh.polygons.foreach_get("material_index", polygon_materials)
+            uv_layer.data.foreach_get("uv", uv_values)
+            mesh.corner_normals.foreach_get("vector", normal_values)
+            mesh.vertices.foreach_get("co", vertex_values)
+        except (AttributeError, TypeError, ValueError):
+            # Defensive fallback for a Blender build exposing corner normals as
+            # a sequence rather than a foreach_get collection.
+            triangle_polygons[:] = [item.polygon_index for item in mesh.loop_triangles]
+            triangle_loops[:] = [value for item in mesh.loop_triangles for value in item.loops]
+            triangle_vertices[:] = [value for item in mesh.loop_triangles for value in item.vertices]
+            polygon_materials[:] = [item.material_index for item in mesh.polygons]
+            uv_values[:] = [value for item in uv_layer.data for value in tuple(item.uv)]
+            normal_values[:] = [
+                value
+                for item in mesh.corner_normals
+                for value in tuple(getattr(item, "vector", item))
+            ]
+            vertex_values[:] = [value for item in mesh.vertices for value in tuple(item.co)]
+        triangle_loops = triangle_loops.reshape(-1, 3)
+        triangle_vertices = triangle_vertices.reshape(-1, 3)
+        selected = polygon_materials[triangle_polygons] == int(project.material_slot_index)
+        if not np.any(selected):
             raise ValueError("No evaluated faces use the selected material slot")
+        selected_loops = triangle_loops[selected]
+        selected_vertices = triangle_vertices[selected]
+        uv_values = uv_values.reshape(-1, 2)
+        normal_values = normal_values.reshape(-1, 3)
+        vertex_values = vertex_values.reshape(-1, 3)
         return (
-            np.ascontiguousarray(triangles_uv, dtype=np.float32),
-            np.ascontiguousarray(triangles_normal, dtype=np.float32),
-            np.ascontiguousarray(triangle_centers, dtype=np.float32),
+            np.ascontiguousarray(uv_values[selected_loops], dtype=np.float32),
+            np.ascontiguousarray(normal_values[selected_loops], dtype=np.float32),
+            np.ascontiguousarray(
+                vertex_values[selected_vertices].mean(axis=1, dtype=np.float32),
+                dtype=np.float32,
+            ),
         )
     finally:
         evaluated.to_mesh_clear()
@@ -205,9 +228,7 @@ def _write_sdf_area_occupancy(project, occupancy, *, force: bool = False) -> boo
     expected = (int(project.resolution), int(project.resolution))
     if mask.shape != expected:
         raise ValueError(f"SDF Area shape {mask.shape} does not match {expected}")
-    rgba = np.ones((*mask.shape, 4), dtype=np.float32)
-    rgba[..., :3] = mask[..., None]
-    runtime.write_image_rgba(image, rgba)
+    runtime.write_image_gray8(image, mask.astype(np.uint8) * np.uint8(255))
     image[runtime.AUX_MASK_INITIALIZED_KEY] = True
     item.dirty = bool(force)
     mark_aux_mask_changed(project, item)
@@ -335,14 +356,12 @@ def _bake_project(context, project) -> None:
                 display = runtime.resolve_display_image(project, item)
                 if display is None:
                     raise ValueError(f"Angle data is incomplete at {float(item.angle):g} degrees")
-                base_rgba = np.ones((*mask.shape, 4), dtype=np.float32)
-                base_rgba[..., :3] = mask[..., None]
-                old_display = runtime.image_rgba(display)
+                composed = np.asarray(mask, dtype=np.uint8) * np.uint8(255)
+                old_display = runtime.image_gray8(display)
                 overridden = runtime.coverage_mask(item)
-                composed = base_rgba.copy()
-                composed[..., :3][overridden] = old_display[..., :3][overridden]
+                composed[overridden] = old_display[overridden]
                 runtime.set_base_mask(item, mask)
-                runtime.write_image_rgba(display, composed)
+                runtime.write_image_gray8(display, composed)
                 item.is_generated = True
                 item.dirty = True
         if project.boundary_tracks:
@@ -984,7 +1003,7 @@ def _record_aux_image_change(project, item, image, before, label: str) -> bool:
 
     import numpy as np
 
-    after = runtime.image_rgba8(image)
+    after = runtime.image_gray8(image)
     if before.shape == after.shape and np.array_equal(before, after):
         return False
     history = _HISTORIES.setdefault(str(project.uuid), History(compression_level=1))
@@ -1167,12 +1186,12 @@ class QUICKSDF_OT_aux_mask_import(bpy.types.Operator):
         if source_image is None:
             self.report({"ERROR"}, "Choose a source image")
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         try:
             runtime.copy_image_channel_to_aux(source_image, image, self.component)
             _record_aux_image_change(project, item, image, before, "Import Mask")
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            runtime.write_image_rgba8(image, before)
+            runtime.write_image_gray8(image, before)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -1195,7 +1214,7 @@ class QUICKSDF_OT_aux_mask_fill(bpy.types.Operator):
         image = runtime.resolve_aux_mask_image(project, item)
         if item is None or image is None:
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         runtime.fill_aux_mask_image(image, self.value)
         _record_aux_image_change(project, item, image, before, "Fill Mask")
         runtime.sync_canvas(context, project)
@@ -1220,12 +1239,12 @@ class QUICKSDF_OT_aux_mask_reset_sdf_area(bpy.types.Operator):
         image = runtime.resolve_aux_mask_image(project, item)
         if image is None:
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         try:
             _reset_sdf_area_from_uv(context, project, force=True)
             _record_aux_image_change(project, item, image, before, "Reset SDF Area")
         except (RuntimeError, TypeError, ValueError) as exc:
-            runtime.write_image_rgba8(image, before)
+            runtime.write_image_gray8(image, before)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -1761,6 +1780,12 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             project.first_stroke_complete = True
             project.dirty = True
             try:
+                from .residency import mark_changed
+
+                mark_changed(source_image, synchronous=True)
+            except (ImportError, OSError, ReferenceError, RuntimeError):
+                pass
+            try:
                 from .live_preview import invalidate
 
                 invalidate(str(project.uuid))
@@ -1782,18 +1807,21 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             try:
                 if item is None or image is None:
                     raise ValueError("The additional mask disappeared during the stroke")
-                current = runtime.image_rgba8(image)
+                current = runtime.image_gray8(image)
                 if current.shape != before_rgba.shape:
                     raise ValueError("The additional mask changed size during the stroke")
-                if np.any(current[..., 3] != 255):
-                    current[..., 3] = 255
-                    runtime.write_image_rgba8(image, current)
-                changed = np.any(current[..., :3] != before_rgba[..., :3], axis=2)
+                changed = current != before_rgba
                 if not np.any(changed):
                     return {"FINISHED"}
                 image[runtime.IMAGE_REVISION_KEY] = int(
                     image.get(runtime.IMAGE_REVISION_KEY, 0)
                 ) + 1
+                try:
+                    from .residency import mark_changed
+
+                    mark_changed(image, synchronous=True)
+                except (ImportError, OSError, ReferenceError, RuntimeError):
+                    pass
                 _record_aux_image_change(
                     project,
                     item,
@@ -1812,7 +1840,7 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 clear_histories(str(project.uuid))
                 if image is not None:
                     try:
-                        runtime.write_image_rgba8(image, before_rgba)
+                        runtime.write_image_gray8(image, before_rgba)
                     except Exception:
                         pass
                 self.report({"ERROR"}, f"Could not finish the mask stroke: {exc}")
@@ -1837,8 +1865,9 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             )
             active_item = None if provisional_stroke else runtime.active_angle(project)
             source_image = bpy.data.images.get(display_name)
-            before_history: dict[str, np.ndarray] = {}
             metadata_before: dict[str, tuple[bool, bool]] = {}
+            history = None
+            transaction = None
             interactive_no_change = False
             try:
                 if source_image is None:
@@ -1847,18 +1876,11 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     active_item is None or str(active_item.uuid) != active_uuid
                 ):
                     raise ValueError("The active angle changed before the stroke finished")
-                source_rgba = runtime.image_rgba8(source_image)
-                source_gray = source_rgba[..., 0].copy()
+                source_gray = runtime.image_gray8(source_image)
                 if source_gray.shape != before_gray.shape or (
                     coverage_before is not None and coverage_before.shape != before_gray.shape
                 ):
                     raise ValueError("The active paint image changed size during the stroke")
-                # Work images are always opaque. Erase-alpha Brush Assets may
-                # still alter the hidden buffer, so normalize that metadata
-                # without treating it as an artist-visible paint action.
-                if np.any(source_rgba[..., 3] != 255):
-                    source_rgba[..., 3] = 255
-                    runtime.write_image_rgba8(source_image, source_rgba)
                 touched = source_gray != before_gray
                 if not np.any(touched):
                     interactive_no_change = True
@@ -1887,17 +1909,32 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     created_metadata = provisional_created_metadata(project, active_item)
                 except (ImportError, ReferenceError, RuntimeError):
                     created_metadata = None
+                history = _HISTORIES.setdefault(
+                    str(project.uuid),
+                    History(compression_level=1),
+                )
+                metadata = {"created_key": created_metadata} if created_metadata else None
+                had_redo = history.can_redo
+                transaction = history.begin_transaction(
+                    "Paint + Auto Key" if created_metadata else "Smart Paint",
+                    metadata=metadata,
+                )
                 display_key = f"display:{active_uuid}"
-                before_history[display_key] = before_gray
-                after_history = {display_key: source_gray}
+                transaction.add_delta(display_key, before_gray, source_gray)
                 if coverage_uuid and coverage_before is not None:
                     coverage_after = coverage_before.copy()
                     coverage_after[touched] = True
                     coverage_key = f"coverage:{active_uuid}"
-                    before_history[coverage_key] = coverage_before
-                    after_history[coverage_key] = coverage_after
+                    transaction.add_delta(coverage_key, coverage_before, coverage_after)
                 else:
                     raise ValueError("The active angle Coverage is missing")
+                if transaction.needs_rollback:
+                    raise RuntimeError("This stroke is too large for the Quick SDF Undo history")
+                runtime.set_coverage_mask(active_item, coverage_after)
+                metadata_before[active_uuid] = (
+                    bool(getattr(active_item, "is_manual", False)),
+                    bool(getattr(active_item, "dirty", False)),
+                )
 
                 # Propagate only pixels that actually crossed the binary
                 # threshold. This retains Blender's native soft brush and
@@ -1906,7 +1943,6 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 became_light = touched & (before_gray < 128) & (source_gray >= 128)
                 became_shadow = touched & (before_gray >= 128) & (source_gray < 128)
                 active_angle = float(active_item.angle)
-                planned_writes = []
                 for candidate in sorted(
                     (
                         item
@@ -1943,46 +1979,37 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     destination_coverage_after[changed] = True
                     candidate_display_key = f"display:{candidate.uuid}"
                     candidate_coverage_key = f"coverage:{candidate.uuid}"
-                    before_history[candidate_display_key] = destination_before
-                    before_history[candidate_coverage_key] = destination_coverage_before
-                    after_history[candidate_display_key] = destination_after
-                    after_history[candidate_coverage_key] = destination_coverage_after
+                    transaction.add_delta(
+                        candidate_display_key,
+                        destination_before,
+                        destination_after,
+                    )
+                    transaction.add_delta(
+                        candidate_coverage_key,
+                        destination_coverage_before,
+                        destination_coverage_after,
+                    )
+                    if transaction.needs_rollback:
+                        raise RuntimeError(
+                            "This stroke is too large for the Quick SDF Undo history"
+                        )
                     metadata_before[str(candidate.uuid)] = (
                         bool(getattr(candidate, "is_manual", False)),
                         bool(getattr(candidate, "dirty", False)),
                     )
-                    planned_writes.append(
-                        (
-                            candidate,
-                            image,
-                            destination_after,
-                            destination_coverage_after,
-                        )
-                    )
-
-                metadata_before[active_uuid] = (
-                    bool(getattr(active_item, "is_manual", False)),
-                    bool(getattr(active_item, "dirty", False)),
-                )
-                for candidate, image, destination_after, destination_coverage_after in planned_writes:
                     runtime.write_image_gray8(image, destination_after)
                     runtime.set_coverage_mask(candidate, destination_coverage_after)
                     candidate.is_manual = True
                     candidate.dirty = True
-                runtime.set_coverage_mask(active_item, coverage_after)
-                history = _HISTORIES.setdefault(
-                    str(project.uuid),
-                    History(compression_level=1),
-                )
-                metadata = {"created_key": created_metadata} if created_metadata else None
-                had_redo = history.can_redo
-                if not history.push(
-                    "Paint + Auto Key" if created_metadata else "Smart Paint",
-                    before_history,
-                    after_history,
-                    metadata=metadata,
-                ):
+                    del (
+                        destination_before,
+                        destination_after,
+                        destination_coverage_before,
+                        destination_coverage_after,
+                    )
+                if not transaction.commit():
                     raise RuntimeError("This stroke is too large for the Quick SDF Undo history")
+                transaction = None
                 if had_redo:
                     _purge_history_orphans(str(project.uuid))
                 from .studio import finish_provisional_stroke
@@ -1991,14 +2018,24 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 complete_active_stroke(active_item, source_image)
                 return {"FINISHED"}
             except Exception as exc:
-                clear_histories(str(project.uuid))
                 try:
-                    if before_history:
-                        _write_history_values(project, before_history)
+                    if (
+                        transaction is not None
+                        and history is not None
+                        and history.active_transaction is transaction
+                    ):
+                        for key in transaction.keys:
+                            current = _history_values(project, (key,)).get(key)
+                            if current is None:
+                                continue
+                            restored = transaction.restore_before(key, current)
+                            _write_history_values(project, {key: restored})
+                        transaction.rollback()
                     elif source_image is not None:
                         runtime.write_image_gray8(source_image, before_gray)
                 except Exception:
                     pass
+                clear_histories(str(project.uuid))
                 for item_uuid, flags in metadata_before.items():
                     candidate = next(
                         (item for item in project.angles if str(item.uuid) == item_uuid),
@@ -2355,7 +2392,7 @@ def _history_values(project, names) -> dict[str, object]:
         else:
             image = bpy.data.images.get(name)
             if image is not None:
-                result[name] = runtime.image_rgba8(image)
+                result[name] = runtime.image_gray8(image)
     return result
 
 
@@ -2376,7 +2413,7 @@ def _write_history_values(project, values) -> None:
             image = bpy.data.images.get(name)
             if image is None:
                 raise ValueError(f"The history image {name!r} is missing")
-            runtime.write_image_rgba8(image, value)
+            runtime.write_image_gray8(image, value)
 
 
 def _mark_history_images_changed(project, image_names) -> None:
