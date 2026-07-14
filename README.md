@@ -1,4 +1,4 @@
-# Quick SDF Studio 0.3.3 (test build)
+# Quick SDF Studio 0.3.3
 
 Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作るWindows向けExtensionです。法線から作られた影ガイドを下描きにして、気になる部分だけを直せます。
 
@@ -21,7 +21,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 一筆はBlender標準Texture Paintの操作感を保ったまま、選択中の角度へ即時反映されます。書き出し時に角度のつながりを非破壊で自動調整するため、Propagate、Validate、反対側生成の追加操作は不要です。
 
-0.3.3試用版では、角度タイムラインを1本のプレイヘッドへ統合しました。ドラッグ中だけ2D／3Dで補間結果を確認し、離すと最も近い既存キーへ吸着します。通常のペイントからキーを自動追加せず、ペイント開始時に別角度へ戻る表示切替もありません。
+0.3.3では、角度タイムラインを1本のプレイヘッドへ統合しました。ドラッグ中だけ2D／3Dで補間結果を確認し、離すと最も近い既存キーへ吸着します。通常のペイントからキーを自動追加せず、ペイント開始時に別角度へ戻る表示切替もありません。
 
 0.3.2では、3Dプレビューが黒くなるMaterial接続、ペンを離した後の待ち時間、Light／ShadowとBrush Assetの不一致、誤解を招く無変更エラーを修正しました。1024pxでの連続3Dペイント、タイムライン上のUndo、Studio終了時の復元をBlender 5.1実機テストへ追加しています。
 
@@ -31,7 +31,7 @@ Blender 5.1上で、トゥーン調の顔影テクスチャを直感的に作る
 
 対応環境はBlender 5.1、Windows x64です。
 
-1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.3.2-windows-x64.zip` を取得する
+1. [GitHub Releases](https://github.com/yeczrtu/QuickSDFBlender/releases/latest)から `quick_sdf_blender-0.3.3-windows-x64.zip` を取得する
 2. Blenderで `編集` → `プリファレンス` → `エクステンションを入手` を開く
 3. 右上メニューから `ディスクからインストール` を選ぶ
 4. 取得したZIPを展開せずに選択する
