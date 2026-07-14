@@ -21,10 +21,13 @@ from typing import Sequence
 import numpy as np
 
 
-ALWAYS_LIGHT = np.uint16(0)
-FIRST_TRANSITION = np.uint16(1)
-LAST_TRANSITION = np.uint16(65534)
-ALWAYS_SHADOW = np.uint16(65535)
+# lilToon consumes the complete normalized channel range.  A larger value
+# means that a pixel becomes Light earlier in the authored 0..90 sweep.
+# These names describe the two endpoint outcomes; neither value is a reserved
+# sentinel and both may also be produced by a transition exactly at an
+# endpoint.
+ALWAYS_LIGHT = np.uint16(65535)
+ALWAYS_SHADOW = np.uint16(0)
 _ANGLE_EPSILON = 1.0e-7
 
 
@@ -396,7 +399,10 @@ def _require_full_threshold_angles(angles: np.ndarray) -> None:
 
 
 def _quantize_transition(normalized_angle: np.ndarray) -> np.ndarray:
-    values = 1.0 + np.floor(np.clip(normalized_angle, 0.0, 1.0) * 65533.0 + 0.5)
+    """Encode authored transition progress as lilToon's inverted SDF value."""
+
+    transition = np.clip(normalized_angle, 0.0, 1.0)
+    values = np.floor((1.0 - transition) * 65535.0 + 0.5)
     return values.astype(np.uint16)
 
 
@@ -440,7 +446,7 @@ def generate_threshold_channels(
     *,
     validate: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate positive-side R and negative-side G uint16 thresholds."""
+    """Generate positive-side R and negative-side G lilToon SDF values."""
 
     masks = _as_binary(mask_stack, ndim=3)
     angle_values = _validated_angles(angles, masks.shape[0])
@@ -472,10 +478,9 @@ def _validated_side_stack(
     """Validate one artist-facing 0..90 degree mask lane.
 
     Quick SDF Studio authors the right and left lanes independently instead of
-    encoding the side in an angle sign.  Keeping this validation separate from
-    the legacy signed-stack API makes it impossible to accidentally swap the R
-    and G output channels while still accepting v1 projects through the adapter
-    below.
+    encoding the side in an angle sign. Keeping this validation separate from
+    the signed-stack convenience API makes it impossible to accidentally swap
+    the R and G output channels.
     """
 
     masks = _as_binary(mask_stack, ndim=3)
@@ -603,11 +608,13 @@ def generate_threshold_pair(
     *,
     validate: bool = True,
 ) -> np.ndarray:
-    """Generate the canonical schema-v2 RGBA16 texture from two 0..90 lanes.
+    """Generate the canonical lilToon RGBA16 texture from two 0..90 lanes.
 
     ``right_masks`` is written to R and ``left_masks`` to G.  Each lane owns its
     own 0 degree mask, which is important after an artist chooses *Break
-    Mirror*.  B is zero and A is fully opaque.
+    Mirror*. A pixel's Light-transition progress ``u`` is encoded as
+    ``round((1 - u) * 65535)`` over the complete uint16 range. B is zero and A
+    is fully opaque.
     """
 
     right, right_values = _validated_side_stack(
@@ -644,7 +651,7 @@ def generate_threshold_rgba16(
     *,
     validate: bool = True,
 ) -> np.ndarray:
-    """Generate the final R/G threshold map as an RGBA uint16 array.
+    """Generate the final R/G lilToon SDF map as an RGBA uint16 array.
 
     R stores the positive/right-light side and G the negative/left-light side.
     B is zero and A is 65535.
@@ -667,8 +674,6 @@ def generate_threshold_rgba16(
 __all__ = [
     "ALWAYS_LIGHT",
     "ALWAYS_SHADOW",
-    "FIRST_TRANSITION",
-    "LAST_TRANSITION",
     "GuardClipResult",
     "MonotonicValidation",
     "MonotonicRepairResult",

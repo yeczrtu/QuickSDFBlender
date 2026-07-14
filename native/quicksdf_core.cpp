@@ -126,7 +126,7 @@ bool dt_2d(std::vector<double>& grid, int width, int height,
 }
 
 bool signed_distance(const uint8_t* light_mask, int width, int height,
-                     std::vector<float>& output,
+                     std::vector<double>& output,
                      const int* cancel_requested = nullptr) {
     const size_t pixels = size_t(width) * height;
     const double far_sq = double(width) * width + double(height) * height + 100.0;
@@ -158,14 +158,14 @@ bool signed_distance(const uint8_t* light_mask, int width, int height,
         if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
             return false;
         // Positive is shadow, negative is light, matching QuickSDF's convention.
-        output[p] = float(to_light[p] - to_shadow[p]);
+        output[p] = to_light[p] - to_shadow[p];
     }
     return true;
 }
 
-uint16_t encode_transition(float normalized_angle) {
-    normalized_angle = std::clamp(normalized_angle, 0.0f, 1.0f);
-    return uint16_t(1 + std::lround(normalized_angle * 65533.0f));
+uint16_t encode_transition(double normalized_angle) {
+    normalized_angle = std::clamp(normalized_angle, 0.0, 1.0);
+    return uint16_t(std::floor((1.0 - normalized_angle) * 65535.0 + 0.5));
 }
 
 int validate_sequence(const uint8_t* masks, const std::vector<int>& sequence,
@@ -187,7 +187,7 @@ int validate_sequence(const uint8_t* masks, const std::vector<int>& sequence,
     return violations;
 }
 
-bool generate_channel(const uint8_t* masks, const float* angles,
+bool generate_channel(const uint8_t* masks, const double* angles,
                       const std::vector<int>& sequence, int width, int height,
                       uint16_t* output, int stride,
                       const int* cancel_requested = nullptr) {
@@ -196,11 +196,11 @@ bool generate_channel(const uint8_t* masks, const float* angles,
     for (size_t p = 0; p < pixels; ++p) {
         if ((p & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
             return false;
-        output[p * stride] = first[p] ? 0 : 65535;
+        output[p * stride] = first[p] ? 65535 : 0;
     }
     if (sequence.size() < 2) return true;
 
-    std::vector<float> previous_sdf, current_sdf;
+    std::vector<double> previous_sdf, current_sdf;
     if (!signed_distance(first, width, height, previous_sdf, cancel_requested))
         return false;
     for (size_t i = 1; i < sequence.size(); ++i) {
@@ -211,16 +211,16 @@ bool generate_channel(const uint8_t* masks, const float* angles,
         const uint8_t* current = masks + size_t(current_index) * pixels;
         if (!signed_distance(current, width, height, current_sdf, cancel_requested))
             return false;
-        const float a0 = std::abs(angles[previous_index]) / 90.0f;
-        const float a1 = std::abs(angles[current_index]) / 90.0f;
+        const double a0 = std::abs(angles[previous_index]) / 90.0;
+        const double a1 = std::abs(angles[current_index]) / 90.0;
         for (size_t p = 0; p < pixels; ++p) {
             if (previous[p] == 0 && current[p] != 0) {
-                const float d0 = std::abs(previous_sdf[p]);
-                const float d1 = std::abs(current_sdf[p]);
-                const float denominator = d0 + d1;
-                const float ratio = std::isfinite(denominator) && denominator > 0.0f
+                const double d0 = std::abs(previous_sdf[p]);
+                const double d1 = std::abs(current_sdf[p]);
+                const double denominator = d0 + d1;
+                const double ratio = std::isfinite(denominator) && denominator > 0.0
                                         ? d0 / denominator
-                                        : 0.5f;
+                                        : 0.5;
                 output[p * stride] = encode_transition(a0 + (a1 - a0) * ratio);
             }
         }
@@ -229,13 +229,13 @@ bool generate_channel(const uint8_t* masks, const float* angles,
     return true;
 }
 
-bool build_side_sequence(const float* angles, int count,
+bool build_side_sequence(const double* angles, int count,
                          std::vector<int>& sequence) {
     if (!angles || count < 2) return false;
     sequence.resize(size_t(count));
     for (int i = 0; i < count; ++i) {
-        if (!std::isfinite(angles[i]) || angles[i] < -1.0e-5f ||
-            angles[i] > 90.0f + 1.0e-5f)
+        if (!std::isfinite(angles[i]) || angles[i] < -1.0e-7 ||
+            angles[i] > 90.0 + 1.0e-7)
             return false;
         sequence[size_t(i)] = i;
     }
@@ -243,12 +243,12 @@ bool build_side_sequence(const float* angles, int count,
                      [angles](int first, int second) {
                          return angles[first] < angles[second];
                      });
-    if (std::abs(angles[sequence.front()]) > 1.0e-5f ||
-        std::abs(angles[sequence.back()] - 90.0f) > 1.0e-5f)
+    if (std::abs(angles[sequence.front()]) > 1.0e-7 ||
+        std::abs(angles[sequence.back()] - 90.0) > 1.0e-7)
         return false;
     for (int i = 1; i < count; ++i)
         if (angles[sequence[size_t(i)]] - angles[sequence[size_t(i - 1)]] <=
-            1.0e-5f)
+            1.0e-7)
             return false;
     return true;
 }
@@ -308,8 +308,8 @@ void enforce_bake_monotonic(uint8_t* masks, const float* angles, int count,
     }
 }
 
-bool build_guide_directions(const float* angles, int count, const float* forward,
-                            const float* up, int side_sign,
+bool build_guide_directions(const double* angles, int count, const double* forward,
+                            const double* up, int side_sign,
                             std::vector<Vec3>& directions) {
     if (!angles || !forward || !up || count < 2 ||
         (side_sign != 1 && side_sign != -1))
@@ -327,20 +327,22 @@ bool build_guide_directions(const float* angles, int count, const float* forward
     side.x *= side_sign;
     side.y *= side_sign;
     side.z *= side_sign;
-    if (std::abs(angles[0]) > 1.0e-5f ||
-        std::abs(angles[count - 1] - 90.0f) > 1.0e-5f)
+    if (std::abs(angles[0]) > 1.0e-7 ||
+        std::abs(angles[count - 1] - 90.0) > 1.0e-7)
         return false;
     directions.resize(size_t(count));
     for (int index = 0; index < count; ++index) {
-        const float angle = angles[index];
-        if (!std::isfinite(angle) || angle < -1.0e-5f || angle > 90.0f + 1.0e-5f ||
-            (index > 0 && angle - angles[index - 1] <= 1.0e-5f))
+        const double angle = angles[index];
+        if (!std::isfinite(angle) || angle < -1.0e-7 || angle > 90.0 + 1.0e-7 ||
+            (index > 0 && angle - angles[index - 1] <= 1.0e-7))
             return false;
-        const double radians = double(angle) * QSDF_PI / 180.0;
+        const double progress = std::clamp(double(angle) / 90.0, 0.0, 1.0);
+        const double front_dot = progress - 0.5;
+        const double side_dot = std::sqrt(std::max(0.0, 1.0 - front_dot * front_dot));
         Vec3 direction{
-            side.x * std::cos(radians) + front.x * std::sin(radians),
-            side.y * std::cos(radians) + front.y * std::sin(radians),
-            side.z * std::cos(radians) + front.z * std::sin(radians),
+            side.x * side_dot + front.x * front_dot,
+            side.y * side_dot + front.y * front_dot,
+            side.z * side_dot + front.z * front_dot,
         };
         if (!normalize(direction)) return false;
         directions[size_t(index)] = direction;
@@ -409,7 +411,7 @@ int rasterize_guide_normals(const float* triangle_uvs, const float* corner_norma
 
 }  // namespace
 
-QSDF_API int qsdf_version() { return 4; }
+QSDF_API int qsdf_version() { return 5; }
 
 QSDF_API int qsdf_bake_normal_sweep(
     const float* triangle_uvs, const float* corner_normals, int triangle_count,
@@ -494,8 +496,8 @@ QSDF_API int qsdf_bake_normal_sweep(
 
 QSDF_API int qsdf_bake_face_shadow_guide(
     const float* triangle_uvs, const float* corner_normals, int triangle_count,
-    const float* angles, int angle_count, const float* forward, const float* up,
-    int side_sign, float cutoff, int width, int height, uint8_t* output_masks,
+    const double* angles, int angle_count, const double* forward, const double* up,
+    int side_sign, double cutoff, int width, int height, uint8_t* output_masks,
     uint8_t* output_occupancy, const int* cancel_requested) {
     if (!triangle_uvs || !corner_normals || !angles || !forward || !up ||
         !output_masks || !output_occupancy || triangle_count < 0 ||
@@ -526,6 +528,12 @@ QSDF_API int qsdf_bake_face_shadow_guide(
             for (size_t pixel = 0; pixel < pixels; ++pixel)
                 current[pixel] = uint8_t(current[pixel] || previous[pixel]);
         }
+        // The final authoring key represents Full Light. Paint overrides are
+        // composited later, so the Base Guide itself must illuminate every
+        // occupied texel at this endpoint.
+        uint8_t* final_mask = output_masks + size_t(angle_count - 1) * pixels;
+        for (size_t pixel = 0; pixel < pixels; ++pixel)
+            if (output_occupancy[pixel]) final_mask[pixel] = 1;
         return QSDF_OK;
     } catch (const std::bad_alloc&) {
         return QSDF_OUT_OF_MEMORY;
@@ -657,7 +665,7 @@ QSDF_API int qsdf_repair_side_monotonic(
     return QSDF_OK;
 }
 
-QSDF_API int qsdf_validate_monotonic(const uint8_t* masks, const float* angles,
+QSDF_API int qsdf_validate_monotonic(const uint8_t* masks, const double* angles,
                                      int count, int width, int height,
                                      int* violation_pixels) {
     if (!masks || !angles || !violation_pixels || count < 1 || width < 1 || height < 1)
@@ -674,7 +682,7 @@ QSDF_API int qsdf_validate_monotonic(const uint8_t* masks, const float* angles,
     return *violation_pixels ? QSDF_NON_MONOTONIC : QSDF_OK;
 }
 
-QSDF_API int qsdf_generate_threshold(const uint8_t* masks, const float* angles,
+QSDF_API int qsdf_generate_threshold(const uint8_t* masks, const double* angles,
                                      int count, int width, int height,
                                      uint16_t* output_rg, int* violation_pixels) {
     if (!masks || !angles || !output_rg || !violation_pixels || count < 1 || width < 1 || height < 1)
@@ -699,8 +707,8 @@ QSDF_API int qsdf_generate_threshold(const uint8_t* masks, const float* angles,
 }
 
 QSDF_API int qsdf_generate_threshold_pair_cancelable(
-    const uint8_t* right_masks, const float* right_angles, int right_count,
-    const uint8_t* left_masks, const float* left_angles, int left_count,
+    const uint8_t* right_masks, const double* right_angles, int right_count,
+    const uint8_t* left_masks, const double* left_angles, int left_count,
     int width, int height, uint16_t* output_rg,
     int* right_violation_pixels, int* left_violation_pixels,
     const int* cancel_requested) {
@@ -735,8 +743,8 @@ QSDF_API int qsdf_generate_threshold_pair_cancelable(
 }
 
 QSDF_API int qsdf_generate_threshold_pair(
-    const uint8_t* right_masks, const float* right_angles, int right_count,
-    const uint8_t* left_masks, const float* left_angles, int left_count,
+    const uint8_t* right_masks, const double* right_angles, int right_count,
+    const uint8_t* left_masks, const double* left_angles, int left_count,
     int width, int height, uint16_t* output_rg,
     int* right_violation_pixels, int* left_violation_pixels) {
     return qsdf_generate_threshold_pair_cancelable(

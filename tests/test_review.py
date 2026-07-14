@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 
+from quick_sdf_blender.core import generate_threshold_pair
 from quick_sdf_blender.review import (
     review_current,
     review_onion_difference,
@@ -62,25 +63,48 @@ class ThresholdReviewTests(unittest.TestCase):
         texture[0, :, 1] = [65535, 0, 50000, 10000]
         return texture
 
-    def test_positive_uses_red_and_honors_reserved_values(self) -> None:
+    def test_positive_uses_red_with_liltoon_equation(self) -> None:
         image = review_threshold_rgba16(self._texture(), 30.0)
-        np.testing.assert_array_equal(image[0, :, 0], [1.0, 0.0, 1.0, 0.0])
+        np.testing.assert_array_equal(image[0, :, 0], [0.0, 1.0, 0.0, 1.0])
         np.testing.assert_array_equal(image[..., 3], 1.0)
 
     def test_negative_uses_green(self) -> None:
         image = review_threshold_rgba16(self._texture(), -30.0)
-        np.testing.assert_array_equal(image[0, :, 0], [0.0, 1.0, 0.0, 1.0])
+        np.testing.assert_array_equal(image[0, :, 0], [1.0, 0.0, 1.0, 0.0])
 
-    def test_transition_endpoints_and_zero_channel(self) -> None:
+    def test_channel_endpoints_are_ordinary_liltoon_values(self) -> None:
         texture = np.zeros((1, 2, 4), dtype=np.uint16)
         texture[..., 3] = 65535
-        texture[0, :, 0] = [1, 65534]
+        texture[0, :, 0] = [0, 65535]
         np.testing.assert_array_equal(
-            review_threshold_rgba16(texture, 0.0)[0, :, 0], [1.0, 0.0]
+            review_threshold_rgba16(texture, 0.0)[0, :, 0], [0.0, 1.0]
         )
         np.testing.assert_array_equal(
             review_threshold_rgba16(texture, 90.0)[0, :, 0], [1.0, 1.0]
         )
+
+    def test_midpoint_matches_default_liltoon_border(self) -> None:
+        texture = np.zeros((1, 2, 4), dtype=np.uint16)
+        texture[..., 3] = 65535
+        texture[0, :, 0] = [32767, 32768]
+        np.testing.assert_array_equal(
+            review_threshold_rgba16(texture, 45.0)[0, :, 0], [0.0, 1.0]
+        )
+
+    def test_eight_key_masks_round_trip_through_liltoon_equation(self) -> None:
+        angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
+        y, x = np.indices((9, 11))
+        right_transition = (x + 2 * y) % 8
+        left_transition = (2 * x + y + 1) % 8
+        right = np.arange(8)[:, None, None] >= right_transition[None, ...]
+        left = np.arange(8)[:, None, None] >= left_transition[None, ...]
+        texture = generate_threshold_pair(right, angles, left, angles)
+        for index, angle in enumerate(angles):
+            right_preview = review_threshold_rgba16(texture, float(angle))[..., 0] >= 0.5
+            np.testing.assert_array_equal(right_preview, right[index])
+            if index:
+                left_preview = review_threshold_rgba16(texture, -float(angle))[..., 0] >= 0.5
+                np.testing.assert_array_equal(left_preview, left[index])
 
     def test_requires_uint16_rgba(self) -> None:
         with self.assertRaises(TypeError):

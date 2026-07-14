@@ -29,29 +29,30 @@ def _load():
         dll = ctypes.CDLL(str(path))
         u8p = ctypes.POINTER(ctypes.c_uint8)
         f32p = ctypes.POINTER(ctypes.c_float)
+        f64p = ctypes.POINTER(ctypes.c_double)
         u16p = ctypes.POINTER(ctypes.c_uint16)
         i32p = ctypes.POINTER(ctypes.c_int)
         dll.qsdf_version.argtypes = []
         dll.qsdf_version.restype = ctypes.c_int
         dll.qsdf_generate_threshold.argtypes = [
-            u8p, f32p, ctypes.c_int, ctypes.c_int, ctypes.c_int, u16p, i32p
+            u8p, f64p, ctypes.c_int, ctypes.c_int, ctypes.c_int, u16p, i32p
         ]
         dll.qsdf_generate_threshold.restype = ctypes.c_int
         dll.qsdf_validate_monotonic.argtypes = [
-            u8p, f32p, ctypes.c_int, ctypes.c_int, ctypes.c_int, i32p
+            u8p, f64p, ctypes.c_int, ctypes.c_int, ctypes.c_int, i32p
         ]
         dll.qsdf_validate_monotonic.restype = ctypes.c_int
         if hasattr(dll, "qsdf_generate_threshold_pair"):
             dll.qsdf_generate_threshold_pair.argtypes = [
-                u8p, f32p, ctypes.c_int,
-                u8p, f32p, ctypes.c_int,
+                u8p, f64p, ctypes.c_int,
+                u8p, f64p, ctypes.c_int,
                 ctypes.c_int, ctypes.c_int, u16p, i32p, i32p,
             ]
             dll.qsdf_generate_threshold_pair.restype = ctypes.c_int
         if hasattr(dll, "qsdf_generate_threshold_pair_cancelable"):
             dll.qsdf_generate_threshold_pair_cancelable.argtypes = [
-                u8p, f32p, ctypes.c_int,
-                u8p, f32p, ctypes.c_int,
+                u8p, f64p, ctypes.c_int,
+                u8p, f64p, ctypes.c_int,
                 ctypes.c_int, ctypes.c_int, u16p, i32p, i32p, i32p,
             ]
             dll.qsdf_generate_threshold_pair_cancelable.restype = ctypes.c_int
@@ -65,8 +66,8 @@ def _load():
         if hasattr(dll, "qsdf_bake_face_shadow_guide"):
             dll.qsdf_bake_face_shadow_guide.argtypes = [
                 f32p, f32p, ctypes.c_int,
-                f32p, ctypes.c_int, f32p, f32p,
-                ctypes.c_int, ctypes.c_float,
+                f64p, ctypes.c_int, f64p, f64p,
+                ctypes.c_int, ctypes.c_double,
                 ctypes.c_int, ctypes.c_int, u8p, u8p, i32p,
             ]
             dll.qsdf_bake_face_shadow_guide.restype = ctypes.c_int
@@ -93,19 +94,31 @@ def version() -> int:
     return int(dll.qsdf_version()) if dll is not None else 0
 
 
+def native_threshold_available() -> bool:
+    """Return whether the loaded core implements the ABI-5 lilToon encoder."""
+
+    dll = _load()
+    return bool(
+        dll is not None
+        and version() >= 5
+        and hasattr(dll, "qsdf_generate_threshold")
+        and hasattr(dll, "qsdf_generate_threshold_pair")
+    )
+
+
 def _prepare(masks, angles):
     binary = np.ascontiguousarray(np.asarray(masks) >= 0.5, dtype=np.uint8)
-    angle_values = np.asarray(angles, dtype=np.float32)
+    angle_values = np.asarray(angles, dtype=np.float64)
     if binary.ndim != 3 or angle_values.shape != (binary.shape[0],):
         raise ValueError("masks must be (N,H,W) and angles must be (N,)")
     if not np.all(np.isfinite(angle_values)) or np.any(np.abs(angle_values) > 90.0):
         raise ValueError("angles must be finite values in [-90, 90]")
     if len(np.unique(angle_values)) != len(angle_values):
         raise ValueError("angles must be unique")
-    if not np.any(np.isclose(angle_values, 0.0, atol=1.0e-5)):
+    if not np.any(np.isclose(angle_values, 0.0, atol=1.0e-7, rtol=0.0)):
         raise ValueError("angles must include zero degrees")
-    if not np.any(np.isclose(angle_values, -90.0, atol=1.0e-5)) or not np.any(
-        np.isclose(angle_values, 90.0, atol=1.0e-5)
+    if not np.any(np.isclose(angle_values, -90.0, atol=1.0e-7, rtol=0.0)) or not np.any(
+        np.isclose(angle_values, 90.0, atol=1.0e-7, rtol=0.0)
     ):
         raise ValueError("angles must include both -90 and +90 degree endpoints")
     order = np.argsort(angle_values, kind="stable")
@@ -114,36 +127,36 @@ def _prepare(masks, angles):
 
 def _prepare_side(masks, angles, *, name: str):
     binary = np.ascontiguousarray(np.asarray(masks) >= 0.5, dtype=np.uint8)
-    angle_values = np.asarray(angles, dtype=np.float32)
+    angle_values = np.asarray(angles, dtype=np.float64)
     if binary.ndim != 3 or angle_values.shape != (binary.shape[0],):
         raise ValueError(f"{name}_masks must be (N,H,W) and {name}_angles must be (N,)")
-    if not np.all(np.isfinite(angle_values)) or np.any(angle_values < -1.0e-5) or np.any(
-        angle_values > 90.0 + 1.0e-5
+    if not np.all(np.isfinite(angle_values)) or np.any(angle_values < -1.0e-7) or np.any(
+        angle_values > 90.0 + 1.0e-7
     ):
         raise ValueError(f"{name}_angles must be finite values in [0, 90]")
     order = np.argsort(angle_values, kind="stable")
     sorted_angles = np.ascontiguousarray(angle_values[order])
-    if sorted_angles.size < 2 or np.any(np.diff(sorted_angles) <= 1.0e-5):
+    if sorted_angles.size < 2 or np.any(np.diff(sorted_angles) <= 1.0e-7):
         raise ValueError(f"{name}_angles must be unique")
-    if not np.isclose(sorted_angles[0], 0.0, atol=1.0e-5) or not np.isclose(
-        sorted_angles[-1], 90.0, atol=1.0e-5
+    if not np.isclose(sorted_angles[0], 0.0, atol=1.0e-7, rtol=0.0) or not np.isclose(
+        sorted_angles[-1], 90.0, atol=1.0e-7, rtol=0.0
     ):
         raise ValueError(f"{name}_angles must include 0 and 90 degree endpoints")
     return np.ascontiguousarray(binary[order]), sorted_angles
 
 
 def generate_threshold(masks, angles):
-    """Return ``(H, W, 2) uint16`` or raise for invalid/non-monotonic input."""
+    """Return ABI-5 lilToon ``(H, W, 2) uint16`` channel values."""
     dll = _load()
-    if dll is None:
-        raise NativeCoreError("Native Quick SDF core is not available")
+    if not native_threshold_available():
+        raise NativeCoreError("Native Quick SDF ABI 5 threshold core is not available")
     binary, angle_values = _prepare(masks, angles)
     count, height, width = binary.shape
     output = np.empty((height, width, 2), dtype=np.uint16)
     violations = ctypes.c_int(0)
     code = dll.qsdf_generate_threshold(
         binary.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         count,
         width,
         height,
@@ -160,16 +173,11 @@ def generate_threshold(masks, angles):
 def generate_threshold_pair(
     right_masks, right_angles, left_masks, left_angles, *, cancel_flag=None
 ):
-    """Return independent right/left ``(H, W, 2) uint16`` thresholds.
-
-    Unlike the legacy signed-stack ABI, each side owns its own zero-degree
-    mask.  Version-1 DLLs are rejected rather than silently merging those two
-    masks.
-    """
+    """Return independent right/left lilToon ``(H, W, 2) uint16`` values."""
 
     dll = _load()
-    if dll is None or not hasattr(dll, "qsdf_generate_threshold_pair"):
-        raise NativeCoreError("Native Quick SDF threshold-pair core is not available")
+    if not native_threshold_available():
+        raise NativeCoreError("Native Quick SDF ABI 5 threshold-pair core is not available")
     right, right_values = _prepare_side(right_masks, right_angles, name="right")
     left, left_values = _prepare_side(left_masks, left_angles, name="left")
     if right.shape[1:] != left.shape[1:]:
@@ -193,10 +201,10 @@ def generate_threshold_pair(
     )
     arguments = (
         right.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        right_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        right_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         right_count,
         left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        left_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        left_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         left_count,
         width,
         height,
@@ -231,12 +239,12 @@ def native_bake_available() -> bool:
 
 
 def native_guide_bake_available() -> bool:
-    """Return whether the ABI-4 artist guide rasterizer is available."""
+    """Return whether the ABI-5 lilToon guide rasterizer is available."""
 
     dll = _load()
     return bool(
         dll is not None
-        and version() >= 4
+        and version() >= 5
         and hasattr(dll, "qsdf_bake_face_shadow_guide")
     )
 
@@ -348,7 +356,7 @@ def bake_face_shadow_guide(
     enforce_monotonic=True,
     cancel_flag=None,
 ):
-    """Bake the side-explicit face-shadow guide in ABI 4 or exact Python."""
+    """Bake the side-explicit lilToon guide in ABI 5 or exact Python."""
 
     from .bake import (
         bake_face_shadow_guide as fallback,
@@ -372,9 +380,9 @@ def bake_face_shadow_guide(
     uvs = np.ascontiguousarray(np.asarray(triangle_uvs), dtype=np.float32)
     normals = np.ascontiguousarray(np.asarray(corner_normals), dtype=np.float32)
     angle_values, _directions = guide_light_directions(angles, forward, up, side)
-    angle_values = np.ascontiguousarray(angle_values, dtype=np.float32)
-    forward_values = np.ascontiguousarray(np.asarray(forward), dtype=np.float32)
-    up_values = np.ascontiguousarray(np.asarray(up), dtype=np.float32)
+    angle_values = np.ascontiguousarray(angle_values, dtype=np.float64)
+    forward_values = np.ascontiguousarray(np.asarray(forward), dtype=np.float64)
+    up_values = np.ascontiguousarray(np.asarray(up), dtype=np.float64)
     cutoff = shadow_amount_cutoff(shadow_amount)
     if uvs.ndim != 3 or uvs.shape[1:] != (3, 2):
         raise ValueError("triangle_uvs must have shape (N, 3, 2)")
@@ -404,12 +412,12 @@ def bake_face_shadow_guide(
         uvs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         normals.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         int(uvs.shape[0]),
-        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         int(angle_values.size),
-        forward_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        up_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        forward_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        up_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         side_sign,
-        ctypes.c_float(cutoff),
+        ctypes.c_double(cutoff),
         image_width,
         image_height,
         masks.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
@@ -428,7 +436,7 @@ def bake_face_shadow_guide(
 def repair_side_monotonic(
     mask_stack, base_stack, coverage_stack, *, cancel_flag=None
 ):
-    """Use ABI 4 to repair an export lane, falling back to the pure core."""
+    """Use ABI 4+ to repair an export lane, falling back to the pure core."""
 
     from .core import (
         MonotonicRepairResult,
@@ -498,14 +506,14 @@ def repair_side_monotonic(
 
 def validate_monotonic(masks, angles) -> int:
     dll = _load()
-    if dll is None:
-        raise NativeCoreError("Native Quick SDF core is not available")
+    if not native_threshold_available():
+        raise NativeCoreError("Native Quick SDF ABI 5 validation core is not available")
     binary, angle_values = _prepare(masks, angles)
     count, height, width = binary.shape
     violations = ctypes.c_int(0)
     code = dll.qsdf_validate_monotonic(
         binary.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        angle_values.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         count,
         width,
         height,
@@ -526,6 +534,7 @@ __all__ = [
     "native_bake_available",
     "native_guide_bake_available",
     "native_repair_available",
+    "native_threshold_available",
     "repair_side_monotonic",
     "validate_monotonic",
     "version",

@@ -97,10 +97,10 @@ class ThresholdPairTests(unittest.TestCase):
         right[:, 0, 0] = True
         left[:, 1, 1] = True
         rgba = generate_threshold_pair(right, ANGLES, left, ANGLES)
-        self.assertEqual(int(rgba[0, 0, 0]), 0)
-        self.assertEqual(int(rgba[0, 0, 1]), 65535)
-        self.assertEqual(int(rgba[1, 1, 0]), 65535)
-        self.assertEqual(int(rgba[1, 1, 1]), 0)
+        self.assertEqual(int(rgba[0, 0, 0]), 65535)
+        self.assertEqual(int(rgba[0, 0, 1]), 0)
+        self.assertEqual(int(rgba[1, 1, 0]), 0)
+        self.assertEqual(int(rgba[1, 1, 1]), 65535)
         self.assertTrue(np.all(rgba[..., 2] == 0))
         self.assertTrue(np.all(rgba[..., 3] == 65535))
 

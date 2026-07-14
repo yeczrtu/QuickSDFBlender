@@ -167,12 +167,12 @@ def review_threshold_rgba16(
     threshold_rgba16: np.ndarray,
     signed_angle: float,
 ) -> np.ndarray:
-    """Evaluate a generated threshold texture at a continuous signed angle.
+    """Evaluate a lilToon face-SDF texture at continuous authored progress.
 
-    Positive angles (including zero) use R and negative angles use G.  Codes 0
-    and 65535 are reserved for always-Light and always-Shadow respectively;
-    transition codes 1..65534 are compared in the same quantized domain used by
-    threshold generation.
+    Positive angles (including zero) use R and negative angles use G. The
+    authored 0..90 sweep maps to lilToon's horizontal forward dot in -0.5..0.5
+    and uses its default border equation ``frontDot + T >= 0.5``. Channel
+    endpoints are ordinary values, not reserved sentinels.
     """
 
     thresholds = np.asarray(threshold_rgba16)
@@ -187,10 +187,10 @@ def review_threshold_rgba16(
 
     angle = _validated_review_angle(signed_angle)
     channel = 0 if angle >= 0.0 else 1
-    values = thresholds[..., channel]
-    normalized = abs(angle) / 90.0
-    current_code = 1 + int(np.floor(normalized * 65533.0 + 0.5))
-    light = (values == 0) | ((values != 65535) & (values <= current_code))
+    threshold = thresholds[..., channel].astype(np.float64) / 65535.0
+    progress = abs(angle) / 90.0
+    front_dot = progress - 0.5
+    light = front_dot + threshold >= 0.5
     return _mask_rgba(light)
 
 

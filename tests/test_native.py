@@ -11,6 +11,7 @@ from quick_sdf_blender.bake import (
     bake_normal_sweep as reference_bake,
 )
 from quick_sdf_blender.core import (
+    generate_threshold_pair as reference_threshold_pair,
     generate_threshold_rgba16,
     repair_side_monotonic as reference_repair,
 )
@@ -18,8 +19,9 @@ from quick_sdf_blender.core import (
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
 class NativeCoreTests(unittest.TestCase):
-    def test_version_four_guide_abi(self):
-        self.assertGreaterEqual(native.version(), 4)
+    def test_version_five_liltoon_abi(self):
+        self.assertEqual(native.version(), 5)
+        self.assertTrue(native.native_threshold_available())
         self.assertTrue(native.native_guide_bake_available())
         self.assertTrue(native.native_repair_available())
 
@@ -154,7 +156,7 @@ class NativeCoreTests(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        angles = np.asarray([0.0, 15.0, 45.0, 75.0, 90.0], dtype=np.float32)
+        angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
         for side in ("RIGHT", "LEFT"):
             expected_masks, expected_occupancy = reference_guide_bake(
                 uvs,
@@ -180,6 +182,7 @@ class NativeCoreTests(unittest.TestCase):
             )
             np.testing.assert_array_equal(occupancy, expected_occupancy)
             np.testing.assert_array_equal(masks, expected_masks)
+            self.assertTrue(np.all(masks[-1, occupancy]))
 
     def test_threshold_pair_supports_distinct_zero_masks(self):
         angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float32)
@@ -190,12 +193,12 @@ class NativeCoreTests(unittest.TestCase):
         right[2, 0, 2] = 1  # transition at the last interval
         left[1:, 0, 2] = 1  # earlier transition
         result = native.generate_threshold_pair(right, angles, left, angles)
-        np.testing.assert_array_equal(result[0, 0], [0, 65535])
-        np.testing.assert_array_equal(result[0, 1], [65535, 0])
-        self.assertGreater(result[0, 2, 0], result[0, 2, 1])
+        np.testing.assert_array_equal(result[0, 0], [65535, 0])
+        np.testing.assert_array_equal(result[0, 1], [0, 65535])
+        self.assertLess(result[0, 2, 0], result[0, 2, 1])
 
-    def test_existing_threshold_pair_symbol_remains_abi_compatible(self):
-        angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float32)
+    def test_threshold_pair_symbol_uses_abi_five_double_angles(self):
+        angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float64)
         right = np.zeros((3, 2, 3), dtype=np.uint8)
         left = np.zeros_like(right)
         right[1:, 0, :] = 1
@@ -209,10 +212,10 @@ class NativeCoreTests(unittest.TestCase):
         dll = native._load()
         code = dll.qsdf_generate_threshold_pair(
             right.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             3,
             left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            angles.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             3,
             3,
             2,
@@ -230,24 +233,35 @@ class NativeCoreTests(unittest.TestCase):
         left[0] = 1
         with self.assertRaisesRegex(native.NativeCoreError, "left=1"):
             native.generate_threshold_pair(right, angles, left, angles)
-    def test_constant_sentinels(self):
-        angles = np.array([-90.0, 0.0, 90.0], dtype=np.float32)
+    def test_full_range_endpoint_values(self):
+        angles = np.array([-90.0, 0.0, 90.0], dtype=np.float64)
         masks = np.zeros((3, 4, 6), dtype=np.uint8)
-        result = native.generate_threshold(masks, angles)
-        self.assertTrue(np.all(result == 65535))
-
-        masks.fill(1)
         result = native.generate_threshold(masks, angles)
         self.assertTrue(np.all(result == 0))
 
+        masks.fill(1)
+        result = native.generate_threshold(masks, angles)
+        self.assertTrue(np.all(result == 65535))
+
     def test_distance_interpolated_transition(self):
-        angles = np.array([-90.0, -45.0, 0.0, 45.0, 90.0], dtype=np.float32)
+        angles = np.array([-90.0, -45.0, 0.0, 45.0, 90.0], dtype=np.float64)
         masks = np.ones((5, 8, 8), dtype=np.uint8)
         masks[2] = 0
         result = native.generate_threshold(masks, angles)
-        # Equal SDF magnitudes place the transition at 22.5 degrees (0.25).
-        self.assertTrue(np.all(result[:, :, 0] == 16384))
-        self.assertTrue(np.all(result[:, :, 1] == 16384))
+        # Equal SDF magnitudes place the transition at u=.25, encoded as T=.75.
+        self.assertTrue(np.all(result[:, :, 0] == 49151))
+        self.assertTrue(np.all(result[:, :, 1] == 49151))
+
+    def test_eight_fractional_keys_are_byte_exact_with_python(self):
+        angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
+        y, x = np.indices((13, 17))
+        right_transition = (x + 2 * y) % 9
+        left_transition = (3 * x + y + 2) % 9
+        right = np.arange(8)[:, None, None] >= right_transition[None, ...]
+        left = np.arange(8)[:, None, None] >= left_transition[None, ...]
+        expected = reference_threshold_pair(right, angles, left, angles)
+        actual = native.generate_threshold_pair(right, angles, left, angles)
+        np.testing.assert_array_equal(actual, expected[..., :2])
 
     def test_non_monotonic_is_rejected(self):
         angles = np.array([-90.0, 0.0, 90.0], dtype=np.float32)

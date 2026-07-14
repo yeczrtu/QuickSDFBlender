@@ -106,7 +106,7 @@ class MonotonicRepairTests(unittest.TestCase):
         self.assertEqual(int(result.transition_indices[0, 0]), 0)
         self.assertEqual(result.transition_indices.dtype, np.int32)
 
-    def test_repair_enabled_export_matches_020_png_golden(self) -> None:
+    def test_repair_enabled_export_matches_liltoon_png_golden(self) -> None:
         angles = np.asarray([0.0, 20.0, 55.0, 90.0], dtype=np.float64)
         right_transitions = np.asarray([[0, 1, 2, 4], [4, 3, 1, 0]])
         left_transitions = np.asarray([[4, 2, 3, 0], [1, 4, 0, 2]])
@@ -126,7 +126,7 @@ class MonotonicRepairTests(unittest.TestCase):
         np.testing.assert_array_equal(repaired_left, left)
         self.assertEqual(
             hashlib.sha256(encode_png_rgba16(rgba)).hexdigest(),
-            "3d1c5076504f2ab25d239fbb2a886d6a6dde23a51e7cde134d6d44be5946fd22",
+            "5ad840cffad7c3c8ebf0de83324426234dfb4aa195950c38155f73e40605ac79",
         )
 
     def test_coverage_protection_wins_before_total_and_base_cost(self) -> None:
@@ -277,7 +277,7 @@ class RangeTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
-    def test_reserved_values_and_channels(self) -> None:
+    def test_full_range_liltoon_values_and_channels(self) -> None:
         stack = np.zeros((len(ANGLES), 1, 3), dtype=bool)
         stack[:, 0, 0] = True  # always Light
         # pixel 1 stays Shadow; pixel 2 transitions differently by side
@@ -293,7 +293,8 @@ class ThresholdTests(unittest.TestCase):
         np.testing.assert_array_equal(output[0, 1, :], [ALWAYS_SHADOW, ALWAYS_SHADOW, 0, 65535])
         self.assertTrue(1 <= int(output[0, 2, 0]) <= 65534)
         self.assertTrue(1 <= int(output[0, 2, 1]) <= 65534)
-        self.assertLess(output[0, 2, 0], output[0, 2, 1])
+        # Earlier Light transitions have larger lilToon SDF values.
+        self.assertGreater(output[0, 2, 0], output[0, 2, 1])
 
     def test_sdf_ratio_places_straight_boundary_halfway(self) -> None:
         angles = np.asarray([-90.0, 0.0, 90.0])
@@ -302,7 +303,7 @@ class ThresholdTests(unittest.TestCase):
         stack[2] = True
         output = generate_threshold_rgba16(stack, angles)
         # Adjacent black/white pixel centres have equal |SDF|, so transition is 45 degrees.
-        expected = 1 + int(np.floor(0.5 * 65533 + 0.5))
+        expected = int(np.floor((1.0 - 0.5) * 65535 + 0.5))
         np.testing.assert_array_equal(output[0, :, 0], [expected, expected])
         np.testing.assert_array_equal(output[0, :, 1], [expected, expected])
 
