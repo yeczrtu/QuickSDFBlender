@@ -374,19 +374,6 @@ export default function Home() {
           </aside>
         </section>
 
-        <aside className="model-credit page-shell" aria-labelledby="model-credit-title">
-          <div className="model-credit-heading">
-            <p>{t.creditTitle}</p>
-            <h2 id="model-credit-title">{t.creditName}</h2>
-            <strong>{t.creditCreator}</strong>
-          </div>
-          <p className="model-credit-body">{t.creditBody}</p>
-          <div className="model-credit-links">
-            <a href="https://mukumi.booth.pm/items/5813187" target="_blank" rel="noreferrer">{t.creditProduct}<span aria-hidden="true">↗</span></a>
-            <a href="https://mochiyama.com/kipfel_manual_jp" target="_blank" rel="noreferrer">{t.creditManual}<span aria-hidden="true">↗</span></a>
-          </div>
-        </aside>
-
         <section className="basics-section page-shell" aria-labelledby="basics-title">
           <h2 id="basics-title">{t.basicsTitle}</h2>
           <dl>{t.basics.map(([term, description]) => <div key={term}><dt>{term}</dt><dd>{description}</dd></div>)}</dl>
@@ -411,6 +398,18 @@ export default function Home() {
               </div>
               <ScreenFigure src={`${media}quick-sdf-create-and-edit.png`} alt={t.imageAlts.create} fullSizeLabel={t.openFullSize} legend={t.step1Legend} />
             </div>
+            <aside className="model-credit model-credit-inline" aria-labelledby="model-credit-title">
+              <div className="model-credit-heading">
+                <p>{t.creditTitle}</p>
+                <h2 id="model-credit-title">{t.creditName}</h2>
+                <strong>{t.creditCreator}</strong>
+              </div>
+              <p className="model-credit-body">{t.creditBody}</p>
+              <div className="model-credit-links">
+                <a href="https://mukumi.booth.pm/items/5813187" target="_blank" rel="noreferrer">{t.creditProduct}<span aria-hidden="true">↗</span></a>
+                <a href="https://mochiyama.com/kipfel_manual_jp" target="_blank" rel="noreferrer">{t.creditManual}<span aria-hidden="true">↗</span></a>
+              </div>
+            </aside>
           </article>
 
           <article className="manual-step page-shell" id="step-2">

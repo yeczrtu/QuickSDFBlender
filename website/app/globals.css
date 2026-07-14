@@ -342,6 +342,11 @@ h3 {
   background: var(--surface);
 }
 
+.model-credit.model-credit-inline {
+  margin-top: 28px;
+  margin-bottom: 0;
+}
+
 .model-credit-heading > p {
   margin-bottom: 6px;
   color: var(--orange-soft);
