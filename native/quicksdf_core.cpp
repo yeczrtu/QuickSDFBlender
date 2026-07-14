@@ -163,6 +163,12 @@ bool signed_distance(const uint8_t* light_mask, int width, int height,
     return true;
 }
 
+double finite_signed_distance(double value, double diagonal) {
+    if (std::isnan(value)) return 0.0;
+    if (std::isinf(value)) return std::signbit(value) ? -diagonal : diagonal;
+    return value;
+}
+
 uint16_t encode_transition(double normalized_angle) {
     normalized_angle = std::clamp(normalized_angle, 0.0, 1.0);
     return uint16_t(std::floor((1.0 - normalized_angle) * 65535.0 + 0.5));
@@ -411,7 +417,49 @@ int rasterize_guide_normals(const float* triangle_uvs, const float* corner_norma
 
 }  // namespace
 
-QSDF_API int qsdf_version() { return 5; }
+QSDF_API int qsdf_version() { return 6; }
+
+QSDF_API int qsdf_interpolate_binary_masks(
+    const uint8_t* first_mask, const uint8_t* second_mask,
+    int width, int height, double factor, uint8_t* output_mask,
+    const int* cancel_requested) {
+    if (!first_mask || !second_mask || !output_mask || width < 1 || height < 1 ||
+        !std::isfinite(factor) || factor < 0.0 || factor > 1.0)
+        return QSDF_INVALID_ARGUMENT;
+    if (cancel_requested && *cancel_requested) return QSDF_CANCELLED;
+    const size_t pixels = size_t(width) * size_t(height);
+    if (factor == 0.0 || factor == 1.0) {
+        const uint8_t* source = factor == 0.0 ? first_mask : second_mask;
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            if ((pixel & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+                return QSDF_CANCELLED;
+            output_mask[pixel] = source[pixel] != 0 ? 1 : 0;
+        }
+        return QSDF_OK;
+    }
+    try {
+        std::vector<double> first_sdf, second_sdf;
+        if (!signed_distance(first_mask, width, height, first_sdf,
+                             cancel_requested) ||
+            !signed_distance(second_mask, width, height, second_sdf,
+                             cancel_requested))
+            return QSDF_CANCELLED;
+        const double diagonal =
+            std::sqrt(double(width) * width + double(height) * height) + 1.0;
+        const double inverse_factor = 1.0 - factor;
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            if ((pixel & size_t(65535)) == 0 && cancel_requested && *cancel_requested)
+                return QSDF_CANCELLED;
+            const double first = finite_signed_distance(first_sdf[pixel], diagonal);
+            const double second = finite_signed_distance(second_sdf[pixel], diagonal);
+            output_mask[pixel] =
+                inverse_factor * first + factor * second <= 0.0 ? 1 : 0;
+        }
+        return QSDF_OK;
+    } catch (const std::bad_alloc&) {
+        return QSDF_OUT_OF_MEMORY;
+    }
+}
 
 QSDF_API int qsdf_bake_normal_sweep(
     const float* triangle_uvs, const float* corner_normals, int triangle_count,

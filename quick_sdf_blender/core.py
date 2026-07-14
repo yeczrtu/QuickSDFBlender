@@ -248,6 +248,66 @@ def exact_signed_edt(light_mask: np.ndarray | Sequence[object]) -> np.ndarray:
     return to_light - to_shadow
 
 
+def _cancel_requested(cancel_flag: object | None) -> bool:
+    if cancel_flag is None:
+        return False
+    return bool(getattr(cancel_flag, "value", cancel_flag))
+
+
+def interpolate_binary_masks(
+    first: np.ndarray | Sequence[object],
+    second: np.ndarray | Sequence[object],
+    factor: float,
+    cancel_flag: object | None = None,
+) -> np.ndarray:
+    """Blend two binary masks with the exact signed-distance preview rule.
+
+    ``factor`` is zero at ``first`` and one at ``second``. Constant masks have
+    infinite signed distance, which is replaced by the image diagonal plus one
+    before blending. This is the same finite convention used by Studio seek
+    preview and makes all-Light/all-Shadow interpolation deterministic.
+    """
+
+    first_mask = _as_binary(first, ndim=2)
+    second_mask = _as_binary(second, ndim=2)
+    if first_mask.shape != second_mask.shape:
+        raise ValueError("first and second masks must have the same shape")
+    if not first_mask.size:
+        raise ValueError("mask dimensions must be positive")
+    value = float(factor)
+    if not np.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError("factor must be a finite value in [0, 1]")
+    if _cancel_requested(cancel_flag):
+        raise RuntimeError("Quick SDF interpolation was cancelled")
+    if value == 0.0:
+        return np.ascontiguousarray(first_mask)
+    if value == 1.0:
+        return np.ascontiguousarray(second_mask)
+
+    diagonal = float(
+        (first_mask.shape[0] ** 2 + first_mask.shape[1] ** 2) ** 0.5 + 1.0
+    )
+    first_sdf = np.nan_to_num(
+        exact_signed_edt(first_mask),
+        nan=0.0,
+        posinf=diagonal,
+        neginf=-diagonal,
+    )
+    if _cancel_requested(cancel_flag):
+        raise RuntimeError("Quick SDF interpolation was cancelled")
+    second_sdf = np.nan_to_num(
+        exact_signed_edt(second_mask),
+        nan=0.0,
+        posinf=diagonal,
+        neginf=-diagonal,
+    )
+    if _cancel_requested(cancel_flag):
+        raise RuntimeError("Quick SDF interpolation was cancelled")
+    return np.ascontiguousarray(
+        ((1.0 - value) * first_sdf + value * second_sdf) <= 0.0
+    )
+
+
 def validate_monotonic(
     mask_stack: np.ndarray | Sequence[object],
     angles: Sequence[float] | np.ndarray,
@@ -657,6 +717,7 @@ __all__ = [
     "generate_threshold_channels",
     "generate_threshold_pair_channels",
     "guard_clip_proposal",
+    "interpolate_binary_masks",
     "range_target_indices",
     "repair_side_monotonic",
     "validate_monotonic",

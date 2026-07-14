@@ -79,6 +79,11 @@ def _load():
                 i32p, i32p, i32p, i32p, i32p,
             ]
             dll.qsdf_repair_side_monotonic.restype = ctypes.c_int
+        if hasattr(dll, "qsdf_interpolate_binary_masks"):
+            dll.qsdf_interpolate_binary_masks.argtypes = [
+                u8p, u8p, ctypes.c_int, ctypes.c_int, ctypes.c_double, u8p, i32p,
+            ]
+            dll.qsdf_interpolate_binary_masks.restype = ctypes.c_int
         _DLL = dll
     except OSError:
         _DLL = False
@@ -256,6 +261,70 @@ def native_repair_available() -> bool:
         and version() >= 4
         and hasattr(dll, "qsdf_repair_side_monotonic")
     )
+
+
+def native_interpolation_available() -> bool:
+    """Return whether the ABI-6 exact binary-mask interpolator is available."""
+
+    dll = _load()
+    return bool(
+        dll is not None
+        and version() >= 6
+        and hasattr(dll, "qsdf_interpolate_binary_masks")
+    )
+
+
+def interpolate_binary_masks(first, second, factor, cancel_flag=None):
+    """Return an exact-SDF blend, using ABI 6 when it is available."""
+
+    from .core import _as_binary, interpolate_binary_masks as fallback
+
+    first_mask = _as_binary(first, ndim=2)
+    second_mask = _as_binary(second, ndim=2)
+    if first_mask.shape != second_mask.shape:
+        raise ValueError("first and second masks must have the same shape")
+    if not first_mask.size:
+        raise ValueError("mask dimensions must be positive")
+    value = float(factor)
+    if not np.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError("factor must be a finite value in [0, 1]")
+    if cancel_flag is None:
+        cancel_value = ctypes.c_int(0)
+    elif isinstance(cancel_flag, ctypes.c_int):
+        cancel_value = cancel_flag
+    else:
+        cancel_value = ctypes.c_int(int(bool(cancel_flag)))
+    if cancel_value.value:
+        raise NativeCoreError("Native Quick SDF interpolation was cancelled")
+    if not native_interpolation_available():
+        try:
+            return fallback(first_mask, second_mask, value, cancel_flag=cancel_value)
+        except RuntimeError as error:
+            if "cancelled" in str(error):
+                raise NativeCoreError("Quick SDF interpolation was cancelled") from error
+            raise
+
+    first_binary = np.ascontiguousarray(first_mask, dtype=np.uint8)
+    second_binary = np.ascontiguousarray(second_mask, dtype=np.uint8)
+    height, width = first_binary.shape
+    output = np.empty((height, width), dtype=np.uint8)
+    dll = _load()
+    code = dll.qsdf_interpolate_binary_masks(
+        first_binary.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        second_binary.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        width,
+        height,
+        ctypes.c_double(value),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        ctypes.byref(cancel_value),
+    )
+    if code == 4:
+        raise NativeCoreError("Native Quick SDF interpolation was cancelled")
+    if code:
+        raise NativeCoreError(
+            f"Native Quick SDF interpolation failed with status {code}"
+        )
+    return np.ascontiguousarray(output.astype(np.bool_))
 
 
 def bake_normal_sweep(
@@ -531,8 +600,10 @@ __all__ = [
     "bake_normal_sweep",
     "generate_threshold",
     "generate_threshold_pair",
+    "interpolate_binary_masks",
     "native_bake_available",
     "native_guide_bake_available",
+    "native_interpolation_available",
     "native_repair_available",
     "native_threshold_available",
     "repair_side_monotonic",

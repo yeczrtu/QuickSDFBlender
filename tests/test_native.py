@@ -13,6 +13,7 @@ from quick_sdf_blender.bake import (
 from quick_sdf_blender.core import (
     generate_threshold_channels as reference_threshold_channels,
     generate_threshold_pair_channels as reference_threshold_pair,
+    interpolate_binary_masks as reference_interpolation,
     repair_side_monotonic as reference_repair,
 )
 
@@ -26,11 +27,66 @@ def reference_signed_threshold_channels(
 
 @unittest.skipUnless(native.available(), "Windows native core was not built")
 class NativeCoreTests(unittest.TestCase):
-    def test_version_five_liltoon_abi(self):
-        self.assertEqual(native.version(), 5)
+    def test_version_six_interpolation_abi(self):
+        self.assertEqual(native.version(), 6)
         self.assertTrue(native.native_threshold_available())
         self.assertTrue(native.native_guide_bake_available())
+        self.assertTrue(native.native_interpolation_available())
         self.assertTrue(native.native_repair_available())
+
+    def test_native_binary_interpolation_matches_python_byte_exact(self):
+        rng = np.random.default_rng(6102)
+        first = rng.random((37, 29)) > 0.52
+        second = rng.random((37, 29)) > 0.48
+        for factor in (0.0, 0.01, 0.2, 0.5, 0.731, 0.99, 1.0):
+            expected = reference_interpolation(first, second, factor)
+            actual = native.interpolate_binary_masks(first, second, factor)
+            self.assertEqual(actual.dtype, np.bool_)
+            self.assertTrue(actual.flags.c_contiguous)
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_native_binary_interpolation_normalizes_layout_and_constants(self):
+        shadow = np.zeros((5, 7), dtype=np.uint16)[:, ::-1]
+        light = np.full((5, 7), 255, dtype=np.uint8, order="F")
+        for factor in (0.49, 0.5, 0.51):
+            np.testing.assert_array_equal(
+                native.interpolate_binary_masks(shadow, light, factor),
+                reference_interpolation(shadow, light, factor),
+            )
+
+    def test_native_binary_interpolation_honors_cancel_flag(self):
+        mask = np.zeros((8, 8), dtype=np.bool_)
+        with self.assertRaisesRegex(native.NativeCoreError, "cancelled"):
+            native.interpolate_binary_masks(
+                mask, ~mask, 0.5, cancel_flag=ctypes.c_int(1)
+            )
+
+    def test_running_native_binary_interpolation_cancels_cooperatively(self):
+        size = 1024
+        y, x = np.indices((size, size))
+        first = (x + y) % 17 < 8
+        second = (3 * x + y) % 19 < 9
+        cancel_flag = ctypes.c_int(0)
+        outcome = []
+
+        def interpolate():
+            try:
+                native.interpolate_binary_masks(
+                    first, second, 0.413, cancel_flag=cancel_flag
+                )
+            except BaseException as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=interpolate)
+        started = time.perf_counter()
+        worker.start()
+        time.sleep(0.01)
+        cancel_flag.value = 1
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(time.perf_counter() - started, 2.0)
+        self.assertEqual(len(outcome), 1)
+        self.assertRegex(str(outcome[0]), "cancelled")
 
     def test_native_monotonic_repair_matches_reference(self):
         rng = np.random.default_rng(403)

@@ -18,6 +18,7 @@ from quick_sdf_blender.core import (
     exact_signed_edt,
     generate_threshold_pair_channels,
     guard_clip_proposal,
+    interpolate_binary_masks,
     range_target_indices,
     repair_side_monotonic,
     validate_monotonic,
@@ -233,6 +234,50 @@ class ExactEdtTests(unittest.TestCase):
         np.testing.assert_allclose(signed, [[1.0, -1.0], [1.0, -1.0]])
         self.assertTrue(np.all(np.isneginf(exact_signed_edt(np.ones((2, 3), dtype=bool)))))
         self.assertTrue(np.all(np.isposinf(exact_signed_edt(np.zeros((2, 3), dtype=bool)))))
+
+
+class BinaryMaskInterpolationTests(unittest.TestCase):
+    def test_exact_sdf_blend_moves_a_straight_boundary(self) -> None:
+        first = np.asarray([[True, True, False, False, False, False, False]])
+        second = np.asarray([[True, True, True, True, True, True, False]])
+        np.testing.assert_array_equal(
+            interpolate_binary_masks(first, second, 0.25),
+            [[True, True, True, False, False, False, False]],
+        )
+        np.testing.assert_array_equal(
+            interpolate_binary_masks(first, second, 0.5),
+            [[True, True, True, True, False, False, False]],
+        )
+
+    def test_constant_masks_follow_live_preview_finite_distance_rule(self) -> None:
+        shadow = np.zeros((3, 5), dtype=np.bool_)
+        light = np.ones_like(shadow)
+        self.assertFalse(np.any(interpolate_binary_masks(shadow, light, 0.49)))
+        # The exact zero crossing is Light, matching Studio's ``<= 0`` rule.
+        self.assertTrue(np.all(interpolate_binary_masks(shadow, light, 0.5)))
+        self.assertTrue(np.all(interpolate_binary_masks(shadow, light, 0.51)))
+        self.assertTrue(np.all(interpolate_binary_masks(light, light, 0.37)))
+        self.assertFalse(np.any(interpolate_binary_masks(shadow, shadow, 0.63)))
+
+    def test_endpoints_are_exact_contiguous_bool_copies(self) -> None:
+        first = np.asarray([[0, 255, 0], [255, 0, 255]], dtype=np.uint8)[:, ::-1]
+        second = np.asarray([[1, 0, 1], [0, 1, 0]], dtype=np.uint16)
+        at_first = interpolate_binary_masks(first, second, 0.0)
+        at_second = interpolate_binary_masks(first, second, 1.0)
+        self.assertEqual(at_first.dtype, np.bool_)
+        self.assertTrue(at_first.flags.c_contiguous)
+        np.testing.assert_array_equal(at_first, first >= 0.5)
+        np.testing.assert_array_equal(at_second, second >= 0.5)
+
+    def test_validation_and_pre_cancel(self) -> None:
+        mask = np.zeros((2, 3), dtype=np.bool_)
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            interpolate_binary_masks(mask, mask[:, :2], 0.5)
+        for factor in (-0.01, 1.01, np.nan, np.inf):
+            with self.assertRaisesRegex(ValueError, "factor"):
+                interpolate_binary_masks(mask, mask, factor)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            interpolate_binary_masks(mask, mask, 0.5, cancel_flag=True)
 
 
 class MonotonicTests(unittest.TestCase):
