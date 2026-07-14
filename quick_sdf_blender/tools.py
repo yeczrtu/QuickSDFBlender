@@ -41,6 +41,7 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         return
 
     editing_aux_uuid = ""
+    session = None
     try:
         from .studio import active_session
 
@@ -107,7 +108,14 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         row.prop(project, "onion_enabled", text="Onion", toggle=True, icon="IMAGE_ALPHA")
 
     row.separator()
-    if bool(getattr(project, "job_running", False)) and _operator_exists("quicksdf.cancel_job"):
+    preparing_auto_key = bool(
+        session is not None
+        and str(getattr(session, "provisional_state", "NONE")) == "PREPARING"
+    )
+    if preparing_auto_key and _operator_exists("quicksdf.cancel_auto_key"):
+        row.label(text="Preparing angle", icon="TIME")
+        row.operator("quicksdf.cancel_auto_key", text="Cancel", icon="CANCEL")
+    elif bool(getattr(project, "job_running", False)) and _operator_exists("quicksdf.cancel_job"):
         row.operator("quicksdf.cancel_job", text="Cancel", icon="CANCEL")
     elif _operator_exists("quicksdf.export_texture"):
         row.operator("quicksdf.export_texture", text="Export Face Shadow Texture", icon="EXPORT")

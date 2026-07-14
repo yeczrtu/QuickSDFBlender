@@ -34,6 +34,8 @@ TRANSLATIONS = {
         ("*", "A light-sweep guide from rear oblique to full light is ready. Paint only the areas you want to adjust."): "斜め後ろから全体へ広がる影ガイドを作成しました。気になる部分だけ修正してください。",
         ("*", "A light-sweep guide from rear oblique to full light is ready. Paint only the areas you want to adjust. Paint between keys to add that angle."): "斜め後ろから全体へ広がる影ガイドを作成しました。気になる部分だけ修正してください。キーの間で塗ると、その角度が自動で追加されます。",
         ("*", "Preparing this angle"): "この角度を準備中",
+        ("*", "Preparing angle"): "角度を準備中",
+        ("*", "Cancel Angle Preparation"): "角度の準備をキャンセル",
         ("*", "Paint here to add this angle"): "ここで塗ると、この角度を追加します",
         ("*", "Maximum 16 keys · select or delete a key"): "最大16キーです。近いキーを選ぶか不要なキーを削除してください",
         ("*", "No paint landed · move back or press Numpad 5"): "ペイントが届きませんでした。少し引くかNumpad 5を押してください",

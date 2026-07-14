@@ -3361,6 +3361,40 @@ class QUICKSDF_OT_cancel_job(bpy.types.Operator):
         )
 
 
+class QUICKSDF_OT_cancel_auto_key(bpy.types.Operator):
+    bl_idname = "quicksdf.cancel_auto_key"
+    bl_label = "Cancel Angle Preparation"
+    bl_description = "Cancel the temporary in-between angle without creating a key"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            from .studio import active_session
+
+            session = active_session(context)
+            return bool(
+                session is not None
+                and str(getattr(session, "provisional_state", "NONE")) == "PREPARING"
+            )
+        except (ImportError, AttributeError, ReferenceError, RuntimeError):
+            return False
+
+    def execute(self, context):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        try:
+            from .studio import back_to_paint, discard_provisional
+
+            discard_provisional(context, project)
+            back_to_paint(context, project)
+        except (ImportError, AttributeError, ReferenceError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
 
@@ -3461,5 +3495,6 @@ CLASSES = (
     QUICKSDF_OT_export_texture,
     QUICKSDF_OT_review_export_adjustments,
     QUICKSDF_OT_cancel_job,
+    QUICKSDF_OT_cancel_auto_key,
     QUICKSDF_OT_export_mask_sequence,
 )
