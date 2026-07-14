@@ -600,7 +600,7 @@ def _threshold_for_lane(masks: np.ndarray, angles: np.ndarray) -> np.ndarray:
     return _threshold_for_side(masks, angles, indices, {})
 
 
-def generate_threshold_pair(
+def generate_threshold_pair_channels(
     right_masks: np.ndarray | Sequence[object],
     right_angles: Sequence[float] | np.ndarray,
     left_masks: np.ndarray | Sequence[object],
@@ -608,13 +608,15 @@ def generate_threshold_pair(
     *,
     validate: bool = True,
 ) -> np.ndarray:
-    """Generate the canonical lilToon RGBA16 texture from two 0..90 lanes.
+    """Generate canonical right/left threshold channels from two 0..90 lanes.
 
-    ``right_masks`` is written to R and ``left_masks`` to G.  Each lane owns its
-    own 0 degree mask, which is important after an artist chooses *Break
-    Mirror*. A pixel's Light-transition progress ``u`` is encoded as
-    ``round((1 - u) * 65535)`` over the complete uint16 range. B is zero and A
-    is fully opaque.
+    The returned contiguous ``(height, width, 2) uint16`` array stores the
+    right threshold in plane 0 and the left threshold in plane 1.  It has no
+    output-channel packing semantics: callers choose how these canonical
+    signals map to an exported texture.  Each lane owns its own 0 degree mask,
+    which is important after an artist chooses *Break Mirror*. A pixel's
+    Light-transition progress ``u`` is encoded as
+    ``round((1 - u) * 65535)`` over the complete uint16 range.
     """
 
     right, right_values = _validated_side_stack(
@@ -637,38 +639,10 @@ def generate_threshold_pair(
                 )
     red = _threshold_for_lane(right, right_values)
     green = _threshold_for_lane(left, left_values)
-    output = np.empty((*red.shape, 4), dtype=np.uint16)
+    output = np.empty((*red.shape, 2), dtype=np.uint16)
     output[..., 0] = red
     output[..., 1] = green
-    output[..., 2] = 0
-    output[..., 3] = 65535
     return output
-
-
-def generate_threshold_rgba16(
-    mask_stack: np.ndarray | Sequence[object],
-    angles: Sequence[float] | np.ndarray,
-    *,
-    validate: bool = True,
-) -> np.ndarray:
-    """Generate the final R/G lilToon SDF map as an RGBA uint16 array.
-
-    R stores the positive/right-light side and G the negative/left-light side.
-    B is zero and A is 65535.
-    """
-
-    masks = _as_binary(mask_stack, ndim=3)
-    values = _validated_angles(angles, masks.shape[0])
-    _require_full_threshold_angles(values)
-    positive_indices = _side_indices(values, 1)
-    negative_indices = _side_indices(values, -1)
-    return generate_threshold_pair(
-        masks[positive_indices],
-        np.abs(values[positive_indices]),
-        masks[negative_indices],
-        np.abs(values[negative_indices]),
-        validate=validate,
-    )
 
 
 __all__ = [
@@ -681,8 +655,7 @@ __all__ = [
     "exact_edt",
     "exact_signed_edt",
     "generate_threshold_channels",
-    "generate_threshold_pair",
-    "generate_threshold_rgba16",
+    "generate_threshold_pair_channels",
     "guard_clip_proposal",
     "range_target_indices",
     "repair_side_monotonic",

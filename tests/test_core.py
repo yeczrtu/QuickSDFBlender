@@ -16,19 +16,45 @@ from quick_sdf_blender.core import (
     RangeScope,
     exact_edt,
     exact_signed_edt,
-    generate_threshold_pair,
-    generate_threshold_rgba16,
+    generate_threshold_pair_channels,
     guard_clip_proposal,
     range_target_indices,
     repair_side_monotonic,
     validate_monotonic,
     validate_side_monotonic,
 )
+from quick_sdf_blender.packing import PackingChannelSpec, PackingSource, pack_rgba16
 from quick_sdf_blender.png16 import PNG_SIGNATURE, encode_png_rgba16, write_png_rgba16
 
 
 ANGLES = np.arange(-90.0, 91.0, 15.0)
 SIDE_ANGLES = np.arange(0.0, 91.0, 15.0)
+
+
+def threshold_pair_from_signed(stack: np.ndarray, angles: np.ndarray) -> np.ndarray:
+    right_indices = np.flatnonzero(angles >= 0.0)
+    left_indices = np.flatnonzero(angles <= 0.0)[::-1]
+    return generate_threshold_pair_channels(
+        stack[right_indices],
+        angles[right_indices],
+        stack[left_indices],
+        np.abs(angles[left_indices]),
+    )
+
+
+def pack_golden_liltoon_channels(channels: np.ndarray) -> np.ndarray:
+    return pack_rgba16(
+        {
+            PackingSource.RIGHT_THRESHOLD: channels[..., 0],
+            PackingSource.LEFT_THRESHOLD: channels[..., 1],
+        },
+        (
+            PackingChannelSpec(PackingSource.RIGHT_THRESHOLD),
+            PackingChannelSpec(PackingSource.LEFT_THRESHOLD),
+            PackingChannelSpec(PackingSource.CONSTANT, constant_value=0.0),
+            PackingChannelSpec(PackingSource.CONSTANT, constant_value=1.0),
+        ),
+    )
 
 
 def brute_distance(features: np.ndarray) -> np.ndarray:
@@ -119,9 +145,10 @@ class MonotonicRepairTests(unittest.TestCase):
         repaired_left = repair_side_monotonic(
             left, np.roll(left, 1, axis=0), ~coverage
         ).masks
-        rgba = generate_threshold_pair(
+        channels = generate_threshold_pair_channels(
             repaired_right, angles, repaired_left, angles
         )
+        rgba = pack_golden_liltoon_channels(channels)
         np.testing.assert_array_equal(repaired_right, right)
         np.testing.assert_array_equal(repaired_left, left)
         self.assertEqual(
@@ -286,11 +313,11 @@ class ThresholdTests(unittest.TestCase):
                 stack[index, 0, 2] = angle >= 30
             else:
                 stack[index, 0, 2] = abs(angle) >= 60
-        output = generate_threshold_rgba16(stack, ANGLES)
+        output = threshold_pair_from_signed(stack, ANGLES)
         self.assertEqual(output.dtype, np.uint16)
-        self.assertEqual(output.shape, (1, 3, 4))
-        np.testing.assert_array_equal(output[0, 0, :], [ALWAYS_LIGHT, ALWAYS_LIGHT, 0, 65535])
-        np.testing.assert_array_equal(output[0, 1, :], [ALWAYS_SHADOW, ALWAYS_SHADOW, 0, 65535])
+        self.assertEqual(output.shape, (1, 3, 2))
+        np.testing.assert_array_equal(output[0, 0, :], [ALWAYS_LIGHT, ALWAYS_LIGHT])
+        np.testing.assert_array_equal(output[0, 1, :], [ALWAYS_SHADOW, ALWAYS_SHADOW])
         self.assertTrue(1 <= int(output[0, 2, 0]) <= 65534)
         self.assertTrue(1 <= int(output[0, 2, 1]) <= 65534)
         # Earlier Light transitions have larger lilToon SDF values.
@@ -301,7 +328,7 @@ class ThresholdTests(unittest.TestCase):
         stack = np.zeros((3, 1, 2), dtype=bool)
         stack[0] = True
         stack[2] = True
-        output = generate_threshold_rgba16(stack, angles)
+        output = threshold_pair_from_signed(stack, angles)
         # Adjacent black/white pixel centres have equal |SDF|, so transition is 45 degrees.
         expected = int(np.floor((1.0 - 0.5) * 65535 + 0.5))
         np.testing.assert_array_equal(output[0, :, 0], [expected, expected])
@@ -311,11 +338,14 @@ class ThresholdTests(unittest.TestCase):
         stack = np.ones((len(ANGLES), 1, 1), dtype=bool)
         stack[np.where(ANGLES == 15)[0][0], 0, 0] = False
         with self.assertRaisesRegex(ValueError, "not monotonic"):
-            generate_threshold_rgba16(stack, ANGLES)
+            threshold_pair_from_signed(stack, ANGLES)
 
     def test_generation_requires_both_side_endpoints(self) -> None:
-        with self.assertRaisesRegex(ValueError, "requires"):
-            generate_threshold_rgba16(np.ones((3, 1, 1), bool), [-45, 0, 90])
+        masks = np.ones((3, 1, 1), dtype=np.bool_)
+        with self.assertRaisesRegex(ValueError, "0 degree mask"):
+            generate_threshold_pair_channels(
+                masks, [15, 45, 90], masks, [0, 45, 90]
+            )
 
 
 class PngTests(unittest.TestCase):
