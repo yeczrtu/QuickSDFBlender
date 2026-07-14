@@ -76,7 +76,7 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
     corner_normals = np.array(
         [[[0.0, -1.0, 0.0]] * 3], dtype=np.float32
     )
-    guide, occupancy = native.bake_face_shadow_guide(
+    guide_arguments = (
         triangle_uvs,
         corner_normals,
         angles,
@@ -86,9 +86,15 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
         50.0,
         8,
     )
+    guide, occupancy = native.bake_face_shadow_guide(*guide_arguments)
+    bake = importlib.import_module(f"{module_name}.bake")
+    expected_guide, expected_occupancy = bake.bake_face_shadow_guide(
+        *guide_arguments
+    )
     assert guide.shape == (8, 8, 8)
     assert occupancy.any()
-    np.testing.assert_array_equal(guide[-1], occupancy)
+    np.testing.assert_array_equal(occupancy, expected_occupancy)
+    np.testing.assert_array_equal(guide, expected_guide)
 
     assert hasattr(bpy.types.Scene, "quick_sdf_projects")
     addon.unregister()

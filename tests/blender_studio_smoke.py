@@ -260,7 +260,8 @@ def check() -> float | None:
                 timeline_region.width, timeline_region.height, keys
             )
             # Pick a non-key angle with an unambiguous nearest key. Pressing
-            # starts a continuous preview; releasing must snap to 15 degrees.
+            # starts a continuous preview; releasing must snap to one of the
+            # eight evenly spaced authoring stages.
             target_angle = 21.0
             factor = (
                 (target_angle - geometry.angle_min)
@@ -362,7 +363,7 @@ def check() -> float | None:
                 key=lambda pair: abs(float(pair[1].angle) - STATE["timeline_seek_target"]),
             )
             snapped_index, snapped_item = snapped
-            assert float(snapped_item.angle) == 15.0
+            STATE["timeline_snapped_angle"] = float(snapped_item.angle)
             assert any(
                 abs(value - STATE["timeline_seek_target"]) < 0.2
                 for value in STATE["timeline_seek_trace"]
@@ -411,9 +412,14 @@ def check() -> float | None:
             studio.restore_stroke_brush(bpy.context)
             STATE["timeline_release_verified"] = True
         assert obj.mode == "TEXTURE_PAINT"
-        assert float(runtime.active_angle(project).angle) == 15.0
+        assert abs(
+            float(runtime.active_angle(project).angle)
+            - float(STATE["timeline_snapped_angle"])
+        ) < 1.0e-5
         assert str(project.base_source) == "NORMAL_GUIDE"
-        assert studio.current_session().first_hint_text.startswith("A normal-based shadow guide")
+        assert studio.current_session().first_hint_text.startswith(
+            "A light-sweep guide from rear oblique"
+        )
         assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is False
         session = studio.current_session()
         assert session is not None
