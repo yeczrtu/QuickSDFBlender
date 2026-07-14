@@ -211,7 +211,7 @@ def _playhead_layout(
     span = max(1.0e-6, geometry.angle_max - geometry.angle_min)
     factor = max(0.0, min(1.0, (angle - geometry.angle_min) / span))
     x = geometry.rail.x0 + factor * (geometry.rail.x1 - geometry.rail.x0)
-    label = f"{angle:.1f}".rstrip("0").rstrip(".") + "°"
+    label = f"{angle:.1f}°"
     label_width = max(30.0, 8.0 + 7.0 * len(label))
     label_x0 = max(2.0, min(width - label_width - 2.0, x - label_width * 0.5))
     label_y0 = geometry.rail.y1 + 2.0
@@ -287,7 +287,7 @@ def _draw_timeline() -> None:
             if image is None or not _draw_thumbnail(image, rect, uv_bbox):
                 _rect(Rect(rect.x0 + 2, rect.y0 + 2, rect.x1 - 2, rect.y1 - 16), (0.18, 0.19, 0.21, 1.0))
             angle = float(getattr(item, "angle", 0.0))
-            _text(f"{angle:g}°", rect.x0 + 4.0, rect.y0 + 3.0, size=10)
+            _text(f"{angle:.1f}°", rect.x0 + 4.0, rect.y0 + 3.0, size=10)
             if collection_index == highlighted:
                 _outline(rect, (0.18, 0.62, 1.0, 1.0), 2.0)
             if bool(getattr(item, "has_violation", False)):
@@ -300,12 +300,27 @@ def _draw_timeline() -> None:
             Rect(seek_x - 1.0, 4.0, seek_x + 1.0, geometry.rail.y1 + 5.0),
             (0.25, 0.72, 1.0, 1.0),
         )
+        from .i18n import tr
+
+        semantic_y = max(2.0, geometry.rail.y0 - 12.0)
+        rail_mid = (geometry.rail.x0 + geometry.rail.x1) * 0.5
+        semantic_color = (0.58, 0.62, 0.68, 1.0)
+        _text(
+            tr("Light Starts"), geometry.rail.x0, semantic_y,
+            color=semantic_color, size=9,
+        )
+        _text(
+            tr("Side"), rail_mid - 12.0, semantic_y,
+            color=semantic_color, size=9,
+        )
+        _text(
+            tr("Full Light"), max(2.0, geometry.rail.x1 - 48.0), semantic_y,
+            color=semantic_color, size=9,
+        )
         if not show_hint:
             _rect(label_rect, (0.16, 0.48, 0.78, 1.0))
             _text(label_text, label_rect.x0 + 4.0, label_rect.y0 + 2.0, size=10)
         if show_hint and session is not None:
-            from .i18n import tr
-
             message = session.first_hint_text or "Choose an angle · choose Light or Shadow · paint"
             _text(tr(message), geometry.rail.x0, geometry.rail.y1 + 5.0, size=11)
     except (AttributeError, ReferenceError, RuntimeError, SystemError, ValueError):

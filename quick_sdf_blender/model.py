@@ -22,11 +22,12 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-SCHEMA_VERSION = 3
-DEFAULT_KEY_ANGLES = tuple(float(value) for value in range(0, 91, 15))
-LEGACY_SIGNED_ANGLES = tuple(float(value) for value in range(-90, 91, 15))
-# Public compatibility name.  From schema v2 onward a linked/mirrored project
-# authors one 0..90 degree side; the opposite side is generated live.
+SCHEMA_VERSION = 4
+# Eight evenly spaced authoring stages.  The values are intentionally not
+# rounded: interpolation and export use the exact normalized position i / 7.
+DEFAULT_KEY_ANGLES = tuple(index * 90.0 / 7.0 for index in range(8))
+# Public name used by project creation. A linked/mirrored project authors one
+# 0..90 degree side; the opposite side is generated live.
 DEFAULT_ANGLES = DEFAULT_KEY_ANGLES
 
 
@@ -40,7 +41,6 @@ BASE_SOURCE_ITEMS = (
     ("NORMAL_GUIDE", "Normal Guide", "Base masks generated from evaluated mesh normals"),
     ("IMPORTED", "Imported Mask", "Base masks copied from artist-supplied images"),
     ("WHITE", "All Light", "Base masks initialized as all Light"),
-    ("LEGACY", "Legacy", "Base masks preserved from an earlier Quick SDF version"),
 )
 
 
@@ -297,7 +297,7 @@ class QSDFProject(PropertyGroup):
     base_source: EnumProperty(
         name="Base Source", items=BASE_SOURCE_ITEMS, default="NORMAL_GUIDE"
     )
-    guide_version: IntProperty(name="Guide Version", default=1, min=0, options={"HIDDEN"})
+    guide_version: IntProperty(name="Guide Version", default=2, min=0, options={"HIDDEN"})
     guide_shadow_amount: FloatProperty(
         name="Shadow Amount", default=50.0, min=0.0, max=100.0, subtype="PERCENTAGE"
     )

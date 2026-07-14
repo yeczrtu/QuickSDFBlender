@@ -141,7 +141,14 @@ def guide_light_directions(
     up: Sequence[float] | np.ndarray,
     side: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return guide directions where 0° is side light and 90° is front light."""
+    """Return lilToon guide directions for the 0..90 authoring sweep.
+
+    Authoring angles describe progress rather than a literal light yaw.  At
+    0 degrees the light is 120 degrees from face-forward (rear-oblique), the
+    middle of the rail is a 90 degree side light, and 90 degrees is a
+    60 degree front-oblique light.  This matches lilToon's ``frontDot`` domain
+    while keeping the artist-facing masks ordered from least to most Light.
+    """
 
     angle_values = _validated_guide_angles(angles)
     side_name = str(side).upper()
@@ -159,10 +166,12 @@ def guide_light_directions(
     if side_name == "LEFT":
         side_vector = -side_vector
 
-    radians = np.deg2rad(angle_values)
+    progress = angle_values / 90.0
+    front_dot = progress - 0.5
+    side_dot = np.sqrt(np.maximum(0.0, 1.0 - front_dot * front_dot))
     directions = (
-        side_vector[None, :] * np.cos(radians)[:, None]
-        + front[None, :] * np.sin(radians)[:, None]
+        side_vector[None, :] * side_dot[:, None]
+        + front[None, :] * front_dot[:, None]
     )
     directions /= np.linalg.norm(directions, axis=1)[:, None]
     return angle_values, np.ascontiguousarray(directions, dtype=np.float32)
@@ -333,7 +342,7 @@ def bake_face_shadow_guide(
     *,
     enforce_monotonic: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Bake the artist-facing normal guide while keeping the legacy sweep intact."""
+    """Bake an expanding rear-oblique-to-full-Light authoring guide."""
 
     angle_values, directions = guide_light_directions(angles, forward, up, side)
     cutoff = shadow_amount_cutoff(shadow_amount)
@@ -342,6 +351,10 @@ def bake_face_shadow_guide(
     )
     dots = np.einsum("hwc,ac->ahw", normals, directions, optimize=True)
     masks = (~occupancy)[None, :] | (dots >= cutoff)
+    # The final authoring stage represents the completed Light state, not one
+    # more physical N·L sample.  Paint overrides are separate layers and are
+    # reapplied by the Blender runtime after this base guide is returned.
+    masks[-1, occupancy] = True
     if enforce_monotonic:
         masks = np.ascontiguousarray(masks, dtype=np.bool_)
         for closer in range(1, masks.shape[0]):

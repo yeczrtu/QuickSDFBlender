@@ -81,24 +81,40 @@ class NormalSweepTests(unittest.TestCase):
 
 
 class FaceShadowGuideTests(unittest.TestCase):
-    def test_side_and_front_endpoints_are_explicit(self) -> None:
+    def test_rear_oblique_side_and_front_oblique_directions_are_explicit(self) -> None:
         angles, right = guide_light_directions(
             [0.0, 45.0, 90.0], (0.0, -1.0, 0.0), (0.0, 0.0, 1.0), "RIGHT"
         )
         _angles, left = guide_light_directions(
             angles, (0.0, -1.0, 0.0), (0.0, 0.0, 1.0), "LEFT"
         )
-        np.testing.assert_allclose(right[0], [1.0, 0.0, 0.0], atol=1e-6)
-        np.testing.assert_allclose(left[0], [-1.0, 0.0, 0.0], atol=1e-6)
-        np.testing.assert_allclose(right[-1], [0.0, -1.0, 0.0], atol=1e-6)
-        np.testing.assert_allclose(left[-1], right[-1], atol=1e-6)
+        root_three_over_two = np.sqrt(3.0) * 0.5
+        np.testing.assert_allclose(right[0], [root_three_over_two, 0.5, 0.0], atol=1e-6)
+        np.testing.assert_allclose(left[0], [-root_three_over_two, 0.5, 0.0], atol=1e-6)
+        np.testing.assert_allclose(right[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(left[1], [-1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(right[-1], [root_three_over_two, -0.5, 0.0], atol=1e-6)
+        np.testing.assert_allclose(left[-1], [-root_three_over_two, -0.5, 0.0], atol=1e-6)
 
     def test_continuous_forward_is_not_axis_quantized(self) -> None:
         _angles, directions = guide_light_directions(
             [0.0, 90.0], (1.0, -1.0, 0.3), (0.0, 0.0, 1.0), "RIGHT"
         )
-        expected_front = np.asarray([1.0, -1.0, 0.0]) / np.sqrt(2.0)
-        np.testing.assert_allclose(directions[-1], expected_front, atol=1e-6)
+        front = np.asarray([1.0, -1.0, 0.0]) / np.sqrt(2.0)
+        side = np.cross(np.asarray([0.0, 0.0, 1.0]), front)
+        expected = side * (np.sqrt(3.0) * 0.5) + front * 0.5
+        np.testing.assert_allclose(directions[-1], expected, atol=1e-6)
+
+    def test_eight_even_authoring_keys_map_to_liltoon_front_dot(self) -> None:
+        angles = np.asarray([index * 90.0 / 7.0 for index in range(8)])
+        returned, directions = guide_light_directions(
+            angles, (0.0, -1.0, 0.0), (0.0, 0.0, 1.0), "RIGHT"
+        )
+        np.testing.assert_array_equal(returned, angles)
+        expected_front_dot = np.arange(8, dtype=np.float64) / 7.0 - 0.5
+        front = np.asarray([0.0, -1.0, 0.0])
+        np.testing.assert_allclose(directions @ front, expected_front_dot, atol=1e-6)
+        np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0, atol=1e-6)
 
     def test_shadow_amount_maps_to_documented_cutoff(self) -> None:
         self.assertAlmostEqual(shadow_amount_cutoff(0.0), -0.15)
@@ -129,7 +145,26 @@ class FaceShadowGuideTests(unittest.TestCase):
         self.assertTrue(np.all(~masks[:-1] | masks[1:]))
         self.assertTrue(np.any(masks[3, occupancy]))
         self.assertTrue(np.any(~masks[3, occupancy]))
+        self.assertTrue(np.all(masks[-1, occupancy]))
         self.assertTrue(np.all(masks[:, ~occupancy]))
+
+    def test_final_guide_stage_is_full_light_even_without_monotonic_enforcement(self) -> None:
+        normals = np.zeros((2, 3, 3), dtype=np.float32)
+        normals[..., 2] = 1.0
+        masks, occupancy = bake_face_shadow_guide(
+            SQUARE_UVS,
+            normals,
+            [0.0, 45.0, 90.0],
+            (0.0, -1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            "RIGHT",
+            50.0,
+            9,
+            7,
+            enforce_monotonic=False,
+        )
+        self.assertTrue(np.any(~masks[0, occupancy]))
+        self.assertTrue(np.all(masks[-1, occupancy]))
 
 
 if __name__ == "__main__":

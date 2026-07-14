@@ -13,7 +13,8 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 
-from .model import DEFAULT_ANGLES, LEGACY_SIGNED_ANGLES, SCHEMA_VERSION
+from .model import DEFAULT_ANGLES, SCHEMA_VERSION
+from .migration import is_project_supported, unsupported_project_message
 
 
 PROJECT_UUID_KEY = "quick_sdf_project_uuid"
@@ -81,6 +82,8 @@ def compute_base_signature(project: Any, scene: bpy.types.Scene | None = None) -
 
 
 def refresh_base_staleness(project: Any, scene: bpy.types.Scene | None = None) -> bool:
+    if not is_project_supported(project):
+        return False
     previous = str(getattr(project, "base_signature", ""))
     current = compute_base_signature(project, scene)
     stale = bool(previous and current and previous != current)
@@ -134,6 +137,10 @@ def resolve_angle_data_image(
     if role not in _LAYER_FIELDS:
         raise ValueError(f"Unknown angle image role: {role!r}")
     pointer_name, string_name = _LAYER_FIELDS[role]
+    if not is_project_supported(project):
+        # Reading a direct pointer is safe, but repairing an old pointer or
+        # image-name field would mutate an unsupported project on load.
+        return getattr(angle_item, pointer_name, None)
     candidates: list[bpy.types.Image] = []
     pointer = getattr(angle_item, pointer_name, None)
     if pointer is not None:
@@ -265,6 +272,9 @@ def create_mask_image(project_uuid: str, angle_uuid: str, angle: float, resoluti
 
 
 def create_project_images(project: Any, source: bpy.types.Image | None = None) -> None:
+    # Mark this as current before allocating layers so a failed creation can
+    # safely clean up only its own new images.
+    project.schema_version = SCHEMA_VERSION
     for value in DEFAULT_ANGLES:
         angle_item = project.angles.add()
         angle_item.uuid = new_uuid()
@@ -521,7 +531,7 @@ def ensure_palette(scene: bpy.types.Scene) -> bpy.types.Palette:
 
 def sync_canvas(context: bpy.types.Context, project: Any | None = None) -> bpy.types.Image | None:
     project = project or active_project(context.scene)
-    if project is None:
+    if project is None or not is_project_supported(project):
         return None
     angle_item = active_angle(project)
     if angle_item is None:
@@ -1115,6 +1125,8 @@ def clear_image_alpha(image: bpy.types.Image) -> None:
 
 
 def remove_project_images(project: Any) -> None:
+    if not is_project_supported(project):
+        return
     for image in tuple(bpy.data.images):
         if image.get(PROJECT_UUID_KEY) == project.uuid:
             bpy.data.images.remove(image)
@@ -1128,6 +1140,8 @@ _TOPOLOGY_MODIFIERS = {
 
 
 def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[list[str], list[str], Any | None]:
+    if not is_project_supported(project):
+        return [unsupported_project_message(project)], [], None
     errors: list[str] = []
     warnings: list[str] = []
     report = None
@@ -1223,6 +1237,8 @@ def validate_project(project: Any, *, include_monotonic: bool = True) -> tuple[l
 
 def repair_project_references(scene: bpy.types.Scene) -> None:
     for project in getattr(scene, "quick_sdf_projects", ()):
+        if not is_project_supported(project):
+            continue
         for angle_item in project.angles:
             resolve_display_image(project, angle_item, allow_legacy=True)
             resolve_base_image(project, angle_item)
