@@ -62,20 +62,29 @@ def _visible_keys(project: Any) -> list[tuple[int, Any]]:
 
 def build_geometry(width: float, height: float, keys: Sequence[tuple[int, Any]]) -> TimelineGeometry:
     margin = 16.0
-    rail_y = max(20.0, height - 18.0)
-    rail = Rect(margin, rail_y - 5.0, max(margin + 1.0, width - margin), rail_y + 5.0)
+    rail_y = max(20.0, height - 24.0)
+    content_x0 = margin
+    content_x1 = max(margin + 1.0, width - margin)
+    content_width = max(1.0, content_x1 - content_x0)
     angles = [float(getattr(item, "angle", 0.0)) for _index, item in keys] or [0.0, 90.0]
     angle_min, angle_max = min(angles), max(angles)
     if abs(angle_max - angle_min) < 1.0e-6:
         angle_max = angle_min + 90.0
+    thumb_width = max(28.0, min(68.0, content_width / max(1, len(keys)) - 4.0))
+    thumb_width = min(content_width, thumb_width)
+    endpoint_inset = thumb_width * 0.5 if keys else 0.0
+    rail_x0 = content_x0 + endpoint_inset
+    rail_x1 = content_x1 - endpoint_inset
+    if rail_x1 <= rail_x0:
+        rail_x0 = (content_x0 + content_x1) * 0.5
+        rail_x1 = rail_x0 + 1.0
+    rail = Rect(rail_x0, rail_y - 5.0, rail_x1, rail_y + 5.0)
     available = max(1.0, rail.x1 - rail.x0)
-    thumb_width = max(28.0, min(68.0, available / max(1, len(keys)) - 4.0))
     thumb_height = max(24.0, min(64.0, rail.y0 - 18.0))
     rects: list[tuple[int, Rect]] = []
     for collection_index, item in keys:
         factor = (float(item.angle) - angle_min) / (angle_max - angle_min)
         center = rail.x0 + factor * available
-        center = max(rail.x0 + thumb_width * 0.5, min(rail.x1 - thumb_width * 0.5, center))
         rects.append((collection_index, Rect(center - thumb_width * 0.5, 8.0, center + thumb_width * 0.5, 8.0 + thumb_height)))
     return TimelineGeometry(rail, tuple(rects), angle_min, angle_max)
 
@@ -193,6 +202,46 @@ def _seek_value(project: Any) -> float:
     return float(getattr(project, "seek_angle", getattr(project, "review_angle", 0.0)))
 
 
+def _playhead_layout(
+    geometry: TimelineGeometry,
+    width: float,
+    height: float,
+    angle: float,
+) -> tuple[float, Rect, str]:
+    span = max(1.0e-6, geometry.angle_max - geometry.angle_min)
+    factor = max(0.0, min(1.0, (angle - geometry.angle_min) / span))
+    x = geometry.rail.x0 + factor * (geometry.rail.x1 - geometry.rail.x0)
+    label = f"{angle:.1f}".rstrip("0").rstrip(".") + "°"
+    label_width = max(30.0, 8.0 + 7.0 * len(label))
+    label_x0 = max(2.0, min(width - label_width - 2.0, x - label_width * 0.5))
+    label_y0 = geometry.rail.y1 + 2.0
+    label_rect = Rect(
+        label_x0,
+        label_y0,
+        label_x0 + label_width,
+        max(label_y0 + 1.0, min(height - 1.0, label_y0 + 16.0)),
+    )
+    return x, label_rect, label
+
+
+def _nearest_key_index(
+    keys: Sequence[tuple[int, Any]],
+    angle: float,
+) -> int | None:
+    """Return the visible key nearest to ``angle``, preferring lower on ties."""
+
+    if not keys:
+        return None
+    index, _item = min(
+        keys,
+        key=lambda pair: (
+            abs(float(getattr(pair[1], "angle", 0.0)) - angle),
+            float(getattr(pair[1], "angle", 0.0)),
+        ),
+    )
+    return index
+
+
 def _draw_timeline() -> None:
     context = bpy.context
     if getattr(context, "area", None) is None or context.area.type != TIMELINE_SPACE_TYPE:
@@ -208,9 +257,12 @@ def _draw_timeline() -> None:
     affected = _affected_indices(project, keys)
     session = active_session(context)
     previewing = bool(session is not None and session.view_mode == "PREVIEW")
-    paint_angle = float(session.paint_key_angle) if session is not None else float(
-        getattr(project.angles[active], "angle", 0.0) if 0 <= active < len(project.angles) else 0.0
+    show_hint = bool(session is not None and session.show_first_stroke_hint)
+    highlighted = (
+        _nearest_key_index(keys, _seek_value(project)) if previewing else active
     )
+    if previewing and highlighted is not None:
+        affected = {highlighted}
     bbox_values = tuple(float(value) for value in getattr(project, "thumbnail_uv_bbox", (0.0, 0.0, 1.0, 1.0)))
     uv_bbox = bbox_values if (
         len(bbox_values) == 4
@@ -221,14 +273,12 @@ def _draw_timeline() -> None:
         gpu.state.blend_set("ALPHA")
         _rect(Rect(0.0, 0.0, context.region.width, context.region.height), (0.025, 0.03, 0.04, 1.0))
         _rect(geometry.rail, (0.18, 0.20, 0.24, 1.0))
-        span = max(1.0e-6, geometry.angle_max - geometry.angle_min)
-        paint_factor = max(0.0, min(1.0, (paint_angle - geometry.angle_min) / span))
-        paint_x = geometry.rail.x0 + paint_factor * (geometry.rail.x1 - geometry.rail.x0)
-        _rect(Rect(paint_x - 2.0, geometry.rail.y0 - 4.0, paint_x + 2.0, geometry.rail.y1 + 4.0), (0.25, 0.72, 1.0, 1.0))
-        if previewing:
-            seek_factor = max(0.0, min(1.0, (_seek_value(project) - geometry.angle_min) / span))
-            seek_x = geometry.rail.x0 + seek_factor * (geometry.rail.x1 - geometry.rail.x0)
-            _rect(Rect(seek_x - 2.0, geometry.rail.y0 - 5.0, seek_x + 2.0, geometry.rail.y1 + 5.0), (1.0, 0.45, 0.08, 1.0))
+        seek_x, label_rect, label_text = _playhead_layout(
+            geometry,
+            context.region.width,
+            context.region.height,
+            _seek_value(project),
+        )
         key_map = {index: item for index, item in keys}
         for collection_index, rect in geometry.key_rects:
             item = key_map[collection_index]
@@ -238,7 +288,7 @@ def _draw_timeline() -> None:
                 _rect(Rect(rect.x0 + 2, rect.y0 + 2, rect.x1 - 2, rect.y1 - 16), (0.18, 0.19, 0.21, 1.0))
             angle = float(getattr(item, "angle", 0.0))
             _text(f"{angle:g}°", rect.x0 + 4.0, rect.y0 + 3.0, size=10)
-            if collection_index == active:
+            if collection_index == highlighted:
                 _outline(rect, (0.18, 0.62, 1.0, 1.0), 2.0)
             if bool(getattr(item, "has_violation", False)):
                 _rect(Rect(rect.x1 - 9, rect.y1 - 9, rect.x1 - 2, rect.y1 - 2), (1.0, 0.08, 0.03, 1.0))
@@ -246,15 +296,14 @@ def _draw_timeline() -> None:
                 _rect(Rect(rect.x1 - 7, rect.y1 - 7, rect.x1 - 3, rect.y1 - 3), (0.95, 0.95, 1.0, 1.0))
             else:
                 _rect(Rect(rect.x1 - 6, rect.y1 - 6, rect.x1 - 4, rect.y1 - 4), (0.70, 0.74, 0.80, 1.0))
-        if previewing and session is not None:
-            _text(
-                f"Preview {_seek_value(project):g}°  ·  Back to Paint {session.paint_key_angle:g}°",
-                geometry.rail.x0,
-                geometry.rail.y1 + 5.0,
-                color=(1.0, 0.68, 0.28, 1.0),
-                size=11,
-            )
-        elif session is not None and session.show_first_stroke_hint:
+        _rect(
+            Rect(seek_x - 1.0, 4.0, seek_x + 1.0, geometry.rail.y1 + 5.0),
+            (0.25, 0.72, 1.0, 1.0),
+        )
+        if not show_hint:
+            _rect(label_rect, (0.16, 0.48, 0.78, 1.0))
+            _text(label_text, label_rect.x0 + 4.0, label_rect.y0 + 2.0, size=10)
+        if show_hint and session is not None:
             from .i18n import tr
 
             message = session.first_hint_text or "Choose an angle · choose Light or Shadow · paint"
@@ -305,6 +354,13 @@ def _select_key(context: Any, project: Any, index: int) -> None:
 
 
 def _set_seek(context: Any, project: Any, value: float) -> None:
+    try:
+        from .studio import seek_preview
+
+        seek_preview(context, project, value, show_in_image_editor=True)
+        return
+    except (ImportError, AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
     if _operator_exists("quicksdf.seek_set"):
         operator = bpy.ops.quicksdf.seek_set
         props = operator.get_rna_type().properties.keys()
@@ -323,12 +379,13 @@ def _set_seek(context: Any, project: Any, value: float) -> None:
 
 class QSDF_GT_timeline_capture(bpy.types.Gizmo):
     bl_idname = "QSDF_GT_timeline_capture"
-    __slots__ = ("_shape", "_initial_seek", "_initial_mode")
+    __slots__ = ("_shape", "_initial_seek", "_initial_key_uuid", "_dragging")
 
     def setup(self):
         self._shape = self.new_custom_shape("TRIS", ((0, 0), (1, 0), (1, 1), (0, 0), (1, 1), (0, 1)))
         self._initial_seek = 0.0
-        self._initial_mode = "EDIT"
+        self._initial_key_uuid = ""
+        self._dragging = False
 
     def draw(self, _context):
         # The visible timeline is rendered by the shared draw handler.
@@ -349,33 +406,82 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
             if rect.contains(x, y):
                 _select_key(context, project, index)
                 return {"FINISHED"}
-        if geometry.rail.contains(x, y):
+        _playhead_x, label_rect, _label = _playhead_layout(
+            geometry,
+            context.region.width,
+            context.region.height,
+            _seek_value(project),
+        )
+        scrub_lane = Rect(
+            geometry.rail.x0,
+            0.0,
+            geometry.rail.x1,
+            float(context.region.height),
+        )
+        if scrub_lane.contains(x, y) or label_rect.contains(x, y):
             self._initial_seek = _seek_value(project)
-            session = active_session(context)
-            self._initial_mode = str(getattr(session, "view_mode", "EDIT"))
-            _set_seek(context, project, geometry.angle_from_x(x))
+            active = int(getattr(project, "active_angle_index", -1))
+            self._initial_key_uuid = str(
+                getattr(project.angles[active], "uuid", "")
+                if 0 <= active < len(project.angles)
+                else ""
+            )
+            self._dragging = True
+            value = geometry.angle_from_x(x)
+            _set_seek(context, project, value)
             return {"RUNNING_MODAL"}
         return {"FINISHED"}
+
+    def _restore_initial_key(self, context: Any, project: Any) -> None:
+        if self._initial_key_uuid:
+            for index, item in enumerate(project.angles):
+                if str(getattr(item, "uuid", "")) == self._initial_key_uuid:
+                    _select_key(context, project, index)
+                    return
+        index = _nearest_key_index(_visible_keys(project), self._initial_seek)
+        if index is not None:
+            _select_key(context, project, index)
+        else:
+            _set_seek(context, project, self._initial_seek)
 
     def modal(self, context, event, _tweak):
         project = _project_for_context(context)
         if project is None:
             return {"CANCELLED"}
-        if event.type == "ESC":
-            if self._initial_mode == "EDIT" and _operator_exists("quicksdf.back_to_paint"):
-                try:
-                    bpy.ops.quicksdf.back_to_paint("EXEC_DEFAULT")
-                except RuntimeError:
-                    _set_seek(context, project, self._initial_seek)
-            else:
-                _set_seek(context, project, self._initial_seek)
+        if event.type in {"ESC", "WINDOW_DEACTIVATE"} or (
+            event.type == "RIGHTMOUSE" and event.value == "PRESS"
+        ):
+            self._restore_initial_key(context, project)
+            self._dragging = False
             return {"CANCELLED"}
         if event.type == "MOUSEMOVE":
             geometry = build_geometry(context.region.width, context.region.height, _visible_keys(project))
             _set_seek(context, project, geometry.angle_from_x(float(event.mouse_region_x)))
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            keys = _visible_keys(project)
+            geometry = build_geometry(context.region.width, context.region.height, keys)
+            angle = geometry.angle_from_x(float(event.mouse_region_x))
+            index = _nearest_key_index(keys, angle)
+            if index is not None:
+                _select_key(context, project, index)
+            self._dragging = False
             return {"FINISHED"}
         return {"RUNNING_MODAL"}
+
+    def exit(self, context, cancel):
+        if not self._dragging:
+            return
+        project = _project_for_context(context)
+        if project is None:
+            self._dragging = False
+            return
+        if cancel:
+            self._restore_initial_key(context, project)
+        else:
+            index = _nearest_key_index(_visible_keys(project), _seek_value(project))
+            if index is not None:
+                _select_key(context, project, index)
+        self._dragging = False
 
 
 class QSDF_GGT_timeline(bpy.types.GizmoGroup):

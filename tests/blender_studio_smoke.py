@@ -54,6 +54,48 @@ def _mesh() -> bpy.types.Object:
 STATE = {}
 
 
+def _timeline_draw_probe(timeline, timeline_area, timeline_region, project):
+    """Capture the semantic timeline primitives without depending on pixels."""
+
+    rectangles = []
+    labels = []
+    originals = {
+        "_rect": timeline._rect,
+        "_outline": timeline._outline,
+        "_draw_thumbnail": timeline._draw_thumbnail,
+        "_text": timeline._text,
+    }
+    timeline._rect = lambda rect, color: rectangles.append((rect, color))
+    timeline._outline = lambda *_args, **_kwargs: None
+    timeline._draw_thumbnail = lambda *_args, **_kwargs: True
+    timeline._text = lambda text, *_args, **_kwargs: labels.append(str(text))
+    try:
+        with bpy.context.temp_override(
+            window=bpy.context.window,
+            screen=bpy.context.window.screen,
+            area=timeline_area,
+            region=timeline_region,
+        ):
+            timeline._draw_timeline()
+    finally:
+        for name, value in originals.items():
+            setattr(timeline, name, value)
+
+    geometry = timeline.build_geometry(
+        timeline_region.width,
+        timeline_region.height,
+        timeline._visible_keys(project),
+    )
+    playheads = [
+        rect
+        for rect, _color in rectangles
+        if rect.x1 - rect.x0 <= 6.0
+        and rect.y0 <= geometry.rail.y0
+        and rect.y1 >= geometry.rail.y1
+    ]
+    return playheads, labels
+
+
 def finish(error: BaseException | None = None) -> None:
     result_path = ROOT / "build" / "studio_smoke_result.txt"
     if error is not None:
@@ -217,7 +259,9 @@ def check() -> float | None:
             geometry = timeline.build_geometry(
                 timeline_region.width, timeline_region.height, keys
             )
-            target_angle = 22.5
+            # Pick a non-key angle with an unambiguous nearest key. Pressing
+            # starts a continuous preview; releasing must snap to 15 degrees.
+            target_angle = 21.0
             factor = (
                 (target_angle - geometry.angle_min)
                 / (geometry.angle_max - geometry.angle_min)
@@ -228,38 +272,146 @@ def check() -> float | None:
             local_y = (geometry.rail.y0 + geometry.rail.y1) * 0.5
             event_x = int(timeline_region.x + local_x)
             event_y = int(timeline_region.y + local_y)
+            start_factor = (
+                (float(runtime.active_angle(project).angle) - geometry.angle_min)
+                / (geometry.angle_max - geometry.angle_min)
+            )
+            start_local_x = geometry.rail.x0 + start_factor * (
+                geometry.rail.x1 - geometry.rail.x0
+            )
+            start_event_x = int(timeline_region.x + start_local_x)
             STATE.update(
                 timeline_seek_started=True,
                 timeline_seek_target=target_angle,
                 timeline_paint_uuid=str(runtime.active_angle(project).uuid),
                 timeline_canvas=bpy.context.scene.tool_settings.image_paint.canvas,
+                timeline_key_uuids=tuple(str(item.uuid) for item in project.angles),
+                timeline_event_xy=(event_x, event_y),
+            )
+
+            # The interpolated position has one Blender-like playhead. The
+            # selected key and Canvas remain untouched until mouse release.
+            assert bpy.ops.quicksdf.seek_set(angle=target_angle) == {"FINISHED"}
+            assert studio.current_session().view_mode == "PREVIEW"
+            assert str(runtime.active_angle(project).uuid) == STATE["timeline_paint_uuid"]
+            assert bpy.context.scene.tool_settings.image_paint.canvas == STATE["timeline_canvas"]
+            playheads, labels = _timeline_draw_probe(
+                timeline, timeline_area, timeline_region, project
+            )
+            assert len(playheads) == 1, playheads
+            assert not any("Back to Paint" in label for label in labels), labels
+            assert bpy.context.scene.frame_current == 96
+            assert tuple(str(item.uuid) for item in project.angles) == STATE["timeline_key_uuids"]
+            assert bpy.ops.quicksdf.back_to_paint() == {"FINISHED"}
+
+            seek_trace = []
+            seek_editor_roles = []
+            select_trace = []
+            original_set_seek = timeline._set_seek
+            original_select_key = timeline._select_key
+
+            def tracked_set_seek(context, selected_project, value):
+                seek_trace.append(float(value))
+                result = original_set_seek(context, selected_project, value)
+                image_area = next(
+                    area for area in context.window.screen.areas
+                    if area.type == "IMAGE_EDITOR"
+                )
+                preview_image = image_area.spaces.active.image
+                seek_editor_roles.append(
+                    str(preview_image.get(runtime.ROLE_KEY, ""))
+                    if preview_image is not None
+                    else ""
+                )
+                return result
+
+            def tracked_select_key(context, selected_project, index):
+                select_trace.append(int(index))
+                return original_select_key(context, selected_project, index)
+
+            timeline._set_seek = tracked_set_seek
+            timeline._select_key = tracked_select_key
+            STATE.update(
+                timeline_seek_trace=seek_trace,
+                timeline_seek_editor_roles=seek_editor_roles,
+                timeline_select_trace=select_trace,
+                timeline_original_set_seek=original_set_seek,
+                timeline_original_select_key=original_select_key,
             )
             window = bpy.context.window
             window.event_simulate(
-                type="MOUSEMOVE", value="NOTHING", x=event_x, y=event_y
+                type="MOUSEMOVE", value="NOTHING", x=start_event_x, y=event_y
             )
             window.event_simulate(
-                type="LEFTMOUSE", value="PRESS", x=event_x, y=event_y
+                type="LEFTMOUSE", value="PRESS", x=start_event_x, y=event_y
+            )
+            window.event_simulate(
+                type="MOUSEMOVE", value="NOTHING", x=event_x, y=event_y
             )
             window.event_simulate(
                 type="LEFTMOUSE", value="RELEASE", x=event_x, y=event_y
             )
             return 0.1
-        if not STATE.get("timeline_seek_verified"):
-            assert abs(float(project.seek_angle) - STATE["timeline_seek_target"]) < 0.2
-            assert studio.current_session().view_mode == "PREVIEW"
-            assert str(runtime.active_angle(project).uuid) == STATE["timeline_paint_uuid"]
-            assert (
-                bpy.context.scene.tool_settings.image_paint.canvas
-                == STATE["timeline_canvas"]
+        if not STATE.get("timeline_release_verified"):
+            from quick_sdf_blender import timeline
+
+            timeline._set_seek = STATE.pop("timeline_original_set_seek")
+            timeline._select_key = STATE.pop("timeline_original_select_key")
+            snapped = min(
+                timeline._visible_keys(project),
+                key=lambda pair: abs(float(pair[1].angle) - STATE["timeline_seek_target"]),
             )
-            # The old Dope Sheet host changed this frame and could therefore
-            # move an animated pose or mark the normal guide stale.
+            snapped_index, snapped_item = snapped
+            assert float(snapped_item.angle) == 15.0
+            assert any(
+                abs(value - STATE["timeline_seek_target"]) < 0.2
+                for value in STATE["timeline_seek_trace"]
+            ), STATE["timeline_seek_trace"]
+            assert "seek_preview" in STATE["timeline_seek_editor_roles"], (
+                STATE["timeline_seek_editor_roles"]
+            )
+            assert STATE["timeline_select_trace"][-1:] == [snapped_index], (
+                STATE["timeline_select_trace"],
+                STATE["timeline_seek_trace"],
+                float(project.seek_angle),
+                float(runtime.active_angle(project).angle),
+            )
+            assert studio.current_session().view_mode == "EDIT", (
+                studio.current_session().view_mode,
+                float(project.seek_angle),
+                float(runtime.active_angle(project).angle),
+            )
+            assert int(project.active_angle_index) == snapped_index
+            assert str(runtime.active_angle(project).uuid) == str(snapped_item.uuid)
+            assert float(project.seek_angle) == float(snapped_item.angle)
+            snapped_canvas = runtime.resolve_display_image(project, snapped_item)
+            assert bpy.context.scene.tool_settings.image_paint.canvas == snapped_canvas
+            image_area = next(
+                area for area in bpy.context.window.screen.areas
+                if area.type == "IMAGE_EDITOR"
+            )
+            assert image_area.spaces.active.image == snapped_canvas
+            assert tuple(str(item.uuid) for item in project.angles) == STATE["timeline_key_uuids"]
             assert bpy.context.scene.frame_current == 96
-            assert bpy.ops.quicksdf.back_to_paint() == {"FINISHED"}
-            STATE["timeline_seek_verified"] = True
+
+            # A stroke snapshot after release is already synchronized. It must
+            # not jump back to the old paint key or swap the visible material.
+            preview_material = obj.material_slots[0].material
+            material_image = preview_material.node_tree.nodes["QSDF Mask"].image
+            assert material_image == snapped_canvas
+            assert bpy.ops.quicksdf.paint_snapshot() == {"FINISHED"}
+            assert studio.current_session().view_mode == "EDIT"
+            assert float(project.seek_angle) == float(snapped_item.angle)
+            assert str(runtime.active_angle(project).uuid) == str(snapped_item.uuid)
+            assert bpy.context.scene.tool_settings.image_paint.canvas == snapped_canvas
+            assert preview_material.node_tree.nodes["QSDF Mask"].image == material_image
+            assert tuple(str(item.uuid) for item in project.angles) == STATE["timeline_key_uuids"]
+            runtime.discard_paint_snapshot(project)
+            runtime.discard_interactive_paint_snapshot(project)
+            studio.restore_stroke_brush(bpy.context)
+            STATE["timeline_release_verified"] = True
         assert obj.mode == "TEXTURE_PAINT"
-        assert float(runtime.active_angle(project).angle) == 45.0
+        assert float(runtime.active_angle(project).angle) == 15.0
         assert str(project.base_source) == "NORMAL_GUIDE"
         assert studio.current_session().first_hint_text.startswith("A normal-based shadow guide")
         assert bpy.context.scene.tool_settings.image_paint.use_normal_falloff is False

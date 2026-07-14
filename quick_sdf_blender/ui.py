@@ -227,9 +227,9 @@ class QSDF_PT_advanced(bpy.types.Panel):
         keys = layout.box()
         keys.label(text="Angle Keys")
         row = keys.row(align=True)
-        add = row.operator("quicksdf.key_add", text="Add at Seek", icon="ADD")
+        add = row.operator("quicksdf.key_add", text="Add Angle…", icon="ADD")
         add.duplicate = False
-        duplicate = row.operator("quicksdf.key_add", text="Duplicate to Seek", icon="DUPLICATE")
+        duplicate = row.operator("quicksdf.key_add", text="Duplicate Angle…", icon="DUPLICATE")
         duplicate.duplicate = True
         active = runtime.active_angle(project)
         if active is not None:

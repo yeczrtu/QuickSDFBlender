@@ -328,8 +328,14 @@ def leave_export_adjustment_review(
     return True
 
 
-def seek_preview(context: Any, project: Any, angle: float) -> float:
-    """Scrub the 3D result without changing the edit key or paint canvas."""
+def seek_preview(
+    context: Any,
+    project: Any,
+    angle: float,
+    *,
+    show_in_image_editor: bool = False,
+) -> float:
+    """Scrub a transient result without changing the edit key or paint canvas."""
 
     value = max(0.0, min(90.0, float(angle)))
     project.seek_angle = value
@@ -340,12 +346,21 @@ def seek_preview(context: Any, project: Any, angle: float) -> float:
         ensure_studio_material_preview(context, session=session)
         session.view_mode = "PREVIEW"
         session.seek_angle = value
+    preview_image = None
     try:
         from .live_preview import update_seek_preview
 
-        update_seek_preview(project, value)
+        preview_image = update_seek_preview(project, value)
     except (ImportError, ReferenceError, RuntimeError, ValueError):
         pass
+    if show_in_image_editor and session is not None and preview_image is not None:
+        window = find_window(session.window_pointer)
+        if window is not None:
+            for area in window.screen.areas:
+                if area.type != "IMAGE_EDITOR":
+                    continue
+                area.spaces.active.image = preview_image
+                area.tag_redraw()
     tag_studio_redraw()
     return value
 

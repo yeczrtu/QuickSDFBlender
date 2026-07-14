@@ -744,11 +744,38 @@ def _assign_angle_layers(project, item, display, base, coverage) -> None:
 class QUICKSDF_OT_key_add(bpy.types.Operator):
     bl_idname = "quicksdf.key_add"
     bl_label = "Add Angle Key"
-    bl_description = "Add a paint key at the seek angle and initialize it from the evaluated pose"
+    bl_description = "Add a paint key at a chosen angle and initialize it from the evaluated pose"
     bl_options = {"REGISTER", "UNDO"}
 
     angle: FloatProperty(name="Angle", default=-1.0, min=-1.0, max=90.0)
     duplicate: BoolProperty(name="Duplicate Current", default=False)
+
+    def invoke(self, context, _event):
+        project = _require_project(self, context)
+        if project is None:
+            return {"CANCELLED"}
+        if self.angle < 0.0:
+            candidate = max(0.0, min(90.0, float(project.seek_angle)))
+            side = str(project.active_side or project.authoring_side)
+            angles = sorted(
+                float(item.angle)
+                for item in project.angles
+                if str(item.side) == side
+            )
+            if angles and any(abs(value - candidate) < 1.0e-4 for value in angles):
+                position = min(
+                    range(len(angles)),
+                    key=lambda index: abs(angles[index] - candidate),
+                )
+                if position + 1 < len(angles):
+                    candidate = 0.5 * (angles[position] + angles[position + 1])
+                elif position > 0:
+                    candidate = 0.5 * (angles[position - 1] + angles[position])
+            self.angle = candidate
+        return context.window_manager.invoke_props_dialog(self, width=260)
+
+    def draw(self, _context):
+        self.layout.prop(self, "angle", text="Angle")
 
     def execute(self, context):
         project = _require_project(self, context)

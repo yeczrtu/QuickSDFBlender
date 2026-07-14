@@ -40,22 +40,6 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
         layout.label(text="Open Quick SDF Studio to paint", icon="INFO")
         return
 
-    try:
-        from .studio import active_session
-
-        session = active_session(context)
-    except (ImportError, AttributeError, ReferenceError):
-        session = None
-    if session is not None and session.view_mode == "PREVIEW":
-        preview_row = layout.row(align=True)
-        preview_row.label(
-            text=f"Preview {session.seek_angle:g}° / Paint {session.paint_key_angle:g}°",
-            icon="HIDE_OFF",
-        )
-        if _operator_exists("quicksdf.back_to_paint"):
-            preview_row.operator("quicksdf.back_to_paint", text=f"Back to Paint {session.paint_key_angle:g}°")
-        preview_row.separator()
-
     row = layout.row(align=True)
     if _operator_exists("quicksdf.paint_value_set"):
         light = row.operator(
