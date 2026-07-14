@@ -104,6 +104,67 @@ TRANSLATIONS["ja_JP"].update({
     ("*", "if the brush misses, move back or press Numpad 5"): "\u30d6\u30e9\u30b7\u304c\u5c4a\u304b\u306a\u3044\u5834\u5408\u306f\u5c11\u3057\u5f15\u304f\u304bNumpad 5\u3092\u62bc\u3057\u3066\u304f\u3060\u3055\u3044",
 })
 
+# Channel packing stays out of the daily Studio UI, but its Advanced labels
+# still need to read as artist-facing concepts rather than implementation data.
+TRANSLATIONS["ja_JP"].update({
+    ("*", "Output Packing"): "出力パッキング",
+    ("*", "Packing: lilToon"): "パッキング：lilToon",
+    ("*", "Packing: Custom — This Project"): "パッキング：カスタム（このプロジェクト）",
+    ("*", "Customize"): "カスタマイズ",
+    ("*", "Reset to lilToon"): "lilToonに戻す",
+    ("*", "Direct"): "そのまま",
+    ("*", "Invert"): "反転",
+    ("*", "Right Threshold"): "右側スレッショルド",
+    ("*", "Left Threshold"): "左側スレッショルド",
+    ("*", "SDF Area"): "SDF領域",
+    ("*", "Shadow Strength"): "影の強度",
+    ("*", "Custom Mask"): "カスタムマスク",
+    ("*", "No Custom Mask Selected"): "カスタムマスク未選択",
+    ("*", "Use Selected Mask"): "選択中のマスクを使用",
+    ("*", "Constant"): "定数",
+    ("*", "Constant output: %s"): "出力値：%s",
+    ("*", "Black: %s · White: %s"): "黒：%s・白：%s",
+    ("*", "lights late"): "遅く明るくなる",
+    ("*", "lights early"): "早く明るくなる",
+    ("*", "normal shading"): "通常法線シェーディング",
+    ("*", "face SDF"): "顔SDF",
+    ("*", "shadow off"): "影なし",
+    ("*", "full shadow"): "影強度100%",
+    ("*", "mask off"): "マスク0",
+    ("*", "mask on"): "マスク1",
+    ("*", "%s: Missing channel mapping"): "%s：チャンネル割り当てがありません",
+    ("*", "Packing data is not available for this project."): "このプロジェクトにはパッキングデータがありません。",
+    ("*", "Add a Custom Mask first."): "先にカスタムマスクを追加してください。",
+    ("*", "Additional Masks"): "追加マスク",
+    ("*", "Additional Mask"): "追加マスク",
+    ("*", "These masks are shared by every angle."): "このマスクはすべての角度で共通です。",
+    ("*", "Editing Mask: %s"): "マスクを編集中：%s",
+    ("*", "Back to Face Shadow"): "顔影の編集に戻る",
+    ("*", "Edit Mask"): "マスクを編集",
+    ("*", "Import from Image"): "画像から読み込み",
+    ("*", "Fill White"): "白で塗りつぶす",
+    ("*", "Fill Black"): "黒で塗りつぶす",
+    ("*", "Reset SDF Area from UV"): "UVからSDF領域を作り直す",
+    ("*", "Add Custom Mask"): "カスタムマスクを追加",
+    ("*", "Delete Mask"): "マスクを削除",
+    ("*", "No additional masks."): "追加マスクはありません。",
+    ("*", "Additional mask data is not available for this project."): "このプロジェクトには追加マスクデータがありません。",
+    ("*", "Image: %s"): "画像：%s",
+    ("*", "White"): "白",
+    ("*", "Black"): "黒",
+    ("*", "This mask is shared by every light angle"): "このマスクはすべてのライト角度で共通です",
+    ("*", "Preview Packed RGB"): "パッキング済みRGBをプレビュー",
+})
+
+TRANSLATIONS["ja_JP"].update({
+    ("*", "%s: Unknown source"): "%s：不明なソースです",
+    ("*", "%s: Required mask is missing"): "%s：必要なマスクがありません",
+    ("*", "%s: Select a Custom Mask"): "%s：カスタムマスクを選択してください",
+    ("*", "%s: Mask image is missing"): "%s：マスク画像がありません",
+    ("*", "%s: Mask resolution does not match the project"): "%s：マスクの解像度がプロジェクトと一致しません",
+    ("*", "%s: Duplicate channel mapping"): "%s：チャンネル割り当てが重複しています",
+})
+
 _REGISTERED = False
 
 
