@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import time
 from typing import Any, Sequence
@@ -45,7 +46,12 @@ _DRAW_HANDLE: Any = None
 _COLOR_SHADER: Any = None
 _IMAGE_SHADER: Any = None
 _ADDON_KEYMAPS: list[tuple[Any, Any]] = []
-_SCRUB_PREVIEW_INTERVAL = 1.0 / 24.0
+_SCRUB_PREVIEW_INTERVAL = 1.0 / 30.0
+_GEOMETRY_CACHE: OrderedDict[tuple[Any, ...], TimelineGeometry] = OrderedDict()
+_RECT_BATCH_CACHE: OrderedDict[tuple[float, float, float, float], Any] = OrderedDict()
+_IMAGE_BATCH_CACHE: OrderedDict[tuple[float, float, float, float], Any] = OrderedDict()
+_GEOMETRY_CACHE_LIMIT = 64
+_BATCH_CACHE_LIMIT = 256
 
 
 def _visible_keys(project: Any) -> list[tuple[int, Any]]:
@@ -69,6 +75,18 @@ def _visible_keys(project: Any) -> list[tuple[int, Any]]:
 
 
 def build_geometry(width: float, height: float, keys: Sequence[tuple[int, Any]]) -> TimelineGeometry:
+    cache_key = (
+        round(float(width), 3),
+        round(float(height), 3),
+        tuple(
+            (int(index), round(float(getattr(item, "angle", 0.0)), 8))
+            for index, item in keys
+        ),
+    )
+    cached = _GEOMETRY_CACHE.get(cache_key)
+    if cached is not None:
+        _GEOMETRY_CACHE.move_to_end(cache_key)
+        return cached
     margin = 16.0
     rail_y = max(20.0, height - 24.0)
     content_x0 = margin
@@ -94,7 +112,12 @@ def build_geometry(width: float, height: float, keys: Sequence[tuple[int, Any]])
         factor = (float(item.angle) - angle_min) / (angle_max - angle_min)
         center = rail.x0 + factor * available
         rects.append((collection_index, Rect(center - thumb_width * 0.5, 8.0, center + thumb_width * 0.5, 8.0 + thumb_height)))
-    return TimelineGeometry(rail, tuple(rects), angle_min, angle_max)
+    result = TimelineGeometry(rail, tuple(rects), angle_min, angle_max)
+    _GEOMETRY_CACHE[cache_key] = result
+    _GEOMETRY_CACHE.move_to_end(cache_key)
+    while len(_GEOMETRY_CACHE) > _GEOMETRY_CACHE_LIMIT:
+        _GEOMETRY_CACHE.popitem(last=False)
+    return result
 
 
 def _project_for_context(context: Any) -> Any | None:
@@ -130,12 +153,20 @@ def _rect(rect: Rect, color: tuple[float, float, float, float]) -> None:
     from gpu_extras.batch import batch_for_shader
 
     shader = _shader()
-    batch = batch_for_shader(
-        shader,
-        "TRIS",
-        {"pos": ((rect.x0, rect.y0), (rect.x1, rect.y0), (rect.x1, rect.y1), (rect.x0, rect.y1))},
-        indices=((0, 1, 2), (2, 3, 0)),
-    )
+    key = (rect.x0, rect.y0, rect.x1, rect.y1)
+    batch = _RECT_BATCH_CACHE.get(key)
+    if batch is None:
+        batch = batch_for_shader(
+            shader,
+            "TRIS",
+            {"pos": ((rect.x0, rect.y0), (rect.x1, rect.y0), (rect.x1, rect.y1), (rect.x0, rect.y1))},
+            indices=((0, 1, 2), (2, 3, 0)),
+        )
+        _RECT_BATCH_CACHE[key] = batch
+        while len(_RECT_BATCH_CACHE) > _BATCH_CACHE_LIMIT:
+            _RECT_BATCH_CACHE.popitem(last=False)
+    else:
+        _RECT_BATCH_CACHE.move_to_end(key)
     shader.bind()
     shader.uniform_float("color", color)
     batch.draw(shader)
@@ -164,29 +195,51 @@ def _draw_thumbnail(
     image: Any,
     rect: Rect,
     uv_bbox: tuple[float, float, float, float],
+    project: Any | None = None,
+    active_image: Any | None = None,
 ) -> bool:
     try:
         global _IMAGE_SHADER
         import gpu
         from gpu_extras.batch import batch_for_shader
 
-        texture = gpu.texture.from_image(image)
+        # Never call ``gpu.texture.from_image`` for a Display image here.  It
+        # would make every full-resolution angle texture GPU resident merely
+        # because the timeline was drawn.  The cache owns a 96 x 64 derivative.
+        from .preview_cache import thumbnail_texture
+
+        was_loaded = bool(getattr(image, "has_data", True))
+        texture = thumbnail_texture(image, uv_bbox)
+        if project is not None and not was_loaded:
+            try:
+                from .residency import reconcile_project
+
+                reconcile_project(project, active_image)
+            except (ImportError, ReferenceError, RuntimeError):
+                pass
         if _IMAGE_SHADER is None:
             _IMAGE_SHADER = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
-        u0, v0, u1, v1 = uv_bbox
         positions = (
             (rect.x0 + 2.0, rect.y0 + 2.0),
             (rect.x1 - 2.0, rect.y0 + 2.0),
             (rect.x1 - 2.0, rect.y1 - 16.0),
             (rect.x0 + 2.0, rect.y1 - 16.0),
         )
-        tex_coords = ((u0, v0), (u1, v0), (u1, v1), (u0, v1))
-        batch = batch_for_shader(
-            _IMAGE_SHADER,
-            "TRIS",
-            {"pos": positions, "texCoord": tex_coords},
-            indices=((0, 1, 2), (2, 3, 0)),
-        )
+        key = (rect.x0, rect.y0, rect.x1, rect.y1)
+        batch = _IMAGE_BATCH_CACHE.get(key)
+        if batch is None:
+            tex_coords = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+            batch = batch_for_shader(
+                _IMAGE_SHADER,
+                "TRIS",
+                {"pos": positions, "texCoord": tex_coords},
+                indices=((0, 1, 2), (2, 3, 0)),
+            )
+            _IMAGE_BATCH_CACHE[key] = batch
+            while len(_IMAGE_BATCH_CACHE) > _BATCH_CACHE_LIMIT:
+                _IMAGE_BATCH_CACHE.popitem(last=False)
+        else:
+            _IMAGE_BATCH_CACHE.move_to_end(key)
         _IMAGE_SHADER.uniform_sampler("image", texture)
         batch.draw(_IMAGE_SHADER)
         return True
@@ -310,11 +363,17 @@ def _draw_timeline() -> None:
             _seek_value(project),
         )
         key_map = {index: item for index, item in keys}
+        active_item = key_map.get(active)
+        active_image = (
+            _image_for_key(project, active_item) if active_item is not None else None
+        )
         for collection_index, rect in geometry.key_rects:
             item = key_map[collection_index]
             _rect(rect, (0.10, 0.22, 0.34, 0.82) if collection_index in affected else (0.08, 0.09, 0.11, 1.0))
             image = _image_for_key(project, item)
-            if image is None or not _draw_thumbnail(image, rect, uv_bbox):
+            if image is None or not _draw_thumbnail(
+                image, rect, uv_bbox, project, active_image
+            ):
                 _rect(Rect(rect.x0 + 2, rect.y0 + 2, rect.x1 - 2, rect.y1 - 16), (0.18, 0.19, 0.21, 1.0))
             angle = float(getattr(item, "angle", 0.0))
             _text(f"{angle:.1f}°", rect.x0 + 4.0, rect.y0 + 3.0, size=10)
@@ -705,6 +764,15 @@ def unregister_timeline() -> None:
         _DRAW_HANDLE = None
     _COLOR_SHADER = None
     _IMAGE_SHADER = None
+    _GEOMETRY_CACHE.clear()
+    _RECT_BATCH_CACHE.clear()
+    _IMAGE_BATCH_CACHE.clear()
+    try:
+        from .preview_cache import invalidate
+
+        invalidate()
+    except (ImportError, RuntimeError):
+        pass
 
 
 __all__ = [

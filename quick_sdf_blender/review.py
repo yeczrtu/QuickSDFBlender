@@ -19,6 +19,7 @@ import numpy as np
 _ANGLE_EPSILON = 1.0e-7
 _CYAN = np.asarray((0.0, 1.0, 1.0), dtype=np.float32)
 _MAGENTA = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
+_PREVIEW_MAXIMUM = 512
 
 
 def _as_binary_stack(mask_stack: np.ndarray | Sequence[object]) -> np.ndarray:
@@ -105,18 +106,24 @@ def review_current(
     mask_stack: np.ndarray | Sequence[object],
     angles: Sequence[float] | np.ndarray,
     angle: float,
+    *,
+    maximum: int = _PREVIEW_MAXIMUM,
 ) -> np.ndarray:
     """Display the authored mask nearest to a continuous review angle."""
 
     masks, angle_values = _validated_stack_and_angles(mask_stack, angles)
     selected = _nearest_index(angle_values, _validated_review_angle(angle))
-    return _mask_rgba(masks[selected])
+    from .preview_cache import resize_nearest
+
+    return _mask_rgba(resize_nearest(masks[selected], maximum))
 
 
 def review_onion_difference(
     mask_stack: np.ndarray | Sequence[object],
     angles: Sequence[float] | np.ndarray,
     angle: float,
+    *,
+    maximum: int = _PREVIEW_MAXIMUM,
 ) -> np.ndarray:
     """Display current mask with adjacent same-side changes as onion colors.
 
@@ -151,10 +158,20 @@ def review_onion_difference(
         selected = int(side_indices[np.argmin(np.abs(angle_values[side_indices] - requested))])
         position = int(np.flatnonzero(side_indices == selected)[0])
 
-    current = masks[selected]
+    from .preview_cache import resize_nearest
+
+    current = resize_nearest(masks[selected], maximum)
     output = _mask_rgba(current)
-    inward = masks[side_indices[position - 1]] if position > 0 else current
-    outward = masks[side_indices[position + 1]] if position + 1 < side_indices.size else current
+    inward = (
+        resize_nearest(masks[side_indices[position - 1]], maximum)
+        if position > 0
+        else current
+    )
+    outward = (
+        resize_nearest(masks[side_indices[position + 1]], maximum)
+        if position + 1 < side_indices.size
+        else current
+    )
     inward_difference = current != inward
     outward_difference = current != outward
     output[inward_difference, :3] = _CYAN
@@ -166,6 +183,8 @@ def review_onion_difference(
 def review_threshold_rgba16(
     threshold_rgba16: np.ndarray,
     signed_angle: float,
+    *,
+    maximum: int = _PREVIEW_MAXIMUM,
 ) -> np.ndarray:
     """Evaluate a lilToon face-SDF texture at continuous authored progress.
 
@@ -187,7 +206,12 @@ def review_threshold_rgba16(
 
     angle = _validated_review_angle(signed_angle)
     channel = 0 if angle >= 0.0 else 1
-    threshold = thresholds[..., channel].astype(np.float64) / 65535.0
+    from .preview_cache import resize_nearest
+
+    threshold = (
+        resize_nearest(thresholds[..., channel], maximum).astype(np.float64)
+        / 65535.0
+    )
     progress = abs(angle) / 90.0
     front_dot = progress - 0.5
     light = front_dot + threshold >= 0.5
@@ -197,6 +221,8 @@ def review_threshold_rgba16(
 def review_violation_heatmap(
     mask_stack: np.ndarray | Sequence[object],
     angles: Sequence[float] | np.ndarray,
+    *,
+    maximum: int = _PREVIEW_MAXIMUM,
 ) -> np.ndarray:
     """Display forbidden Light-to-Shadow transitions by signed-angle side.
 
@@ -223,7 +249,12 @@ def review_violation_heatmap(
             violation |= masks[first] & ~masks[second]
         side_maps.append(violation)
 
-    positive, negative = side_maps
+    from .preview_cache import max_pool
+
+    positive, negative = (
+        max_pool(side_maps[0], maximum),
+        max_pool(side_maps[1], maximum),
+    )
     output = np.zeros((*positive.shape, 4), dtype=np.float32)
     output[..., 0] = positive
     output[..., 2] = negative
@@ -231,8 +262,30 @@ def review_violation_heatmap(
     return output
 
 
+def review_adjustment_heatmap(
+    changed_mask: np.ndarray | Sequence[object],
+    *,
+    maximum: int = _PREVIEW_MAXIMUM,
+) -> np.ndarray:
+    """Build a bounded RGBA8 export-adjustment heatmap with max pooling."""
+
+    values = np.asarray(changed_mask)
+    if values.ndim == 3:
+        values = np.any(values, axis=0)
+    if values.ndim != 2 or not values.size:
+        raise ValueError("changed mask must be a non-empty HxW or NxHxW array")
+    from .preview_cache import max_pool
+
+    problem = max_pool(values.astype(np.bool_, copy=False), maximum)
+    output = np.zeros((*problem.shape, 4), dtype=np.uint8)
+    output[..., 0] = problem.astype(np.uint8) * np.uint8(255)
+    output[..., 3] = 255
+    return output
+
+
 __all__ = [
     "review_current",
+    "review_adjustment_heatmap",
     "review_onion_difference",
     "review_threshold_rgba16",
     "review_violation_heatmap",
