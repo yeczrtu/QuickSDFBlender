@@ -597,7 +597,7 @@ def copy_image_pixels(
         from .residency import mark_changed
 
         mark_changed(destination)
-    except ImportError:
+    except (ImportError, ReferenceError, RuntimeError):
         pass
 
 
@@ -1948,6 +1948,19 @@ def cleanup_export_adjustment_previews() -> None:
 
 
 @persistent
+def _load_pre_cleanup(_unused: Any) -> None:
+    """Stop workers before Blender invalidates every referenced datablock."""
+
+    try:
+        from .operators import shutdown_bake_job, shutdown_export_job
+
+        shutdown_bake_job(message="Base update cancelled because a file was loaded")
+        shutdown_export_job(message="Export cancelled because a file was loaded")
+    except (ImportError, ReferenceError, RuntimeError):
+        pass
+
+
+@persistent
 def _load_or_undo_post(_unused: Any) -> None:
     global _GRAY_UPLOAD_BUFFER
 
@@ -2073,6 +2086,8 @@ def _deferred_base_check() -> None:
 
 
 def register_runtime() -> None:
+    if _load_pre_cleanup not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_load_pre_cleanup)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         if _load_or_undo_post not in handlers:
             handlers.append(_load_or_undo_post)
@@ -2110,6 +2125,8 @@ def unregister_runtime() -> None:
         pass
     if bpy.app.timers.is_registered(_deferred_base_check):
         bpy.app.timers.unregister(_deferred_base_check)
+    while _load_pre_cleanup in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_load_pre_cleanup)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         while _load_or_undo_post in handlers:
             handlers.remove(_load_or_undo_post)

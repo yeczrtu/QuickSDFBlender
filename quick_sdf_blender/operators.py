@@ -25,6 +25,7 @@ from .history import History
 _HISTORIES: dict[str, History] = {}
 _UNDO_FENCES: set[str] = set()
 _EXPORT_JOB: dict[str, object] | None = None
+_BAKE_JOB: dict[str, object] | None = None
 
 
 def _purge_history_orphans(project_uuid: str = "") -> None:
@@ -384,6 +385,236 @@ def _bake_project(context, project) -> None:
         runtime.end_base_bake(str(project.uuid))
 
 
+def _boundary_revision_token(project) -> tuple:
+    return tuple(
+        (
+            str(getattr(track, "uuid", "")),
+            str(getattr(track, "side", "RIGHT")),
+            bool(getattr(track, "enabled", True)),
+            bool(getattr(track, "closed", False)),
+            str(getattr(track, "fill_mode", "INSIDE")),
+            int(getattr(track, "paint_value", 0)),
+            int(getattr(track, "island_index", -1)),
+            tuple(
+                (
+                    str(getattr(key, "uuid", "")),
+                    str(getattr(key, "angle_uuid", "")),
+                    str(getattr(key, "side", "RIGHT")),
+                    float(getattr(key, "angle", 0.0)),
+                    tuple(tuple(float(value) for value in point.co) for point in key.points),
+                )
+                for key in track.keys
+            ),
+        )
+        for track in project.boundary_tracks
+    )
+
+
+def _bake_revision_token(project) -> tuple:
+    return (
+        _export_revision_token(project),
+        tuple(float(value) for value in project.forward_vector),
+        tuple(float(value) for value in project.up_vector),
+        float(project.guide_shadow_amount),
+        _boundary_revision_token(project),
+    )
+
+
+def _compute_async_bake(request, cancel_flag=None):
+    """Run the Blender-independent Native guide bake on one worker."""
+
+    import numpy as np
+
+    from .native import bake_face_shadow_guide
+
+    masks_by_uuid = {}
+    occupancy = None
+    guide_warning = False
+    for lane in request["lanes"]:
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Base update cancelled")
+        masks, local_occupancy = bake_face_shadow_guide(
+            request["triangle_uvs"],
+            request["corner_normals"],
+            lane["angles"],
+            request["forward"],
+            request["up"],
+            lane["side"],
+            request["shadow_amount"],
+            request["resolution"],
+            request["resolution"],
+            cancel_flag=cancel_flag,
+        )
+        if occupancy is None:
+            occupancy = local_occupancy
+        for uuid_value, mask in zip(lane["uuids"], masks):
+            masks_by_uuid[str(uuid_value)] = np.ascontiguousarray(mask, dtype=np.bool_)
+        if np.any(local_occupancy):
+            middle = int(np.argmin(np.abs(lane["angles"] - 45.0)))
+            light_ratio = float(np.mean(masks[middle, local_occupancy]))
+            changed = np.any(masks[1:] != masks[:-1], axis=0)
+            variation = float(np.mean(changed[local_occupancy]))
+            guide_warning = guide_warning or (
+                light_ratio <= 0.02 or light_ratio >= 0.98 or variation < 0.01
+            )
+    if occupancy is None:
+        raise ValueError("Base update has no angle lane")
+    return {
+        "masks": masks_by_uuid,
+        "occupancy": np.ascontiguousarray(occupancy, dtype=np.bool_),
+        "guide_warning": guide_warning,
+    }
+
+
+def _find_angle_uuid(project, uuid_value: str):
+    return next(
+        (item for item in project.angles if str(item.uuid) == str(uuid_value)),
+        None,
+    )
+
+
+def _restore_bake_records(project, records) -> None:
+    """Best-effort reverse restore for a cancelled publish transaction."""
+
+    import numpy as np
+
+    failures = []
+    for record in reversed(records):
+        try:
+            item = _find_angle_uuid(project, record["uuid"])
+            if item is None:
+                raise RuntimeError(f"Angle {record['uuid']} was removed")
+            image = runtime.resolve_display_image(project, item)
+            if image is None:
+                raise RuntimeError(f"Display {record['uuid']} is missing")
+            if runtime.BASE_BITPLANE_KEY in item:
+                del item[runtime.BASE_BITPLANE_KEY]
+            item[runtime.BASE_BITPLANE_KEY] = bytes(record["base_blob"])
+            item.base_revision = int(record["base_revision"])
+            if runtime.COVERAGE_BITPLANE_KEY in item:
+                del item[runtime.COVERAGE_BITPLANE_KEY]
+            item[runtime.COVERAGE_BITPLANE_KEY] = bytes(record["coverage_blob"])
+            item.coverage_revision = int(record["coverage_revision"])
+            gray = np.frombuffer(
+                zlib.decompress(record["gray"]), dtype=np.uint8
+            ).reshape(record["shape"])
+            runtime.write_image_gray8(image, gray)
+            image[runtime.IMAGE_REVISION_KEY] = int(record["image_revision"])
+            item.is_generated = bool(record["is_generated"])
+            item.dirty = bool(record["dirty"])
+            from .residency import mark_changed
+
+            mark_changed(image, synchronous=True)
+        except Exception as exc:
+            failures.append(str(exc))
+    runtime._BITPLANE_CACHE.clear()
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def _publish_async_bake_key(project, job, uuid_value: str) -> None:
+    import numpy as np
+
+    item = _find_angle_uuid(project, uuid_value)
+    if item is None:
+        raise RuntimeError("An angle key was removed during Base update")
+    image = runtime.resolve_display_image(project, item)
+    if image is None:
+        raise RuntimeError(f"Angle data is incomplete at {float(item.angle):g} degrees")
+    old_gray = runtime.image_gray8(image)
+    old_base = runtime.base_mask(item)
+    old_coverage = runtime.coverage_mask(item)
+    effective_coverage = np.array(old_coverage, copy=True)
+    if not project.boundary_tracks:
+        effective_coverage |= old_gray != np.where(old_base, 255, 0).astype(np.uint8)
+    new_base = job["result"]["masks"].pop(str(uuid_value))
+    generated = new_base
+    if project.boundary_tracks:
+        from .boundary import evaluate_boundary_mask
+
+        generated = evaluate_boundary_mask(
+            project,
+            float(item.angle),
+            str(item.side),
+            new_base,
+            uv_perimeters=job.get("uv_perimeters"),
+        )
+    composed = np.asarray(generated, dtype=np.uint8) * np.uint8(255)
+    composed[effective_coverage] = old_gray[effective_coverage]
+    record = {
+        "uuid": str(item.uuid),
+        "gray": zlib.compress(old_gray.tobytes(order="C"), 1),
+        "shape": tuple(old_gray.shape),
+        # IDProperty byte buffers can be invalidated when the property is
+        # replaced. Materialize independent storage for transactional rollback.
+        "base_blob": memoryview(runtime.bitplane_blob(item, "BASE")).tobytes(),
+        "base_revision": int(item.base_revision),
+        "coverage_blob": memoryview(
+            runtime.bitplane_blob(item, "COVERAGE")
+        ).tobytes(),
+        "coverage_revision": int(item.coverage_revision),
+        "image_revision": int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+        "is_generated": bool(item.is_generated),
+        "dirty": bool(item.dirty),
+    }
+    job["rollback"].append(record)
+    runtime.set_base_mask(item, new_base)
+    if not np.array_equal(effective_coverage, old_coverage):
+        runtime.set_coverage_mask(item, effective_coverage)
+    runtime.write_image_gray8(image, composed)
+    item.is_generated = True
+    item.dirty = True
+
+
+def _finish_async_bake(project, job) -> None:
+    import numpy as np
+
+    signature = runtime.compute_base_signature(project, bpy.context.scene)
+    occupancy = job["result"]["occupancy"]
+    _write_sdf_area_occupancy(project, occupancy, force=False)
+    if np.any(occupancy):
+        rows, columns = np.nonzero(occupancy)
+        height, width = occupancy.shape
+        project.thumbnail_uv_bbox = (
+            float(columns.min()) / width,
+            1.0 - float(rows.max() + 1) / height,
+            float(columns.max() + 1) / width,
+            1.0 - float(rows.min()) / height,
+        )
+    if bool(getattr(project, "mirror_enabled", True)):
+        try:
+            _detect_project_symmetry(
+                project,
+                job["triangle_uvs"],
+                job["corner_normals"],
+                job["triangle_centers"],
+            )
+        except (RuntimeError, ValueError) as exc:
+            project.warning_message = f"Base updated; Mirror analysis was skipped: {exc}"
+    project.base_needs_update = False
+    project.base_signature = signature
+    project.base_source = "NORMAL_GUIDE"
+    project.guide_version = 2
+    project.guide_direction_warning = bool(job["result"]["guide_warning"])
+    project.guide_direction_message = (
+        "The guide is nearly uniform; confirm which way the face points"
+        if project.guide_direction_warning
+        else ""
+    )
+    project.dirty = True
+    clear_histories(str(project.uuid))
+    try:
+        from .live_preview import invalidate
+
+        invalidate(str(project.uuid))
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        runtime.sync_canvas(bpy.context, project)
+    except (AttributeError, ReferenceError, RuntimeError) as exc:
+        project.warning_message = f"Base updated; Canvas refresh was deferred: {exc}"
+
+
 def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True):
     obj = context.active_object
     if obj is None or obj.type != "MESH":
@@ -495,6 +726,9 @@ class QUICKSDF_OT_project_remove(bpy.types.Operator):
     def execute(self, context):
         project = _project(context)
         index = context.scene.quick_sdf_active_project_index
+        shutdown_bake_job(
+            str(project.uuid), message="Base update cancelled because the project was removed"
+        )
         shutdown_export_job(str(project.uuid), message="Export cancelled because the project was removed")
         try:
             from .studio import is_studio_active, exit_studio
@@ -649,6 +883,10 @@ class QUICKSDF_OT_bake_base(bpy.types.Operator):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
         try:
+            if not bpy.app.background and getattr(context, "window", None) is not None:
+                _start_bake_job(context, project)
+                self.report({"INFO"}, "Updating Base in the background")
+                return {"FINISHED"}
             _bake_project(context, project)
             runtime.sync_canvas(context, project)
         except Exception as exc:
@@ -3433,6 +3671,212 @@ def _project_by_uuid(uuid: str):
     return None
 
 
+def _finish_bake_job(message: str, *, error: bool = False, wait: bool = True) -> None:
+    global _BAKE_JOB
+
+    job = _BAKE_JOB
+    _BAKE_JOB = None
+    if job is None:
+        return
+    cancel_flag = job.get("cancel_flag")
+    if error and cancel_flag is not None:
+        cancel_flag.value = 1
+    manager = job.get("manager")
+    if manager is not None:
+        manager.shutdown(wait=wait)
+    project = _project_by_uuid(str(job.get("project_uuid", "")))
+    rollback_error = ""
+    if project is not None and not bool(job.get("committed", False)) and job.get("rollback"):
+        try:
+            _restore_bake_records(project, job["rollback"])
+            runtime.sync_canvas(bpy.context, project)
+        except Exception as exc:
+            rollback_error = str(exc)
+    if bool(job.get("publish_started", False)):
+        runtime.end_base_bake(str(job.get("project_uuid", "")))
+    if project is not None:
+        project.job_running = False
+        project.job_progress = 0.0 if error else 1.0
+        project.job_message = message
+        if error:
+            if rollback_error:
+                message = f"{message}; rollback warning: {rollback_error}"
+            project.diagnostic_message = message
+    job.clear()
+    import gc
+
+    gc.collect()
+
+
+def _poll_bake_job() -> float | None:
+    job = _BAKE_JOB
+    if job is None:
+        return None
+    project = _project_by_uuid(str(job["project_uuid"]))
+    if project is None:
+        shutdown_bake_job(message="Base update cancelled because the project was removed")
+        return None
+    if int(getattr(job.get("cancel_flag"), "value", 0)):
+        _finish_bake_job("Base update cancelled", error=True)
+        return None
+    if _bake_revision_token(project) != job.get("revision_token"):
+        _finish_bake_job(
+            "Base update cancelled because the project changed",
+            error=True,
+        )
+        return None
+
+    if str(job.get("stage", "WORKER")) == "WORKER":
+        from .jobs import JobState
+
+        manager = job.get("manager")
+        state = manager.poll() if manager is not None else None
+        if state in {JobState.PENDING, JobState.RUNNING}:
+            project.job_progress = min(0.55, float(project.job_progress) + 0.01)
+            project.job_message = "Updating shadow guide…"
+            return 0.05
+        try:
+            if manager is None:
+                raise RuntimeError("Base update worker was not started")
+            result = manager.take_result()
+            manager.shutdown(wait=True)
+            job["manager"] = None
+            if runtime.compute_base_signature(project, bpy.context.scene) != job["source_signature"]:
+                raise RuntimeError("The mesh or pose changed during Base update")
+            missing = [
+                uuid_value
+                for uuid_value in job["angle_uuids"]
+                if uuid_value not in result["masks"]
+            ]
+            if missing:
+                raise RuntimeError("Base update did not return every angle key")
+            job["result"] = result
+            job["pending"] = list(job["angle_uuids"])
+            job["stage"] = "PUBLISH"
+            runtime.begin_base_bake(str(project.uuid))
+            job["publish_started"] = True
+            project.job_progress = 0.6
+            project.job_message = "Applying updated shadow guide…"
+            return 0.01
+        except Exception as exc:
+            _finish_bake_job(f"Base update failed: {exc}", error=True)
+            return None
+
+    try:
+        pending = job["pending"]
+        if pending:
+            uuid_value = pending.pop(0)
+            _publish_async_bake_key(project, job, uuid_value)
+            job["revision_token"] = _bake_revision_token(project)
+            completed = len(job["angle_uuids"]) - len(pending)
+            project.job_progress = 0.6 + 0.35 * completed / max(1, len(job["angle_uuids"]))
+            return 0.01
+        _finish_async_bake(project, job)
+        job["committed"] = True
+        job["rollback"].clear()
+        _finish_bake_job("Base updated; painted corrections were preserved")
+        return None
+    except Exception as exc:
+        _finish_bake_job(f"Base update failed: {exc}", error=True)
+        return None
+
+
+def _start_bake_job(context, project) -> None:
+    global _BAKE_JOB
+
+    if _BAKE_JOB is not None or _EXPORT_JOB is not None:
+        raise RuntimeError("Another Quick SDF job is already running")
+    import ctypes
+    import numpy as np
+
+    from .jobs import GenerationJobManager
+
+    triangle_uvs, corner_normals, triangle_centers = _extract_evaluated_bake_input(
+        context, project
+    )
+    lanes = []
+    angle_uuids = []
+    for side in ("RIGHT", "LEFT"):
+        items = sorted(
+            (item for item in project.angles if str(item.side) == side),
+            key=lambda item: float(item.angle),
+        )
+        if not items:
+            continue
+        uuids = tuple(str(item.uuid) for item in items)
+        angle_uuids.extend(uuids)
+        lanes.append(
+            {
+                "side": side,
+                "uuids": uuids,
+                "angles": np.asarray(
+                    [float(item.angle) for item in items], dtype=np.float64
+                ),
+            }
+        )
+    if not lanes:
+        raise ValueError("Base update requires angle keys")
+    request = {
+        "triangle_uvs": triangle_uvs,
+        "corner_normals": corner_normals,
+        "lanes": tuple(lanes),
+        "forward": tuple(float(value) for value in project.forward_vector),
+        "up": tuple(float(value) for value in project.up_vector),
+        "shadow_amount": float(project.guide_shadow_amount),
+        "resolution": int(project.resolution),
+    }
+    uv_perimeters = None
+    if project.boundary_tracks:
+        from .boundary import _project_uv_boundaries
+
+        uv_perimeters = _project_uv_boundaries(project)
+    cancel_flag = ctypes.c_int(0)
+    manager = GenerationJobManager(thread_name_prefix="QuickSDFBake")
+    manager.submit(_compute_async_bake, request, cancel_flag)
+    _BAKE_JOB = {
+        "manager": manager,
+        "project_uuid": str(project.uuid),
+        "cancel_flag": cancel_flag,
+        "revision_token": _bake_revision_token(project),
+        "source_signature": runtime.compute_base_signature(project, context.scene),
+        "stage": "WORKER",
+        "angle_uuids": tuple(angle_uuids),
+        "triangle_uvs": triangle_uvs,
+        "corner_normals": corner_normals,
+        "triangle_centers": triangle_centers,
+        "uv_perimeters": uv_perimeters,
+        "rollback": [],
+        "publish_started": False,
+        "committed": False,
+    }
+    project.job_running = True
+    project.job_progress = 0.02
+    project.job_message = "Updating shadow guide…"
+    project.diagnostic_message = ""
+    if not bpy.app.timers.is_registered(_poll_bake_job):
+        bpy.app.timers.register(_poll_bake_job, first_interval=0.05)
+
+
+def shutdown_bake_job(
+    project_uuid: str = "", *, message: str = "Base update cancelled", wait: bool = True
+) -> bool:
+    job = _BAKE_JOB
+    if job is None or (
+        project_uuid and str(job.get("project_uuid", "")) != str(project_uuid)
+    ):
+        return False
+    cancel_flag = job.get("cancel_flag")
+    if cancel_flag is not None:
+        cancel_flag.value = 1
+    manager = job.get("manager")
+    if manager is not None:
+        manager.cancel()
+    _finish_bake_job(message, error=True, wait=wait)
+    if bpy.app.timers.is_registered(_poll_bake_job):
+        bpy.app.timers.unregister(_poll_bake_job)
+    return True
+
+
 def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) -> None:
     global _EXPORT_JOB
     job = _EXPORT_JOB
@@ -3593,8 +4037,8 @@ def _poll_export_job() -> float | None:
 
 def _start_export_job(project, plan, path: Path, overwrite: bool) -> None:
     global _EXPORT_JOB
-    if _EXPORT_JOB is not None:
-        raise RuntimeError("Another Quick SDF export is already running")
+    if _EXPORT_JOB is not None or _BAKE_JOB is not None:
+        raise RuntimeError("Another Quick SDF job is already running")
     import ctypes
 
     revision_token = _export_revision_token(project)
@@ -3914,13 +4358,15 @@ class QUICKSDF_OT_cancel_job(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
-        return (
-            {"FINISHED"}
-            if shutdown_export_job(
-                str(project.uuid), message="Export cancelled", wait=True
-            )
-            else {"CANCELLED"}
-        )
+        if shutdown_bake_job(
+            str(project.uuid), message="Base update cancelled", wait=True
+        ):
+            return {"FINISHED"}
+        if shutdown_export_job(
+            str(project.uuid), message="Export cancelled", wait=True
+        ):
+            return {"FINISHED"}
+        return {"CANCELLED"}
 
 
 class QUICKSDF_OT_cancel_auto_key(bpy.types.Operator):

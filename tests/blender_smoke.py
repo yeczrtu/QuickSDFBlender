@@ -569,6 +569,88 @@ def run(output_directory: Path) -> None:
         np.testing.assert_array_equal(coverage, before_coverage)
         np.testing.assert_array_equal(display[..., :3][covered], before_display[..., :3][covered])
 
+    print("[Quick SDF smoke] async Rebake is cancellable and transactional")
+    from quick_sdf_blender import operators
+
+    def bake_fingerprint():
+        return tuple(
+            (
+                str(item.uuid),
+                hashlib.sha256(
+                    runtime.image_gray8(runtime.resolve_display_image(project, item)).tobytes()
+                ).hexdigest(),
+                hashlib.sha256(runtime.bitplane_blob(item, "BASE")).hexdigest(),
+                hashlib.sha256(runtime.bitplane_blob(item, "COVERAGE")).hexdigest(),
+            )
+            for item in project.angles
+        )
+
+    before_cancelled_bake = bake_fingerprint()
+    operators._start_bake_job(bpy.context, project)
+    assert operators.shutdown_bake_job(
+        str(project.uuid), message="Smoke Base cancellation", wait=True
+    )
+    assert operators._BAKE_JOB is None
+    assert bake_fingerprint() == before_cancelled_bake
+
+    project.guide_shadow_amount = 42.0
+    before_failed_publish = bake_fingerprint()
+    original_publish_bake_key = operators._publish_async_bake_key
+    published = {"count": 0}
+
+    def fail_second_bake_publish(project_value, job_value, uuid_value):
+        if published["count"] == 1:
+            raise RuntimeError("simulated async Base publish failure")
+        published["count"] += 1
+        return original_publish_bake_key(project_value, job_value, uuid_value)
+
+    operators._publish_async_bake_key = fail_second_bake_publish
+    try:
+        operators._start_bake_job(bpy.context, project)
+        deadline = time.monotonic() + 15.0
+        while operators._BAKE_JOB is not None and time.monotonic() < deadline:
+            delay = operators._poll_bake_job()
+            if delay:
+                time.sleep(min(float(delay), 0.02))
+    finally:
+        operators._publish_async_bake_key = original_publish_bake_key
+    assert operators._BAKE_JOB is None
+    assert published["count"] == 1
+    after_failed_publish = bake_fingerprint()
+    if after_failed_publish != before_failed_publish:
+        for before_item, after_item in zip(before_failed_publish, after_failed_publish):
+            if before_item != after_item:
+                print("[Quick SDF smoke] async rollback mismatch", before_item, after_item)
+    assert after_failed_publish == before_failed_publish
+
+    project.guide_shadow_amount = 41.0
+    protected_before = {
+        item.uuid: (
+            runtime.image_gray8(runtime.resolve_display_image(project, item)).copy(),
+            runtime.coverage_mask(item).copy(),
+        )
+        for item in project.angles
+    }
+    operators._start_bake_job(bpy.context, project)
+    deadline = time.monotonic() + 15.0
+    while operators._BAKE_JOB is not None and time.monotonic() < deadline:
+        delay = operators._poll_bake_job()
+        if delay:
+            time.sleep(min(float(delay), 0.02))
+    assert operators._BAKE_JOB is None, "asynchronous Base update did not settle"
+    if bpy.app.timers.is_registered(operators._poll_bake_job):
+        bpy.app.timers.unregister(operators._poll_bake_job)
+    assert not project.job_running
+    assert project.base_source == "NORMAL_GUIDE"
+    for item in project.angles:
+        before_gray, before_coverage = protected_before[item.uuid]
+        after_gray = runtime.image_gray8(runtime.resolve_display_image(project, item))
+        after_coverage = runtime.coverage_mask(item)
+        np.testing.assert_array_equal(after_coverage, before_coverage)
+        np.testing.assert_array_equal(
+            after_gray[before_coverage], before_gray[before_coverage]
+        )
+
     print("[Quick SDF smoke] preview material is reversible")
     original_material = cube.material_slots[0].material
     original_link = cube.material_slots[0].link
@@ -597,8 +679,6 @@ def run(output_directory: Path) -> None:
     assert project.generated_image is not None
     assert project.generated_image.get(runtime.PROJECT_UUID_KEY) == project.uuid
     assert project.generated_image.get(runtime.ROLE_KEY) == runtime.THRESHOLD_ROLE
-    from quick_sdf_blender import operators
-
     strict_channels = operators._compute_threshold_channels(
         operators._prepare_strict_threshold_inputs(project)
     )

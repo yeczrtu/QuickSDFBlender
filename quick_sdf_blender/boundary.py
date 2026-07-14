@@ -718,10 +718,12 @@ if bpy is not None:
         pending: list[tuple[Any, np.ndarray, str, float]] = []
         for angle_item in getattr(project, "angles", ()):
             image = runtime.resolve_display_image(project, angle_item)
-            if image is None or not getattr(image, "has_data", False):
-                continue
+            if image is None:
+                raise ValueError(
+                    f"Angle {_angle_value(angle_item):g} Display image is missing"
+                )
             width, height = image.size
-            current = runtime.image_rgba(image)
+            current = runtime.image_gray8(image)
             base = runtime.base_mask(angle_item)
             coverage = runtime.coverage_mask(angle_item)
             angle = _angle_value(angle_item)
@@ -736,30 +738,28 @@ if bpy is not None:
                 base,
                 uv_perimeters=perimeters,
             )
-            generated = np.ones_like(current)
-            generated[..., :3] = boundary_mask[..., None]
-            generated[..., 3] = 1.0
-            generated[..., :3][coverage] = current[..., :3][coverage]
+            generated = boundary_mask.astype(np.uint8) * np.uint8(255)
+            generated[coverage] = current[coverage]
             pending.append((image, generated, str(getattr(angle_item, "side", "RIGHT")), angle))
         if not allow_violations and pending:
             from .core import validate_side_monotonic
 
             for side in ("RIGHT", "LEFT"):
                 lane = sorted(
-                    ((angle, rgba) for _image, rgba, item_side, angle in pending if item_side == side),
+                    ((angle, gray) for _image, gray, item_side, angle in pending if item_side == side),
                     key=lambda pair: pair[0],
                 )
                 if lane:
                     report = validate_side_monotonic(
-                        np.stack([rgba[..., 0] >= 0.5 for _angle, rgba in lane]),
-                        np.asarray([angle for angle, _rgba in lane]),
+                        np.stack([gray >= 128 for _angle, gray in lane]),
+                        np.asarray([angle for angle, _gray in lane]),
                     )
                     if not report.is_valid:
                         raise ValueError(
                             f"This boundary changes {report.violation_pixel_count} pixels in the wrong direction"
                         )
-        for image, rgba, _side, _angle in pending:
-            runtime.write_image_rgba(image, rgba)
+        for image, gray, _side, _angle in pending:
+            runtime.write_image_gray8(image, gray)
         return len(pending)
 
 
