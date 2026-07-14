@@ -20,7 +20,7 @@ def tag_editors_for_redraw() -> None:
     manager = getattr(bpy.context, "window_manager", None)
     for window in getattr(manager, "windows", ()):
         for area in window.screen.areas:
-            if area.type in {"VIEW_3D", "IMAGE_EDITOR", "DOPESHEET_EDITOR"}:
+            if area.type in {"VIEW_3D", "IMAGE_EDITOR", "NODE_EDITOR"}:
                 area.tag_redraw()
 
 

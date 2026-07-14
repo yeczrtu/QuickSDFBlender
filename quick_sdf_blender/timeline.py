@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Interactive Quick SDF timeline hosted by a compact Dope Sheet area."""
+"""Interactive Quick SDF timeline hosted by a compact non-temporal area."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ from typing import Any, Sequence
 
 import bpy
 
-from .studio import WORKSPACE_PROJECT_TAG, active_session, resolve_session_project
+from .studio import (
+    TIMELINE_SPACE_TYPE,
+    WORKSPACE_PROJECT_TAG,
+    active_session,
+    resolve_session_project,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +195,7 @@ def _seek_value(project: Any) -> float:
 
 def _draw_timeline() -> None:
     context = bpy.context
-    if getattr(context, "area", None) is None or context.area.type != "DOPESHEET_EDITOR":
+    if getattr(context, "area", None) is None or context.area.type != TIMELINE_SPACE_TYPE:
         return
     project = _project_for_context(context)
     if project is None or context.region is None:
@@ -214,7 +219,7 @@ def _draw_timeline() -> None:
     ) else (0.0, 0.0, 1.0, 1.0)
     try:
         gpu.state.blend_set("ALPHA")
-        _rect(Rect(0.0, 0.0, context.region.width, context.region.height), (0.025, 0.03, 0.04, 0.98))
+        _rect(Rect(0.0, 0.0, context.region.width, context.region.height), (0.025, 0.03, 0.04, 1.0))
         _rect(geometry.rail, (0.18, 0.20, 0.24, 1.0))
         span = max(1.0e-6, geometry.angle_max - geometry.angle_min)
         paint_factor = max(0.0, min(1.0, (paint_angle - geometry.angle_min) / span))
@@ -376,7 +381,7 @@ class QSDF_GT_timeline_capture(bpy.types.Gizmo):
 class QSDF_GGT_timeline(bpy.types.GizmoGroup):
     bl_idname = "QSDF_GGT_timeline"
     bl_label = "Quick SDF Timeline"
-    bl_space_type = "DOPESHEET_EDITOR"
+    bl_space_type = TIMELINE_SPACE_TYPE
     bl_region_type = "WINDOW"
     bl_options = {"PERSISTENT"}
 
@@ -398,21 +403,23 @@ def tag_timeline_redraw() -> None:
     wm = getattr(bpy.context, "window_manager", None)
     for window in getattr(wm, "windows", ()):
         for area in window.screen.areas:
-            if area.type == "DOPESHEET_EDITOR":
+            if area.type == TIMELINE_SPACE_TYPE:
                 area.tag_redraw()
 
 
 def register_timeline() -> None:
     global _DRAW_HANDLE
     if _DRAW_HANDLE is None:
-        _DRAW_HANDLE = bpy.types.SpaceDopeSheetEditor.draw_handler_add(_draw_timeline, (), "WINDOW", "POST_PIXEL")
+        _DRAW_HANDLE = bpy.types.SpaceNodeEditor.draw_handler_add(
+            _draw_timeline, (), "WINDOW", "POST_PIXEL"
+        )
 
 
 def unregister_timeline() -> None:
     global _DRAW_HANDLE, _COLOR_SHADER, _IMAGE_SHADER
     if _DRAW_HANDLE is not None:
         try:
-            bpy.types.SpaceDopeSheetEditor.draw_handler_remove(_DRAW_HANDLE, "WINDOW")
+            bpy.types.SpaceNodeEditor.draw_handler_remove(_DRAW_HANDLE, "WINDOW")
         except (ReferenceError, ValueError):
             pass
         _DRAW_HANDLE = None

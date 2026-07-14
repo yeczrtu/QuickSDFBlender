@@ -200,8 +200,64 @@ def check() -> float | None:
         assert studio.is_studio_active(bpy.context, str(project.uuid))
         assert len(bpy.context.window.screen.areas) == 3
         assert {area.type for area in bpy.context.window.screen.areas} == {
-            "VIEW_3D", "IMAGE_EDITOR", "DOPESHEET_EDITOR"
+            "VIEW_3D", "IMAGE_EDITOR", "NODE_EDITOR"
         }
+        timeline_area = next(
+            area for area in bpy.context.window.screen.areas
+            if area.type == "NODE_EDITOR"
+        )
+        assert timeline_area.spaces.active.show_gizmo
+        if not STATE.get("timeline_seek_started"):
+            from quick_sdf_blender import timeline
+
+            timeline_region = next(
+                region for region in timeline_area.regions if region.type == "WINDOW"
+            )
+            keys = timeline._visible_keys(project)
+            geometry = timeline.build_geometry(
+                timeline_region.width, timeline_region.height, keys
+            )
+            target_angle = 22.5
+            factor = (
+                (target_angle - geometry.angle_min)
+                / (geometry.angle_max - geometry.angle_min)
+            )
+            local_x = geometry.rail.x0 + factor * (
+                geometry.rail.x1 - geometry.rail.x0
+            )
+            local_y = (geometry.rail.y0 + geometry.rail.y1) * 0.5
+            event_x = int(timeline_region.x + local_x)
+            event_y = int(timeline_region.y + local_y)
+            STATE.update(
+                timeline_seek_started=True,
+                timeline_seek_target=target_angle,
+                timeline_paint_uuid=str(runtime.active_angle(project).uuid),
+                timeline_canvas=bpy.context.scene.tool_settings.image_paint.canvas,
+            )
+            window = bpy.context.window
+            window.event_simulate(
+                type="MOUSEMOVE", value="NOTHING", x=event_x, y=event_y
+            )
+            window.event_simulate(
+                type="LEFTMOUSE", value="PRESS", x=event_x, y=event_y
+            )
+            window.event_simulate(
+                type="LEFTMOUSE", value="RELEASE", x=event_x, y=event_y
+            )
+            return 0.1
+        if not STATE.get("timeline_seek_verified"):
+            assert abs(float(project.seek_angle) - STATE["timeline_seek_target"]) < 0.2
+            assert studio.current_session().view_mode == "PREVIEW"
+            assert str(runtime.active_angle(project).uuid) == STATE["timeline_paint_uuid"]
+            assert (
+                bpy.context.scene.tool_settings.image_paint.canvas
+                == STATE["timeline_canvas"]
+            )
+            # The old Dope Sheet host changed this frame and could therefore
+            # move an animated pose or mark the normal guide stale.
+            assert bpy.context.scene.frame_current == 96
+            assert bpy.ops.quicksdf.back_to_paint() == {"FINISHED"}
+            STATE["timeline_seek_verified"] = True
         assert obj.mode == "TEXTURE_PAINT"
         assert float(runtime.active_angle(project).angle) == 45.0
         assert str(project.base_source) == "NORMAL_GUIDE"
@@ -383,6 +439,7 @@ def run() -> None:
         original_material = obj.material_slots[0].material
         bpy.context.scene.quick_sdf_settings.resolution = 512
         bpy.context.scene.quick_sdf_settings.initialization = "NORMAL_SWEEP"
+        bpy.context.scene.frame_set(96)
         bpy.context.scene.tool_settings.image_paint.use_normal_falloff = True
         for area in bpy.context.window.screen.areas:
             if area.type == "VIEW_3D":

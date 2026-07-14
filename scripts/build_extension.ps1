@@ -91,7 +91,8 @@ try {
     if (Test-Path -LiteralPath $studioResult) {
         Remove-Item -Force -LiteralPath $studioResult
     }
-    & $BlenderPath --factory-startup --python-exit-code 1 --python $studioSmokeTest
+    & $BlenderPath --enable-event-simulate --factory-startup --python-exit-code 1 `
+        --python $studioSmokeTest
     if ($LASTEXITCODE -ne 0) {
         throw "Blender Studio smoke test failed with exit code $LASTEXITCODE"
     }

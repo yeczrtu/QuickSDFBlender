@@ -157,8 +157,8 @@ def register_tools() -> None:
         addon = getattr(keyconfig, "addon", None)
         if addon is not None:
             keymap = addon.keymaps.new(
-                name="Dopesheet",
-                space_type="DOPESHEET_EDITOR",
+                name="Node Editor",
+                space_type="NODE_EDITOR",
                 region_type="WINDOW",
             )
             for operator, shift in (

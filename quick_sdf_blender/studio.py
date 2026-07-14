@@ -19,9 +19,10 @@ from bpy.app.handlers import persistent
 
 WORKSPACE_PROJECT_TAG = "quick_sdf_studio_project_uuid"
 WORKSPACE_VERSION_TAG = "quick_sdf_studio_layout_version"
-WORKSPACE_LAYOUT_VERSION = 1
+WORKSPACE_LAYOUT_VERSION = 2
 WORKSPACE_BASENAME = "Quick SDF Studio"
 TIMELINE_HEIGHT = 104
+TIMELINE_SPACE_TYPE = "NODE_EDITOR"
 
 
 class StudioError(RuntimeError):
@@ -599,7 +600,7 @@ def studio_areas(window: Any) -> tuple[Any | None, Any | None, Any | None]:
     areas = getattr(screen, "areas", ()) if screen else ()
     view = next((area for area in areas if area.type == "VIEW_3D"), None)
     image = next((area for area in areas if area.type == "IMAGE_EDITOR"), None)
-    timeline = next((area for area in areas if area.type == "DOPESHEET_EDITOR"), None)
+    timeline = next((area for area in areas if area.type == TIMELINE_SPACE_TYPE), None)
     return view, image, timeline
 
 
@@ -618,14 +619,18 @@ def _valid_studio_layout(workspace: Any) -> bool:
         for kind in ("VIEW_3D",)
     ) and any(
         any(area.type == "IMAGE_EDITOR" for area in screen.areas)
-        and any(area.type == "DOPESHEET_EDITOR" for area in screen.areas)
+        and any(area.type == TIMELINE_SPACE_TYPE for area in screen.areas)
         for screen in workspace.screens
     )
 
 
 def find_studio_workspace(project_uuid: str) -> Any | None:
     for workspace in bpy.data.workspaces:
-        if workspace.get(WORKSPACE_PROJECT_TAG) == project_uuid and _valid_studio_layout(workspace):
+        if (
+            workspace.get(WORKSPACE_PROJECT_TAG) == project_uuid
+            and int(workspace.get(WORKSPACE_VERSION_TAG, 0)) == WORKSPACE_LAYOUT_VERSION
+            and _valid_studio_layout(workspace)
+        ):
             return workspace
     return None
 
@@ -719,7 +724,11 @@ def configure_workspace(context: Any, window: Any) -> tuple[Any, Any, Any]:
     image_area, view_area = top_areas
     image_area.type = "IMAGE_EDITOR"
     view_area.type = "VIEW_3D"
-    bottom.type = "DOPESHEET_EDITOR"
+    # A Dope Sheet exposes Blender's native frame playhead even with all of
+    # its regions hidden.  That cursor looks like the Quick SDF angle seek,
+    # changes the animated pose, and can mark the normal guide stale.  A Node
+    # Editor gives the custom timeline a non-temporal host with no playhead.
+    bottom.type = TIMELINE_SPACE_TYPE
 
     image_space = image_area.spaces.active
     if hasattr(image_space, "ui_mode"):
@@ -732,7 +741,16 @@ def configure_workspace(context: Any, window: Any) -> tuple[Any, Any, Any]:
         if hasattr(space, "show_region_header"):
             space.show_region_header = True
     timeline_space = bottom.spaces.active
-    for name in ("show_region_header", "show_region_footer", "show_region_channels", "show_region_ui"):
+    if hasattr(timeline_space, "tree_type"):
+        timeline_space.tree_type = "ShaderNodeTree"
+    if hasattr(timeline_space, "show_gizmo"):
+        timeline_space.show_gizmo = True
+    if hasattr(timeline_space, "show_gizmo_active_node"):
+        timeline_space.show_gizmo_active_node = False
+    for name in (
+        "show_region_header", "show_region_footer", "show_region_toolbar",
+        "show_region_tool_header", "show_region_ui",
+    ):
         if hasattr(timeline_space, name):
             setattr(timeline_space, name, False)
     return view_area, image_area, bottom
@@ -963,7 +981,7 @@ def _configure_area_types(window: Any) -> tuple[Any, Any, Any]:
     image_area, view_area = top_areas
     image_area.type = "IMAGE_EDITOR"
     view_area.type = "VIEW_3D"
-    bottom.type = "DOPESHEET_EDITOR"
+    bottom.type = TIMELINE_SPACE_TYPE
     image_space = image_area.spaces.active
     if hasattr(image_space, "ui_mode"):
         image_space.ui_mode = "PAINT"
@@ -978,7 +996,16 @@ def _configure_area_types(window: Any) -> tuple[Any, Any, Any]:
     if hasattr(view_space, "shading"):
         view_space.shading.type = "MATERIAL"
     timeline_space = bottom.spaces.active
-    for name in ("show_region_header", "show_region_footer", "show_region_channels", "show_region_ui"):
+    if hasattr(timeline_space, "tree_type"):
+        timeline_space.tree_type = "ShaderNodeTree"
+    if hasattr(timeline_space, "show_gizmo"):
+        timeline_space.show_gizmo = True
+    if hasattr(timeline_space, "show_gizmo_active_node"):
+        timeline_space.show_gizmo_active_node = False
+    for name in (
+        "show_region_header", "show_region_footer", "show_region_toolbar",
+        "show_region_tool_header", "show_region_ui",
+    ):
         if hasattr(timeline_space, name):
             setattr(timeline_space, name, False)
     return view_area, image_area, bottom
@@ -1565,7 +1592,7 @@ def tag_studio_redraw() -> None:
     wm = getattr(bpy.context, "window_manager", None)
     for window in getattr(wm, "windows", ()):
         for area in window.screen.areas:
-            if area.type in {"VIEW_3D", "IMAGE_EDITOR", "DOPESHEET_EDITOR"}:
+            if area.type in {"VIEW_3D", "IMAGE_EDITOR", TIMELINE_SPACE_TYPE}:
                 area.tag_redraw()
 
 
@@ -1720,6 +1747,7 @@ __all__ = [
     "back_to_paint", "dismiss_first_stroke_hint", "ensure_studio_material_preview",
     "enter_studio", "exit_studio", "open_or_switch_studio",
     "find_studio_workspace", "is_studio_active", "leave_export_adjustment_review",
+    "TIMELINE_SPACE_TYPE",
     "reconcile_view_state", "register_studio", "show_export_adjustment_review",
     "prepare_stroke_brush", "resolve_session_project", "restore_stroke_brush", "seek_preview",
     "select_paint_key", "set_projection_hint", "studio_areas", "tag_studio_redraw",

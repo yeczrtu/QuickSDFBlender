@@ -668,7 +668,7 @@ def _tick() -> float | None:
 
             # Create one final deterministic history entry, then send the
             # actual Ctrl+Z key event with the pointer over the full-width
-            # timeline. A direct operator call cannot prove that the Dopesheet
+            # timeline. A direct operator call cannot prove that the timeline
             # keymap prevents Blender's global Undo from removing the session.
             runtime.write_image_rgba(canvas, before_first)
             timeline_before = runtime.image_rgba8(canvas)
@@ -690,7 +690,7 @@ def _tick() -> float | None:
             timeline_area = next(
                 area
                 for area in bpy.context.window.screen.areas
-                if area.type == "DOPESHEET_EDITOR"
+                if area.type == "NODE_EDITOR"
             )
             timeline_region = next(
                 region for region in timeline_area.regions if region.type == "WINDOW"
