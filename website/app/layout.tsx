@@ -43,6 +43,9 @@ export const metadata: Metadata = {
     "Face Threshold Map",
     "SDF interpolation",
   ],
+  icons: {
+    icon: [{ url: `${basePath}/favicon.svg`, type: "image/svg+xml", sizes: "48x48" }],
+  },
   alternates: { canonical: siteUrl },
   openGraph: {
     title: "Quick SDF Paint | 顔影スレッショルドマップ作成",
