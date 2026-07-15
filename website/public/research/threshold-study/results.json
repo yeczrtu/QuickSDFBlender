@@ -24,28 +24,32 @@
           "worstPixelErrorPercent": 6.25,
           "meanIoU": 0.9141202225029613,
           "temporalChangeStdDevPercent": 3.3292505197048863,
-          "peakOneDegreeChangePercent": 13.4765625
+          "peakOneDegreeChangePercent": 13.4765625,
+          "meanTransitionAngleErrorDegrees": 3.753679973323171
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 3.362008426966292,
           "worstPixelErrorPercent": 6.25,
           "meanIoU": 0.9141202225029613,
           "temporalChangeStdDevPercent": 3.3292505197048863,
-          "peakOneDegreeChangePercent": 13.4765625
+          "peakOneDegreeChangePercent": 13.4765625,
+          "meanTransitionAngleErrorDegrees": 3.753679973323171
         },
         "blurredCumulative": {
           "meanPixelErrorPercent": 6.730600421348315,
           "worstPixelErrorPercent": 11.9140625,
           "meanIoU": 0.8248150578712068,
-          "temporalChangeStdDevPercent": 2.5467483684341303,
-          "peakOneDegreeChangePercent": 10.546875
+          "temporalChangeStdDevPercent": 2.615585497585096,
+          "peakOneDegreeChangePercent": 11.9140625,
+          "meanTransitionAngleErrorDegrees": 7.422525325926339
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.061446629213483143,
           "worstPixelErrorPercent": 0.1953125,
           "meanIoU": 0.9980795743009214,
           "temporalChangeStdDevPercent": 0.09705156152342845,
-          "peakOneDegreeChangePercent": 0.9765625
+          "peakOneDegreeChangePercent": 0.9765625,
+          "meanTransitionAngleErrorDegrees": 0.07134894210640796
         }
       }
     },
@@ -57,28 +61,32 @@
           "worstPixelErrorPercent": 11.872100830078125,
           "meanIoU": 0.8712797917983969,
           "temporalChangeStdDevPercent": 4.038138949000077,
-          "peakOneDegreeChangePercent": 21.596527099609375
+          "peakOneDegreeChangePercent": 21.596527099609375,
+          "meanTransitionAngleErrorDegrees": 3.816439977870636
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 3.952197814255618,
           "worstPixelErrorPercent": 11.872100830078125,
           "meanIoU": 0.8712797917983969,
           "temporalChangeStdDevPercent": 4.038138949000077,
-          "peakOneDegreeChangePercent": 21.596527099609375
+          "peakOneDegreeChangePercent": 21.596527099609375,
+          "meanTransitionAngleErrorDegrees": 3.816439977870636
         },
         "blurredCumulative": {
           "meanPixelErrorPercent": 8.26587462693118,
           "worstPixelErrorPercent": 20.418548583984375,
           "meanIoU": 0.7472247095176534,
-          "temporalChangeStdDevPercent": 2.788684709320402,
-          "peakOneDegreeChangePercent": 18.4600830078125
+          "temporalChangeStdDevPercent": 2.8101141270260888,
+          "peakOneDegreeChangePercent": 18.4600830078125,
+          "meanTransitionAngleErrorDegrees": 7.814240203244961
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.7095508361130618,
           "worstPixelErrorPercent": 3.7628173828125,
           "meanIoU": 0.9576282600863446,
           "temporalChangeStdDevPercent": 0.35150069511846627,
-          "peakOneDegreeChangePercent": 1.8218994140625
+          "peakOneDegreeChangePercent": 1.8218994140625,
+          "meanTransitionAngleErrorDegrees": 0.6906610974999792
         }
       }
     },
@@ -90,28 +98,32 @@
           "worstPixelErrorPercent": 8.2244873046875,
           "meanIoU": 0.8911540170973755,
           "temporalChangeStdDevPercent": 3.840368983341621,
-          "peakOneDegreeChangePercent": 17.205810546875
+          "peakOneDegreeChangePercent": 17.205810546875,
+          "meanTransitionAngleErrorDegrees": 3.724649166131475
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 3.829398851716117,
           "worstPixelErrorPercent": 8.2244873046875,
           "meanIoU": 0.8911540170973755,
           "temporalChangeStdDevPercent": 3.840368983341621,
-          "peakOneDegreeChangePercent": 17.205810546875
+          "peakOneDegreeChangePercent": 17.205810546875,
+          "meanTransitionAngleErrorDegrees": 3.724649166131475
         },
         "blurredCumulative": {
           "meanPixelErrorPercent": 7.779950774117802,
           "worstPixelErrorPercent": 10.250091552734375,
           "meanIoU": 0.7663006062709891,
-          "temporalChangeStdDevPercent": 0.8360846110305232,
-          "peakOneDegreeChangePercent": 5.34820556640625
+          "temporalChangeStdDevPercent": 0.9816114734454954,
+          "peakOneDegreeChangePercent": 7.558441162109375,
+          "meanTransitionAngleErrorDegrees": 7.339804544178453
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.9635625260599544,
           "worstPixelErrorPercent": 4.920196533203125,
           "meanIoU": 0.9751297685786945,
           "temporalChangeStdDevPercent": 0.4997118785490852,
-          "peakOneDegreeChangePercent": 4.1690826416015625
+          "peakOneDegreeChangePercent": 4.1690826416015625,
+          "meanTransitionAngleErrorDegrees": 0.9334254212648355
         }
       }
     },
@@ -123,28 +135,32 @@
           "worstPixelErrorPercent": 8.571624755859375,
           "meanIoU": 0.7773108692963236,
           "temporalChangeStdDevPercent": 3.309439537923627,
-          "peakOneDegreeChangePercent": 18.11981201171875
+          "peakOneDegreeChangePercent": 18.11981201171875,
+          "meanTransitionAngleErrorDegrees": 3.742838904513264
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 2.902718876185042,
           "worstPixelErrorPercent": 8.571624755859375,
           "meanIoU": 0.7773108692963236,
           "temporalChangeStdDevPercent": 3.309439537923627,
-          "peakOneDegreeChangePercent": 18.11981201171875
+          "peakOneDegreeChangePercent": 18.11981201171875,
+          "meanTransitionAngleErrorDegrees": 3.742838904513264
         },
         "blurredCumulative": {
           "meanPixelErrorPercent": 5.507548471515098,
           "worstPixelErrorPercent": 13.76800537109375,
           "meanIoU": 0.597045133787401,
-          "temporalChangeStdDevPercent": 1.9206237711402723,
-          "peakOneDegreeChangePercent": 10.710906982421875
+          "temporalChangeStdDevPercent": 2.1981497528188747,
+          "peakOneDegreeChangePercent": 14.965057373046875,
+          "meanTransitionAngleErrorDegrees": 7.190941619396164
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.17631616485252807,
           "worstPixelErrorPercent": 1.068115234375,
           "meanIoU": 0.9163642382015157,
           "temporalChangeStdDevPercent": 0.44326977447587634,
-          "peakOneDegreeChangePercent": 1.31988525390625
+          "peakOneDegreeChangePercent": 1.31988525390625,
+          "meanTransitionAngleErrorDegrees": 0.24599113558679067
         }
       }
     },
@@ -156,28 +172,32 @@
           "worstPixelErrorPercent": 8.071136474609375,
           "meanIoU": 0.8486692967564453,
           "temporalChangeStdDevPercent": 3.363464305258663,
-          "peakOneDegreeChangePercent": 16.57867431640625
+          "peakOneDegreeChangePercent": 16.57867431640625,
+          "meanTransitionAngleErrorDegrees": 3.736240506549301
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 3.2727959450711026,
           "worstPixelErrorPercent": 8.071136474609375,
           "meanIoU": 0.8486692967564453,
           "temporalChangeStdDevPercent": 3.363464305258663,
-          "peakOneDegreeChangePercent": 16.57867431640625
+          "peakOneDegreeChangePercent": 16.57867431640625,
+          "meanTransitionAngleErrorDegrees": 3.736240506549301
         },
         "blurredCumulative": {
           "meanPixelErrorPercent": 6.39042372114203,
           "worstPixelErrorPercent": 13.836669921875,
           "meanIoU": 0.7062596384692634,
-          "temporalChangeStdDevPercent": 2.4368136937548375,
-          "peakOneDegreeChangePercent": 12.366485595703125
+          "temporalChangeStdDevPercent": 2.5305299660976033,
+          "peakOneDegreeChangePercent": 12.366485595703125,
+          "meanTransitionAngleErrorDegrees": 7.308445221473656
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.07061904735779494,
           "worstPixelErrorPercent": 0.351715087890625,
           "meanIoU": 0.9965887456184102,
           "temporalChangeStdDevPercent": 0.23009039646965196,
-          "peakOneDegreeChangePercent": 1.226806640625
+          "peakOneDegreeChangePercent": 1.226806640625,
+          "meanTransitionAngleErrorDegrees": 0.08277446420539798
         }
       }
     },
@@ -189,28 +209,32 @@
           "worstPixelErrorPercent": 3.363800048828125,
           "meanIoU": 0.8194038010768157,
           "temporalChangeStdDevPercent": 1.328986139962616,
-          "peakOneDegreeChangePercent": 7.098388671875
+          "peakOneDegreeChangePercent": 7.098388671875,
+          "meanTransitionAngleErrorDegrees": 3.8114005547814958
         },
         "pixelLinear": {
           "meanPixelErrorPercent": 1.250543487205934,
           "worstPixelErrorPercent": 3.363800048828125,
           "meanIoU": 0.8194038010768157,
           "temporalChangeStdDevPercent": 1.328986139962616,
-          "peakOneDegreeChangePercent": 7.098388671875
+          "peakOneDegreeChangePercent": 7.098388671875,
+          "meanTransitionAngleErrorDegrees": 3.8114005547814958
         },
         "blurredCumulative": {
-          "meanPixelErrorPercent": 2.3791538195663624,
-          "worstPixelErrorPercent": 4.25567626953125,
-          "meanIoU": 0.6909618919671033,
-          "temporalChangeStdDevPercent": 0.24900574636885275,
-          "peakOneDegreeChangePercent": 1.416778564453125
+          "meanPixelErrorPercent": 2.3087405086903092,
+          "worstPixelErrorPercent": 4.051971435546875,
+          "meanIoU": 0.6934648958498666,
+          "temporalChangeStdDevPercent": 0.35447883374845524,
+          "peakOneDegreeChangePercent": 2.49481201171875,
+          "meanTransitionAngleErrorDegrees": 7.064219114933728
         },
         "sdfDistanceRatio": {
           "meanPixelErrorPercent": 0.28914976655767205,
           "worstPixelErrorPercent": 1.111602783203125,
           "meanIoU": 0.918911641233686,
           "temporalChangeStdDevPercent": 0.24757187134707728,
-          "peakOneDegreeChangePercent": 1.111602783203125
+          "peakOneDegreeChangePercent": 1.111602783203125,
+          "meanTransitionAngleErrorDegrees": 0.7876594242853968
         }
       }
     }
@@ -221,28 +245,32 @@
       "worstPixelErrorPercent": 11.872100830078125,
       "meanIoU": 0.8536563330880531,
       "temporalChangeStdDevPercent": 3.201608072531915,
-      "peakOneDegreeChangePercent": 21.596527099609375
+      "peakOneDegreeChangePercent": 21.596527099609375,
+      "meanTransitionAngleErrorDegrees": 3.7642081805282235
     },
     "pixelLinear": {
       "meanPixelErrorPercent": 3.094943900233351,
       "worstPixelErrorPercent": 11.872100830078125,
       "meanIoU": 0.8536563330880531,
       "temporalChangeStdDevPercent": 3.201608072531915,
-      "peakOneDegreeChangePercent": 21.596527099609375
+      "peakOneDegreeChangePercent": 21.596527099609375,
+      "meanTransitionAngleErrorDegrees": 3.7642081805282235
     },
     "blurredCumulative": {
-      "meanPixelErrorPercent": 6.175591972436798,
+      "meanPixelErrorPercent": 6.163856420624121,
       "worstPixelErrorPercent": 20.418548583984375,
-      "meanIoU": 0.722101172980603,
-      "temporalChangeStdDevPercent": 1.7963268166748365,
-      "peakOneDegreeChangePercent": 18.4600830078125
+      "meanIoU": 0.7225183402943968,
+      "temporalChangeStdDevPercent": 1.915078275120269,
+      "peakOneDegreeChangePercent": 18.4600830078125,
+      "meanTransitionAngleErrorDegrees": 7.356696004858883
     },
     "sdfDistanceRatio": {
       "meanPixelErrorPercent": 0.3784408283590824,
       "worstPixelErrorPercent": 4.920196533203125,
       "meanIoU": 0.9604503713365954,
       "temporalChangeStdDevPercent": 0.31153269624726426,
-      "peakOneDegreeChangePercent": 4.1690826416015625
+      "peakOneDegreeChangePercent": 4.1690826416015625,
+      "meanTransitionAngleErrorDegrees": 0.46864341415813465
     }
   },
   "quantization": {
