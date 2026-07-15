@@ -5,7 +5,8 @@ import { useEffect, useState } from "react";
 type Language = "ja" | "en";
 type LegendItem = readonly [string, string];
 
-const media = "/QuickSDFBlender/media/";
+const basePath = "/QuickSDFBlender";
+const media = `${basePath}/media/`;
 
 const copy = {
   ja: {
@@ -21,6 +22,7 @@ const copy = {
       ["影の変化を確認", "#step-4"],
       ["書き出し", "#step-5"],
       ["困ったとき", "#help"],
+      ["解説記事", `${basePath}/articles/`],
     ],
     download: "Windows x64版をダウンロード",
     github: "GitHub",
@@ -60,6 +62,9 @@ const copy = {
       ["1回のペイント", "選択中の角度へ反映され、0.5境界を越えた画素はLightなら90°側、Shadowなら0°側へ反映されます。"],
       ["書き出し", "8枚のつながりは自動で整えられます。塗った画像そのものは変更されません。"],
     ],
+    articlesTitle: "仕組みから理解する",
+    articlesLead: "顔影スレッショルドマップの全体像、SDF距離補間の比較実験、Blenderで影を直す判断基準を3本の記事にまとめました。",
+    articlesLink: "解説記事を読む",
     installTitle: "インストール",
     installLead: "ダウンロードしたZIPは展開せず、そのままBlenderへインストールします。",
     installSteps: [
@@ -212,7 +217,7 @@ const copy = {
     navLabel: "Page navigation",
     languageLabel: "Display language",
     openFullSize: "Open image at full size",
-    nav: [["Install", "#install"], ["Workflow", "#workflow"], ["Preview the Sweep", "#step-4"], ["Export", "#step-5"], ["Troubleshooting", "#help"]],
+    nav: [["Install", "#install"], ["Workflow", "#workflow"], ["Preview the Sweep", "#step-4"], ["Export", "#step-5"], ["Troubleshooting", "#help"], ["Articles (JA)", `${basePath}/articles/`]],
     download: "Download for Windows x64",
     github: "GitHub",
     guideTitle: "Create face-shadow threshold maps for toon rendering",
@@ -246,6 +251,9 @@ const copy = {
     creditFooter: "Kipfel ©もち山金魚",
     basicsTitle: "Basic controls",
     basics: [["Light / Shadow", "Light paints white; Shadow paints black."], ["0° → 90°", "This is not the light’s physical angle. The lit area grows from Light Starts at 0°, through the Side reference at 45°, to Full Light at 90°."], ["One stroke", "The stroke is applied at the selected angle. Pixels crossing the 0.5 boundary are carried toward 90° for Light or toward 0° for Shadow."], ["Export", "Quick SDF fixes continuity across all eight guides without changing the images you painted."]],
+    articlesTitle: "Understand the method",
+    articlesLead: "Three Japanese articles cover the data model, a reproducible SDF interpolation comparison, and practical decisions when refining face shadows in Blender.",
+    articlesLink: "Read the articles (Japanese)",
     installTitle: "Installation",
     installLead: "Install the downloaded ZIP directly in Blender without extracting it.",
     installSteps: ["Download the Windows x64 ZIP from GitHub Releases.", "In Blender, open Edit → Preferences → Get Extensions.", "Open the top-right menu and choose Install from Disk.", "Select the ZIP. After installation, press N in the 3D Viewport to find the Quick SDF tab."],
@@ -413,6 +421,11 @@ export default function Home() {
         <section className="basics-section page-shell" aria-labelledby="basics-title">
           <h2 id="basics-title">{t.basicsTitle}</h2>
           <dl>{t.basics.map(([term, description]) => <div key={term}><dt>{term}</dt><dd>{description}</dd></div>)}</dl>
+        </section>
+
+        <section className="home-articles page-shell" aria-labelledby="home-articles-title">
+          <div><h2 id="home-articles-title">{t.articlesTitle}</h2><p>{t.articlesLead}</p></div>
+          <a href={`${basePath}/articles/`}>{t.articlesLink}<span aria-hidden="true">→</span></a>
         </section>
 
         <section className="manual-section install-section" id="install">
