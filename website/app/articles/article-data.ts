@@ -49,10 +49,10 @@ export const articles: readonly ArticleRecord[] = [
   },
   {
     slug: "blender-threshold-map-workflow",
-    title: "Blenderで顔影スレッショルドマップを作る — 法線ガイドを直す実践ワークフロー",
-    shortTitle: "Blenderで作る実践ワークフロー",
+    title: "Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る — Blender実践ワークフロー",
+    shortTitle: "Quick SDF Paint 0.7.1実践ワークフロー",
     description:
-      "法線から作った影ガイドを、鼻、頬、口元、角度間の動きという順で修正する実践手順。UV、正面軸、ミラー、書き出しの失敗も切り分けます。",
+      "Quick SDF Paint 0.7.1で法線から作った影ガイドを修正し、16-bit顔影スレッショルドマップを書き出す手順。UV、正面軸、ミラーの問題も切り分けます。",
     audience: "Blenderを使うアーティスト",
     readingTime: "約18分",
     category: "Blender実践",

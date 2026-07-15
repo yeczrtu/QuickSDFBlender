@@ -1,12 +1,20 @@
 import type { Metadata } from "next";
 import {
+  ArticleFigure,
   ArticleLayout,
   EvidenceNote,
   SourceList,
 } from "../article-layout";
-import { absoluteArticleUrl, getArticle, siteOrigin } from "../article-data";
+import {
+  absoluteArticleUrl,
+  articlePath,
+  basePath,
+  getArticle,
+  siteOrigin,
+} from "../article-data";
 
 const article = getArticle("face-shadow-threshold-map");
+const research = `${basePath}/research/threshold-study/`;
 
 export const metadata: Metadata = {
   title: `${article.title} | Quick SDF Paint`,
@@ -65,9 +73,13 @@ export default function FaceShadowThresholdMapArticle() {
       <p>これは法線計算が誤っているという話ではありません。法線が答えるのは「この立体へ光を当てた結果」であり、顔影スレッショルドマップが答えるのは「この光方向で見せたい図形」です。</p>
 
       <h2 id="stored-value">保存するのは「影の濃さ」ではなく「切替角」</h2>
-      <p>顔のUV上に画素A、B、Cがあり、光を横から正面へ動かす場面を考えます。Aは早くLightになり、Bは途中で、Cは正面近くまでShadowに残るとします。完成テクスチャには、その三つの切替時点をそれぞれ異なる値として保存します。</p>
-      <pre><code>{`Light = currentLightAngle >= thresholdMap(UV)`}</code></pre>
+      <p>ここでは三つの値を区別します。<code>φ</code>は頭部に対する実際のライト方向、<code>t</code>は制作で定めたLight StartsからFull Lightまでの進行度、<code>u(p)</code>はUV画素<code>p</code>がLightへ切り替わる正規化位置です。画面に表示する0～90度は<code>t</code>を操作しやすくした制作上の目盛りで、物理的なライト角<code>φ</code>そのものではありません。</p>
+      <p>顔のUV上に画素A、B、Cがあり、<code>t</code>を0から1へ進める場面を考えます。Aは早くLightになり、Bは途中で、CはFull Light近くまでShadowに残るとします。完成テクスチャには、その三つの切替位置<code>u(A)</code>、<code>u(B)</code>、<code>u(C)</code>を保存します。</p>
+      <pre><code>{`t = normalize(φ; Light Starts, Full Light)\nLight(t, p) = [ t >= u(p) ]`}</code></pre>
       <p>実装によって白黒、比較方向、0と1の意味は反転します。しかし本質は、各画素が光角度上の境界を一つ持つことです。中間のグレーは「半分だけ明るい画素」ではなく、「この角度で状態が切り替わる画素」を意味します。影色、境界のぼかし、影の濃さは、その判定結果へシェーダー側で別に適用できます。</p>
+      <p>Quick SDF Paint 0.7.1のlilToon向け既定出力では、正規化切替位置を反転して16-bit値へ量子化します。</p>
+      <pre><code>{`q_lilToon(p) = round((1 - u(p)) × 65535)`}</code></pre>
+      <p>この反転を知らずに<code>u</code>として直接比較すると明暗の進行が逆になります。出力先ごとにチャンネル、反転、比較方向を確認してください。</p>
       <p>一般的なShadow Mapとも役割が異なります。Shadow Mapはライトから見た奥行きで、そのフレームにおける幾何学的な遮蔽を判定します。顔影スレッショルドマップはUVへ固定した制作データで、髪や手が顔を遮ったかどうかは見ていません。実際のシェーダーでは、顔の主要な明暗境界、リアルタイム影、AO、固定マスクを重ねて使えます。</p>
 
       <h2 id="four-stages">制作から表示までを4段階で捉える</h2>
@@ -77,6 +89,13 @@ export default function FaceShadowThresholdMapArticle() {
         <div role="listitem"><span>03 Encoding</span><strong>画素ごとの切替角へ圧縮</strong></div>
         <div role="listitem"><span>04 Evaluation</span><strong>現在の光角度と比較</strong></div>
       </div>
+      <ArticleFigure
+        src={`${research}threshold-map-overview-card.png`}
+        alt="角度別の二値マスクから画素ごとの切替値を作り、任意の進行度で顔影を再構成する流れ"
+        caption="角度別マスクは制作入力、中央のグレースケールは切替位置、右側は任意の進行度から再構成した二値影。SDF距離場は入力と切替値の間だけで使う。"
+        width={1200}
+        height={630}
+      />
 
       <h3>1. Authoring：代表角度で望む影を決める</h3>
       <p>顔に対するライトの代表角度をいくつか選び、各角度でLightにしたい領域を白、Shadowにしたい領域を黒として定義します。法線から下描きを作っても、最初から手描きしても構いません。大切なのは、自動計算を完成結果とせず、アーティストが輪郭を直接修正できることです。</p>
@@ -87,14 +106,15 @@ export default function FaceShadowThresholdMapArticle() {
       <p>SDFを使う方法では、各マスクについて境界までの距離を求めます。隣接する二つの境界からの距離比によって、その画素が区間内のどこで切り替わるかを推定します。<a href="https://nagakagachi.hatenablog.com/entry/2024/03/02/140704">SDF Based Transition Blending for Shadow Threshold Map</a>と<a href="https://github.com/akasaki1211/sdf_shadow_threshold_map">公開ツール実装</a>で、この考え方を確認できます。</p>
       <pre><code>{`transition = distanceFromA / (distanceFromA + distanceFromB)`}</code></pre>
       <p>SDFは有効な補間方法ですが、このデータ表現の必須条件ではありません。入力が単純なら累積マスクなど別方式でも切替値を作れます。SDFが担当するのは、離れた輪郭の途中位置を距離から求める部分です。</p>
+      <p>距離比の式、4方式の再現可能な比較、トポロジー変化での限界は、<a href={articlePath("sdf-threshold-interpolation")}>SDF距離補間の比較検証</a>で詳しく扱います。</p>
 
       <h3>3. Encoding：状態列を一つの値へ圧縮する</h3>
-      <p>角度別マスクを<code>M(u, v, θ)</code>とします。ある画素が角度の進行中に一度だけShadowからLightへ変わるなら、その履歴は一つの切替角<code>T(u, v)</code>で表せます。</p>
-      <pre><code>{`M(u, v, θ) = θ >= T(u, v)`}</code></pre>
+      <p>角度別マスクを<code>M(p, t)</code>とします。ある画素が制作上の進行中に一度だけShadowからLightへ変わるなら、その履歴は一つの切替位置<code>u(p)</code>で表せます。</p>
+      <pre><code>{`M(p, t) = [ t >= u(p) ]`}</code></pre>
       <p>複数画像をランタイムへ持ち込まず、「いつ変わるか」だけを一枚に残せるのはこのためです。左右を別チャンネルへ保存する、左右対称ならUVを反転する、といった格納方法はシェーダーごとに異なります。</p>
 
       <h3>4. Evaluation：頭部に対する光方向と比較する</h3>
-      <p>シェーダーはライト方向を頭部のローカル座標へ変換し、顔のForwardとRightを基準に横方向の値を求めます。左右のどちらから光が来るかに応じてチャンネルまたはUV方向を選び、テクスチャ値と比較します。頭部座標を使うことで、キャラクターや頭が回転しても顔に対する相対方向を保てます。</p>
+      <p>シェーダーは実ライト方向<code>φ</code>を頭部のローカル座標へ変換し、顔のForwardとRightを基準に制作進行度<code>t</code>へ写像します。左右のどちらから光が来るかに応じてチャンネルまたはUV方向を選び、テクスチャの<code>u(p)</code>と比較します。頭部座標を使うことで、キャラクターや頭が回転しても顔に対する相対方向を保てます。</p>
 
       <h2 id="comparison">ほかの顔影制御とどう使い分けるか</h2>
       <p>方式の優劣ではなく、アーティストへ何を直接編集させるかが異なります。以下は、複数方式を同じ評価軸へ置いた本記事独自の整理です。</p>
@@ -145,7 +165,7 @@ export default function FaceShadowThresholdMapArticle() {
       <h2 id="decisions">制作前に決める6項目</h2>
       <ol>
         <li><strong>顔の座標系：</strong>Forward、Right、Upを明示する。</li>
-        <li><strong>角度の意味：</strong>0度と90度、値が増える方向、白黒の意味を決める。</li>
+        <li><strong>角度の意味：</strong>実ライト方向<code>φ</code>から制作進行度<code>t</code>への写像、値が増える方向、白黒の意味を決める。</li>
         <li><strong>左右の扱い：</strong>UV反転で共有するか、左右を別データとして持つか決める。</li>
         <li><strong>キー密度：</strong>枚数を均等に増やさず、境界の経路が変わる区間へ置く。</li>
         <li><strong>一方向の変化：</strong>各画素が角度列で一度だけ切り替わる状態を保つ。</li>
@@ -180,6 +200,7 @@ export default function FaceShadowThresholdMapArticle() {
         <li>頭部に対する現在の光角度と比較する</li>
       </ol>
       <p>SDFは2番目を実現する一つの手段です。何でも解決する陰影方式ではなく、主に横方向へ変化する顔影を、アーティストが輪郭として設計するための限定されたデータ表現です。</p>
+      <p>Blender上で法線ガイドを下描きとして使う具体的な修正手順は、<a href={articlePath("blender-threshold-map-workflow")}>Quick SDF Paint 0.7.1の実践ワークフロー</a>へ続きます。</p>
 
       <SourceList>
         <h3>主な参考資料</h3>
