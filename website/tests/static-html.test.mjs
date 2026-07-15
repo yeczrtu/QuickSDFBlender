@@ -70,7 +70,7 @@ test("uses sourced terminology without presenting one spelling as a standard nam
   ]);
   const publicCopy = `${html}\n${page}\n${layout}`;
   const disallowedLightmapAliases = new RegExp(["face\\s+lightmap", "SDF\\s+lightmap"].join("|"), "i");
-  const disallowedStandardClaims = /Face SDF(?: is|とは)(?: the| a)?(?: common| general| standard|一般|標準)/i;
+  const disallowedStandardClaims = /(?:Face\s?SDF|SDF Face Shadow)(?:\s+is|\s*(?:とは|は))[^.。\n]{0,40}(?:common|general|standard|widely used|de facto|一般名称|一般的|標準名称|標準的)/i;
   const deprecatedLabels = new RegExp([
     ["Quick", "SDF", "Studio"].join("\\s+"),
     ["Export", "Face", "Shadow", "Texture"].join("\\s+"),
@@ -84,6 +84,9 @@ test("uses sourced terminology without presenting one spelling as a standard nam
   assert.match(html, /sdf shadow mask/);
   assert.match(html, /Face Shadow Map/);
   assert.match(html, /SDF-based face shadow map/);
+  assert.match(html, /face SDF shadow/);
+  assert.match(html, /SDF Shadow Map/);
+  assert.match(html, /SDF Shadow Texture/);
   assert.match(html, /Shadow Threshold Map/);
   assert.match(html, /Face Threshold Map/);
   assert.match(html, /github\.com\/lilxyzw\/lilToon\/blob\/master\/Assets\/lilToon\/CHANGELOG\.md/);
@@ -91,7 +94,18 @@ test("uses sourced terminology without presenting one spelling as a standard nam
   assert.match(html, /github\.com\/ChiliMilk\/URP_Toon/);
   assert.match(html, /github\.com\/akasaki1211\/sdf_shadow_threshold_map/);
   assert.match(html, /erichu33\.github\.io\/ASPDocs\/en\/articles\/face-shadow-map-creation-and-baking-workflow\.html/);
-  assert.match(html, /github\.com\/nagakagachi\/NagaSdfTextureToolForUE/);
+  assert.match(html, /github\.com\/entropy622\/Unity-URP-Shader-For-Starrail-Characters/);
+  assert.match(html, /github\.com\/natane010\/natane_toon_shader/);
+  assert.match(html, /cgworld\.jp\/article\/202306-hifirush01\.html/);
+  assert.match(page, /SDF Face Shadow[^}\n]+github\.com\/lilxyzw\/lilToon/);
+  assert.match(page, /FaceSDF textures[^}\n]+potatoon\.dev\/en\/features\/material-settings/);
+  assert.match(page, /SDF_FaceShadow[^}\n]+github\.com\/ChiliMilk\/URP_Toon/);
+  assert.match(page, /SDF-based face shadow map[^}\n]+erichu33\.github\.io\/ASPDocs/);
+  assert.match(page, /face SDF shadow[^}\n]+github\.com\/entropy622\/Unity-URP-Shader-For-Starrail-Characters/);
+  assert.match(page, /SDF Shadow Map[^}\n]+github\.com\/natane010\/natane_toon_shader/);
+  assert.match(page, /Shadow Threshold Map[^}\n]+github\.com\/akasaki1211\/sdf_shadow_threshold_map/);
+  assert.match(page, /Face Threshold Map[^}\n]+cgworld\.jp\/article\/202306-hifirush01\.html/);
+  assert.match(page, /Face Shadow Map[^}\n]+erichu33\.github\.io\/ASPDocs/);
   assert.doesNotMatch(publicCopy, disallowedStandardClaims);
   assert.doesNotMatch(publicCopy, disallowedLightmapAliases);
   assert.doesNotMatch(publicCopy, deprecatedLabels);

@@ -7,7 +7,7 @@
 - 製品名を`Quick SDF Studio`から`Quick SDF Paint`へ変更しました。
 - 本製品の目的を「トゥーンレンダリング用の顔影スレッショルドマップ作成」と明記しました。
 - SDFは角度別の白黒マスク境界を補間する内部処理であり、最終出力はSDFそのものではなく16-bit RGBAスレッショルドマップであることを明記しました。
-- 公開実装で使われる`SDF Face Shadow`、`Shadow SDF mode`、`Face SDF`、`FaceSDF textures`、`SDF_FaceShadow`、`sdf shadow mask`、`SDF-based face shadow map`と、生成物に使われる`Shadow Threshold Map`、`Face Threshold Map`、`Face Shadow Map`を出典どおりの表記で整理しました。Quick SDF Paintの出力は「顔影スレッショルドマップ」と呼びます。
+- 公開実装で使われる`SDF Face Shadow`、`Shadow SDF mode`、`Face SDF`、`FaceSDF textures`、`SDF_FaceShadow`、`sdf shadow mask`、`SDF-based face shadow map`、`face SDF shadow`、`SDF Shadow Map`、`SDF Shadow Texture`と、生成物に使われる`Shadow Threshold Map`、`Face Threshold Map`、`Face Shadow Map`を出典どおりの表記で整理しました。出典は[READMEの「出力とSDF」](../README.md#出力とsdf)にまとめています。Quick SDF Paintの出力は「顔影スレッショルドマップ」と呼びます。
 
 ## 表示の変更
 
