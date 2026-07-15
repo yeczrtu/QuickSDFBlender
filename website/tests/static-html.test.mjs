@@ -113,6 +113,18 @@ test("uses sourced terminology without presenting one spelling as a standard nam
   assert.match(packageManifest, /"version": "0\.7\.1"/);
 });
 
+test("keeps terminology as a lower-page reference", async () => {
+  const html = await readFile(new URL("../out/index.html", import.meta.url), "utf8");
+  const workflow = html.indexOf('id="workflow"');
+  const help = html.indexOf('id="help"');
+  const terminology = html.indexOf('id="terminology-title"');
+  const reference = html.indexOf("reference-section");
+
+  assert.ok(workflow >= 0 && help > workflow);
+  assert.ok(terminology > help);
+  assert.ok(reference > terminology);
+});
+
 test("keeps lilToon and liltoonUE out of the product definition", async () => {
   const [page, layout] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),

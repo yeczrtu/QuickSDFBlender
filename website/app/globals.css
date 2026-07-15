@@ -250,10 +250,7 @@ h3 {
   font-size: 16px;
 }
 
-.concept-section {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 1fr);
-  gap: 18px;
+.pipeline-section {
   padding-bottom: 72px;
 }
 
@@ -1139,10 +1136,6 @@ h3 {
     padding-top: 72px;
   }
 
-  .concept-section {
-    grid-template-columns: 1fr;
-  }
-
   .basics-section dl,
   .install-steps {
     grid-template-columns: 1fr 1fr;
@@ -1215,7 +1208,7 @@ h3 {
     padding-block: 62px 42px;
   }
 
-  .concept-section {
+  .pipeline-section {
     padding-bottom: 48px;
   }
 
