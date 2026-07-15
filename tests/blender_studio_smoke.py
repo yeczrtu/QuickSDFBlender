@@ -1,4 +1,4 @@
-"""Interactive-window smoke for the Quick SDF Studio workspace transaction."""
+"""Interactive-window smoke for the Quick SDF Paint workspace transaction."""
 
 from __future__ import annotations
 

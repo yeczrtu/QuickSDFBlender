@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Quick SDF Studio is distributed under GPL-3.0-or-later. The following notice
+Quick SDF Paint is distributed under GPL-3.0-or-later. The following notice
 applies to third-party work used by the project.
 
 ## Felzenszwalb-Huttenlocher distance transform

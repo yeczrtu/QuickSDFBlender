@@ -170,7 +170,7 @@ def _check() -> float | None:
             STATE["waits"] = int(STATE.get("waits", 0)) + 1
             if int(STATE["waits"]) <= 200:
                 return 0.05
-            raise AssertionError("Quick SDF Studio did not finish opening")
+            raise AssertionError("Quick SDF Paint did not finish opening")
 
         view_area = next(
             area for area in bpy.context.window.screen.areas if area.type == "VIEW_3D"

@@ -70,7 +70,7 @@ PACKING_SOURCE_ITEMS = (
         "Left Threshold",
         "Face-shadow threshold authored for light from the character's left",
     ),
-    ("SDF_AREA", "SDF Area", "Angle-independent mask selecting face-SDF shading"),
+    ("SDF_AREA", "SDF Area", "Angle-independent mask selecting threshold-map shading"),
     (
         "SHADOW_STRENGTH",
         "Shadow Strength",
@@ -81,7 +81,7 @@ PACKING_SOURCE_ITEMS = (
 )
 
 AUX_MASK_ROLE_ITEMS = (
-    ("SDF_AREA", "SDF Area", "White where face-SDF shading is used"),
+    ("SDF_AREA", "SDF Area", "White where threshold-map shading is used"),
     ("SHADOW_STRENGTH", "Shadow Strength", "White where face shadow is enabled"),
     ("CUSTOM", "Custom", "A user-defined angle-independent mask"),
 )

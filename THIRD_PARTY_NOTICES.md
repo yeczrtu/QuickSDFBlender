@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Quick SDF Studio is distributed under GPL-3.0-or-later. The following notice
+Quick SDF Paint is distributed under GPL-3.0-or-later. The following notice
 applies to third-party work used by the project.
 
 ## Felzenszwalb-Huttenlocher distance transform
@@ -15,11 +15,11 @@ Pedro F. Felzenszwalb and Daniel P. Huttenlocher.
 - Upstream source: https://cs.brown.edu/people/pfelzens/dt/
 - Paper: https://theoryofcomputing.org/articles/v008a019/
 
-Quick SDF's adaptations and modifications are distributed under
+Quick SDF Paint's adaptations and modifications are distributed under
 GPL-3.0-or-later. The complete GPL-3.0-or-later text is included in `LICENSE`.
 
 ## NumPy
 
-Quick SDF uses the NumPy installation provided by Blender 5.1. NumPy is not
-redistributed in the Quick SDF Extension ZIP. NumPy is available under the
+Quick SDF Paint uses the NumPy installation provided by Blender 5.1. NumPy is not
+redistributed in the Quick SDF Paint Extension ZIP. NumPy is available under the
 BSD-3-Clause license: https://numpy.org/doc/stable/license.html

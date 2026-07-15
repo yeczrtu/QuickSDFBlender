@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "quick_sdf_blender"
-version = "0.7.0"
-name = "Quick SDF Studio"
-tagline = "Paint toon face shadows with an artist-first angle timeline"
+version = "0.7.1"
+name = "Quick SDF Paint"
+tagline = "Paint face-shadow threshold maps for toon rendering"
 maintainer = "hoshino"
 type = "add-on"
 tags = ["Paint", "Material"]

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Transient Quick SDF Studio session and workspace management.
+"""Transient Quick SDF Paint session and workspace management.
 
 The persistent project model deliberately does not contain an ``author_active``
 flag.  A Studio session belongs to one Blender window and is valid only for the
@@ -21,7 +21,8 @@ from bpy.app.handlers import persistent
 WORKSPACE_PROJECT_TAG = "quick_sdf_studio_project_uuid"
 WORKSPACE_VERSION_TAG = "quick_sdf_studio_layout_version"
 WORKSPACE_LAYOUT_VERSION = 2
-WORKSPACE_BASENAME = "Quick SDF Studio"
+WORKSPACE_BASENAME = "Quick SDF Paint"
+LEGACY_WORKSPACE_BASENAMES = frozenset({"Quick SDF Studio"})
 TIMELINE_HEIGHT = 104
 TIMELINE_SPACE_TYPE = "NODE_EDITOR"
 PROVISIONAL_DISPLAY_ROLE = "provisional_display"
@@ -304,7 +305,7 @@ def enter_aux_mask_edit(context: Any, project: Any, mask_uuid: str) -> bool:
 
     session = active_session(context)
     if session is None or session.project_uuid != str(getattr(project, "uuid", "")):
-        raise StudioError("Open Quick SDF Studio before editing an additional mask")
+        raise StudioError("Open Quick SDF Paint before editing an additional mask")
     discard_provisional(context, project)
     from . import runtime
 
@@ -583,7 +584,7 @@ def _assign_provisional_canvas(
     window = find_window(session.window_pointer)
     scene = bpy.data.scenes.get(session.scene_name) or getattr(window, "scene", None)
     if scene is None:
-        raise StudioError("The Studio scene disappeared while preparing this angle")
+        raise StudioError("The Quick SDF Paint scene disappeared while preparing this angle")
     scene.tool_settings.image_paint.mode = "IMAGE"
     scene.tool_settings.image_paint.canvas = image
     if window is not None:
@@ -1380,6 +1381,19 @@ def _valid_studio_layout(workspace: Any) -> bool:
     )
 
 
+def _migrate_workspace_name(workspace: Any) -> Any:
+    """Rename a tagged legacy workspace without replacing its data-block."""
+
+    name = str(getattr(workspace, "name", ""))
+    is_legacy = any(
+        name == legacy or name.startswith(f"{legacy}.")
+        for legacy in LEGACY_WORKSPACE_BASENAMES
+    )
+    if is_legacy:
+        workspace.name = WORKSPACE_BASENAME
+    return workspace
+
+
 def find_studio_workspace(project_uuid: str) -> Any | None:
     for workspace in bpy.data.workspaces:
         if (
@@ -1387,7 +1401,7 @@ def find_studio_workspace(project_uuid: str) -> Any | None:
             and int(workspace.get(WORKSPACE_VERSION_TAG, 0)) == WORKSPACE_LAYOUT_VERSION
             and _valid_studio_layout(workspace)
         ):
-            return workspace
+            return _migrate_workspace_name(workspace)
     return None
 
 
@@ -1401,7 +1415,7 @@ def _duplicate_workspace(context: Any, window: Any, project: Any) -> Any:
         None,
     )
     if not _operator_succeeded(result) or workspace is None:
-        raise StudioError("Could not create the Quick SDF Studio workspace")
+        raise StudioError("Could not create the Quick SDF Paint workspace")
     window.workspace = workspace
     workspace.name = WORKSPACE_BASENAME
     workspace[WORKSPACE_PROJECT_TAG] = str(project.uuid)
@@ -1417,7 +1431,9 @@ def _collapse_screen(context: Any, window: Any) -> Any:
     while len(screen.areas) > 1:
         attempts += 1
         if attempts > 32:
-            raise StudioError("Studio layout changes did not settle; try opening Studio again")
+            raise StudioError(
+                "Quick SDF Paint layout changes did not settle; try opening it again"
+            )
         areas = tuple(screen.areas)
         pair = next(
             (
@@ -1434,7 +1450,7 @@ def _collapse_screen(context: Any, window: Any) -> Any:
             None,
         )
         if pair is None:
-            raise StudioError("Could not find rectangular Studio areas to join")
+            raise StudioError("Could not find rectangular Quick SDF Paint areas to join")
         area, target = pair
         region = _window_region(area)
         override = {"window": window, "screen": screen, "area": area}
@@ -1445,7 +1461,7 @@ def _collapse_screen(context: Any, window: Any) -> Any:
         with context.temp_override(**override):
             result = bpy.ops.screen.area_join(source_xy=source_xy, target_xy=target_xy)
         if not _operator_succeeded(result):
-            raise StudioError("Could not normalize the Studio workspace layout")
+            raise StudioError("Could not normalize the Quick SDF Paint workspace layout")
         screen = window.screen
     return screen.areas[0]
 
@@ -1458,7 +1474,7 @@ def _split_area(context: Any, window: Any, area: Any, direction: str, factor: fl
     with context.temp_override(**override):
         result = bpy.ops.screen.area_split(direction=direction, factor=factor)
     if not _operator_succeeded(result):
-        raise StudioError("Could not split the Studio workspace")
+        raise StudioError("Could not split the Quick SDF Paint workspace")
 
 
 def _timeline_host_tree(project_uuid: str) -> Any:
@@ -1556,7 +1572,7 @@ def configure_workspace(context: Any, window: Any) -> tuple[Any, Any, Any]:
     bottom = min(areas, key=lambda area: area.y + area.height * 0.5)
     top_areas = sorted((area for area in areas if area != bottom), key=lambda area: area.x)
     if len(top_areas) != 2:
-        raise StudioError("Studio workspace did not produce the expected three areas")
+        raise StudioError("Quick SDF Paint did not produce the expected three areas")
     image_area, view_area = top_areas
     image_area.type = "IMAGE_EDITOR"
     view_area.type = "VIEW_3D"
@@ -1804,18 +1820,18 @@ def _join_one_area(context: Any, window: Any) -> bool:
             target_xy=(target.x + target.width // 2, target.y + target.height // 2),
         )
     if not _operator_succeeded(result):
-        raise StudioError("Could not normalize the Studio workspace layout")
+        raise StudioError("Could not normalize the Quick SDF Paint workspace layout")
     return len(areas) > 2
 
 
 def _configure_area_types(window: Any) -> tuple[Any, Any, Any]:
     areas = list(window.screen.areas)
     if len(areas) != 3:
-        raise StudioError("Studio workspace did not produce the expected three areas")
+        raise StudioError("Quick SDF Paint did not produce the expected three areas")
     bottom = min(areas, key=lambda area: area.y + area.height * 0.5)
     top_areas = sorted((area for area in areas if area != bottom), key=lambda area: area.x)
     if len(top_areas) != 2:
-        raise StudioError("Studio workspace top row is incomplete")
+        raise StudioError("The Quick SDF Paint workspace top row is incomplete")
     image_area, view_area = top_areas
     image_area.type = "IMAGE_EDITOR"
     view_area.type = "VIEW_3D"
@@ -1903,7 +1919,7 @@ def _rollback_pending(error: BaseException | None = None) -> None:
     _restore_preview(project)
     if project is not None and error is not None:
         try:
-            project.diagnostic_message = f"Could not open Studio: {error}"
+            project.diagnostic_message = f"Could not open Quick SDF Paint: {error}"
         except (AttributeError, ReferenceError):
             pass
     restore_stroke_brush(session=session)
@@ -1939,11 +1955,11 @@ def _continue_enter() -> float | None:
     window = find_window(session.window_pointer)
     project = resolve_session_project(session)
     if window is None or project is None:
-        _rollback_pending(StudioError("The Studio target disappeared while opening"))
+        _rollback_pending(StudioError("The Quick SDF Paint target disappeared while opening"))
         return None
     workspace = bpy.data.workspaces.get(session.workspace_name)
     if workspace is None:
-        _rollback_pending(StudioError("The Studio workspace disappeared while opening"))
+        _rollback_pending(StudioError("The Quick SDF Paint workspace disappeared while opening"))
         return None
     window.workspace = workspace
     context = bpy.context
@@ -2022,7 +2038,7 @@ def _leave_object_mode(context: Any, window: Any, obj: Any | None) -> None:
         return
     view_area = next((area for area in window.screen.areas if area.type == "VIEW_3D"), None)
     if view_area is None:
-        raise StudioError("Quick SDF Studio has no 3D View")
+        raise StudioError("Quick SDF Paint has no 3D View")
     _set_active_object(context, obj)
     _mode_set(context, window, view_area, "OBJECT")
 
@@ -2040,7 +2056,7 @@ def _configure_session_target(
     window = find_window(session.window_pointer)
     workspace = bpy.data.workspaces.get(session.workspace_name)
     if window is None or workspace is None:
-        raise StudioError("The Quick SDF Studio workspace is no longer available")
+        raise StudioError("The Quick SDF Paint workspace is no longer available")
     window.workspace = workspace
     workspace[WORKSPACE_PROJECT_TAG] = str(getattr(project, "uuid", ""))
     workspace[WORKSPACE_VERSION_TAG] = WORKSPACE_LAYOUT_VERSION
@@ -2051,7 +2067,7 @@ def _configure_session_target(
 
     view_area, image_area, _timeline_area = studio_areas(window)
     if view_area is None or image_area is None:
-        raise StudioError("Quick SDF Studio needs both a 3D View and an Image Editor")
+        raise StudioError("Quick SDF Paint needs both a 3D View and an Image Editor")
     _set_active_object(context, obj)
     scene.tool_settings.image_paint.mode = "IMAGE"
     if not select_paint_key(
@@ -2078,13 +2094,13 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
 
     session = _SESSION
     if session is None:
-        raise StudioError("Quick SDF Studio is not open")
+        raise StudioError("Quick SDF Paint is not open")
     window = find_window(session.window_pointer)
     if window is None:
-        raise StudioError("The Quick SDF Studio window is no longer available")
+        raise StudioError("The Quick SDF Paint window is no longer available")
     context_window = getattr(context, "window", None)
     if context_window is None or context_window.as_pointer() != session.window_pointer:
-        raise StudioError("Quick SDF Studio is open in another Blender window")
+        raise StudioError("Quick SDF Paint is open in another Blender window")
 
     target_uuid = str(getattr(project, "uuid", ""))
     if not target_uuid:
@@ -2108,14 +2124,14 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
 
     old_project = resolve_session_project(session)
     if old_project is None:
-        raise StudioError("The current Quick SDF Studio target is unavailable")
+        raise StudioError("The current Quick SDF Paint target is unavailable")
     discard_provisional(context, old_project)
     if session.editing_aux_mask_uuid:
         leave_aux_mask_edit(context, old_project)
     old_scene, old_index = _project_location(old_project)
     workspace = bpy.data.workspaces.get(session.workspace_name)
     if old_scene is None or old_index is None or workspace is None:
-        raise StudioError("The current Quick SDF Studio state could not be restored")
+        raise StudioError("The current Quick SDF Paint state could not be restored")
 
     old_session_state = {
         "project_uuid": session.project_uuid,
@@ -2194,12 +2210,12 @@ def _focus_or_switch_studio(context: Any, project: Any) -> StudioSession:
             except Exception:
                 pass
             raise StudioError(
-                f"Could not open this model, and Studio recovery failed: {rollback_error}"
+                f"Could not open this model, and Quick SDF Paint recovery failed: {rollback_error}"
             ) from error
         finally:
             if caller_workspace.as_pointer() != workspace.as_pointer():
                 window.workspace = caller_workspace
-        raise StudioError(f"Could not open this model in Quick SDF Studio: {error}") from error
+        raise StudioError(f"Could not open this model in Quick SDF Paint: {error}") from error
     finally:
         if not switched:
             tag_studio_redraw()
@@ -2227,7 +2243,7 @@ def _continue_switch() -> float | None:
         if pending.attempts < 60:
             return 0.03
         try:
-            project.diagnostic_message = "Could not focus the Quick SDF Studio workspace"
+            project.diagnostic_message = "Could not focus the Quick SDF Paint workspace"
         except (AttributeError, ReferenceError):
             pass
         _SWITCH_PENDING = None
@@ -2248,15 +2264,15 @@ def _queue_studio_switch(context: Any, project: Any) -> StudioSession:
     global _SWITCH_PENDING
     session = _SESSION
     if session is None:
-        raise StudioError("Quick SDF Studio is not open")
+        raise StudioError("Quick SDF Paint is not open")
     context_window = getattr(context, "window", None)
     if context_window is None or context_window.as_pointer() != session.window_pointer:
-        raise StudioError("Quick SDF Studio is open in another Blender window")
+        raise StudioError("Quick SDF Paint is open in another Blender window")
     _preflight_studio_target(context, project)
     window = find_window(session.window_pointer)
     workspace = bpy.data.workspaces.get(session.workspace_name)
     if window is None or workspace is None:
-        raise StudioError("The Quick SDF Studio workspace is no longer available")
+        raise StudioError("The Quick SDF Paint workspace is no longer available")
     _SWITCH_PENDING = _PendingSwitch(str(getattr(project, "uuid", "")))
     window.workspace = workspace
     if not bpy.app.timers.is_registered(_continue_switch):
@@ -2287,7 +2303,7 @@ def open_or_switch_studio(
         window = find_window(session.window_pointer)
         workspace = bpy.data.workspaces.get(session.workspace_name)
         if window is None or workspace is None:
-            raise StudioError("The Quick SDF Studio workspace is no longer available")
+            raise StudioError("The Quick SDF Paint workspace is no longer available")
         if window.workspace.as_pointer() != workspace.as_pointer():
             return _queue_studio_switch(context, project)
         return _focus_or_switch_studio(context, project)
@@ -2307,7 +2323,7 @@ def enter_studio(
     global _SESSION, _PENDING, _SWITCH_PENDING
     _SWITCH_PENDING = None
     if bpy.app.background or getattr(context, "window", None) is None:
-        raise StudioUnavailableError("Quick SDF Studio requires an interactive Blender window")
+        raise StudioUnavailableError("Quick SDF Paint requires an interactive Blender window")
     project_uuid = str(getattr(project, "uuid", ""))
     if not project_uuid:
         raise StudioError("The Quick SDF project has no UUID")
@@ -2316,7 +2332,7 @@ def enter_studio(
     if _PENDING is not None:
         if _PENDING.session.project_uuid == project_uuid:
             return _PENDING.session
-        raise StudioBusyError("Quick SDF Studio is already opening")
+        raise StudioBusyError("Quick SDF Paint is already opening")
     obj = getattr(project, "target_object", None)
     if obj is None or getattr(obj, "type", "") != "MESH":
         raise StudioError("The Quick SDF target must be a local mesh")
@@ -2349,7 +2365,7 @@ def enter_studio(
             state = "FINISH"
         session.workspace_name = workspace.name
         _PENDING = _PendingEnter(session=session, manage_preview=manage_preview, state=state)
-        project.warning_message = "Opening Quick SDF Studio…"
+        project.warning_message = "Opening Quick SDF Paint…"
         if not bpy.app.timers.is_registered(_continue_enter):
             bpy.app.timers.register(_continue_enter, first_interval=0.01)
         return session

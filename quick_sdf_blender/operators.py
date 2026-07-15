@@ -797,7 +797,10 @@ class QUICKSDF_OT_set_forward_from_view(bpy.types.Operator):
 class QUICKSDF_OT_create_and_edit(bpy.types.Operator):
     bl_idname = "quicksdf.create_and_edit"
     bl_label = "Create & Edit"
-    bl_description = "Create the face-shadow project, auto-bake the current pose, and open Studio"
+    bl_description = (
+        "Create a face-shadow threshold-map project, auto-bake the current pose, "
+        "and open Quick SDF Paint"
+    )
 
     @classmethod
     def poll(cls, context):
@@ -836,7 +839,7 @@ class QUICKSDF_OT_create_and_edit(bpy.types.Operator):
 
 class QUICKSDF_OT_studio_enter(bpy.types.Operator):
     bl_idname = "quicksdf.studio_enter"
-    bl_label = "Open Quick SDF Studio"
+    bl_label = "Open Quick SDF Paint"
     bl_description = "Open the paint canvas, 3D preview, and angle timeline in one workspace"
 
     def execute(self, context):
@@ -1643,7 +1646,7 @@ class QUICKSDF_OT_paint_value_set(bpy.types.Operator):
 
 class QUICKSDF_OT_studio_display_mode(bpy.types.Operator):
     bl_idname = "quicksdf.studio_display_mode"
-    bl_label = "Change Studio Display"
+    bl_label = "Change Paint Display"
     bl_options = {"INTERNAL"}
 
     mode: StringProperty(name="Mode", default="OVERLAY")
@@ -4161,7 +4164,7 @@ class QUICKSDF_OT_packing_preview_channel(bpy.types.Operator):
             from .studio import show_export_adjustment_review
 
             if not show_export_adjustment_review(context, project, image):
-                raise RuntimeError("Open Quick SDF Studio to preview packed channels")
+                raise RuntimeError("Open Quick SDF Paint to preview packed channels")
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -4190,8 +4193,8 @@ class QUICKSDF_OT_generate(bpy.types.Operator):
 
 class QUICKSDF_OT_export_texture(bpy.types.Operator):
     bl_idname = "quicksdf.export_texture"
-    bl_label = "Export Face Shadow Texture"
-    bl_description = "Check, generate, and save the finished 16-bit face-shadow PNG"
+    bl_label = "Export Threshold Map"
+    bl_description = "Check, generate, and save the finished 16-bit threshold-map PNG"
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH", default="")
     overwrite: BoolProperty(name="Overwrite", default=False)
@@ -4213,7 +4216,7 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
                 self.confirmed = True
                 return context.window_manager.invoke_confirm(self, event)
             return self.execute(context)
-        self.filepath = f"{project.name.replace(' ', '_')}_FaceShadow.png"
+        self.filepath = f"{project.name.replace(' ', '_')}_ThresholdMap.png"
         self.from_file_selector = True
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
@@ -4339,7 +4342,7 @@ class QUICKSDF_OT_review_export_adjustments(bpy.types.Operator):
                         ),
                     )
                     return {"FINISHED"}
-        self.report({"WARNING"}, "Open Quick SDF Studio to review the export heatmap")
+        self.report({"WARNING"}, "Open Quick SDF Paint to review the export heatmap")
         return {"CANCELLED"}
 
 

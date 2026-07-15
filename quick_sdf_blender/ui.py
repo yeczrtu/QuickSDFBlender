@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Artist-first launcher and Advanced controls for Quick SDF Studio.
+"""Artist-first launcher and Advanced controls for Quick SDF Paint.
 
 Daily angle selection lives in the full-width Studio timeline and daily paint
 controls live in the WorkSpaceTool header.  This module intentionally keeps the
@@ -132,7 +132,7 @@ def _packing_meaning(channel: Any) -> str:
     meanings = {
         "RIGHT_THRESHOLD": ("lights late", "lights early"),
         "LEFT_THRESHOLD": ("lights late", "lights early"),
-        "SDF_AREA": ("normal shading", "face SDF"),
+        "SDF_AREA": ("normal shading", "threshold shading"),
         "SHADOW_STRENGTH": ("shadow off", "full shadow"),
         "CUSTOM_MASK": ("mask off", "mask on"),
     }
@@ -182,7 +182,9 @@ def _packing_channel_error(project: Any, output: str, channel: Any) -> str:
         item = None
     if item is None:
         return ""
-    image = runtime.resolve_aux_mask_image(project, item)
+    # Panel draw callbacks must never repair ID references. Blender rejects
+    # property writes while restricted draw data is active.
+    image = runtime.find_aux_mask_image(project, item)
     if image is None:
         return tr("%s: Mask image is missing") % output
     expected = int(getattr(project, "resolution", 0))
@@ -277,7 +279,7 @@ def _export_controls(layout: Any, project: Any, *, compact: bool = False) -> Non
     export.scale_y = 1.0 if compact else 1.45
     export.operator(
         "quicksdf.export_texture",
-        text="Retry Export" if bool(getattr(project, "export_failed", False)) else "Export Face Shadow Texture",
+        text="Retry Export" if bool(getattr(project, "export_failed", False)) else "Export Threshold Map",
         icon="FILE_REFRESH" if bool(getattr(project, "export_failed", False)) else "EXPORT",
     )
     message = str(getattr(project, "job_message", ""))
@@ -293,7 +295,7 @@ def _export_controls(layout: Any, project: Any, *, compact: bool = False) -> Non
 
 class QSDF_PT_launcher(bpy.types.Panel):
     bl_idname = "QSDF_PT_launcher"
-    bl_label = "Quick SDF Studio"
+    bl_label = "Quick SDF Paint"
     bl_category = "Quick SDF"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -317,7 +319,10 @@ class QSDF_PT_launcher(bpy.types.Panel):
             button = layout.column()
             button.scale_y = 1.7
             button.operator("quicksdf.create_and_edit", text="Create & Edit", icon="BRUSH_DATA")
-            layout.label(text="Auto-bakes the current pose, then opens Studio.", icon="INFO")
+            layout.label(
+                text="Auto-bakes the current pose, then opens Quick SDF Paint.",
+                icon="INFO",
+            )
             return
 
         if studio:
@@ -352,7 +357,7 @@ class QSDF_PT_launcher(bpy.types.Panel):
             layout.label(text=project.name, icon="IMAGE_DATA")
             button = layout.column()
             button.scale_y = 1.7
-            button.operator("quicksdf.studio_enter", text="Open Quick SDF Studio", icon="WORKSPACE")
+            button.operator("quicksdf.studio_enter", text="Open Quick SDF Paint", icon="WORKSPACE")
             _mirror_confirmation(layout, project)
 
 
@@ -714,7 +719,7 @@ class QSDF_PT_additional_masks(bpy.types.Panel):
 
 class QSDF_PT_image_studio(bpy.types.Panel):
     bl_idname = "QSDF_PT_image_studio"
-    bl_label = "Quick SDF Studio"
+    bl_label = "Quick SDF Paint"
     bl_category = "Quick SDF"
     bl_space_type = "IMAGE_EDITOR"
     bl_region_type = "UI"

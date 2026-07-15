@@ -37,7 +37,7 @@ def _project(context: Any) -> Any | None:
 def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
     project = _project(context)
     if project is None:
-        layout.label(text="Open Quick SDF Studio to paint", icon="INFO")
+        layout.label(text="Open Quick SDF Paint to paint", icon="INFO")
         return
 
     editing_aux_uuid = ""
@@ -118,7 +118,7 @@ def _draw_tool_settings(context: Any, layout: Any, _tool: Any) -> None:
     elif bool(getattr(project, "job_running", False)) and _operator_exists("quicksdf.cancel_job"):
         row.operator("quicksdf.cancel_job", text="Cancel", icon="CANCEL")
     elif _operator_exists("quicksdf.export_texture"):
-        row.operator("quicksdf.export_texture", text="Export Face Shadow Texture", icon="EXPORT")
+        row.operator("quicksdf.export_texture", text="Export Threshold Map", icon="EXPORT")
     if _operator_exists("quicksdf.studio_exit"):
         row.operator("quicksdf.studio_exit", text="Exit Quick SDF", icon="X")
 
@@ -234,7 +234,7 @@ def activate_tools(context: Any, *, window: Any | None = None) -> None:
     view = next((area for area in areas if area.type == "VIEW_3D"), None)
     image = next((area for area in areas if area.type == "IMAGE_EDITOR"), None)
     if view is None or image is None:
-        raise RuntimeError("Quick SDF Studio needs both a 3D View and an Image Editor")
+        raise RuntimeError("Quick SDF Paint needs both a 3D View and an Image Editor")
     image_space = image.spaces.active
     if hasattr(image_space, "ui_mode"):
         image_space.ui_mode = "PAINT"

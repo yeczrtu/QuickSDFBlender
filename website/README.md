@@ -1,4 +1,4 @@
-# Quick SDF Studio documentation site
+# Quick SDF Paint documentation site
 
 This directory contains the static documentation site published with GitHub Pages.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Small, explicit English/Japanese UI dictionary for Quick SDF Studio."""
+"""Small, explicit English/Japanese UI dictionary for Quick SDF Paint."""
 
 from __future__ import annotations
 
@@ -10,15 +10,14 @@ TRANSLATION_KEY = "quick_sdf_blender"
 
 TRANSLATIONS = {
     "ja_JP": {
-        ("*", "Quick SDF Studio"): "Quick SDF Studio",
-        ("*", "Quick SDF Paint"): "Quick SDF ペイント",
+        ("*", "Quick SDF Paint"): "Quick SDF Paint",
         ("*", "Quick SDF Timeline"): "Quick SDF タイムライン",
         ("*", "Create & Edit"): "作成して編集",
         ("*", "Select the face mesh"): "顔のメッシュを選択",
         ("*", "Then create a paint-ready face shadow."): "すぐに塗れる顔影を作成します",
         ("*", "A material will be created"): "マテリアルを自動作成します",
-        ("*", "Auto-bakes the current pose, then opens Studio."): "現在のポーズを自動ベイクしてStudioを開きます",
-        ("*", "Open Quick SDF Studio"): "Quick SDF Studioを開く",
+        ("*", "Auto-bakes the current pose, then opens Quick SDF Paint."): "現在のポーズを自動ベイクしてQuick SDF Paintを開きます",
+        ("*", "Open Quick SDF Paint"): "Quick SDF Paintを開く",
         ("*", "Exit Quick SDF"): "Quick SDFを終了",
         ("*", "Light"): "明部",
         ("*", "Shadow"): "影",
@@ -29,7 +28,7 @@ TRANSLATIONS = {
         ("*", "Preview"): "プレビュー",
         ("*", "Mask"): "マスク",
         ("*", "Toon Result"): "トゥーン結果",
-        ("*", "Export Face Shadow Texture"): "顔影テクスチャを書き出す",
+        ("*", "Export Threshold Map"): "スレッショルドマップを書き出す",
         ("*", "Choose an angle · choose Light or Shadow · paint"): "角度を選ぶ・明部か影を選ぶ・塗る",
         ("*", "A light-sweep guide from rear oblique to full light is ready. Paint only the areas you want to adjust."): "斜め後ろから全体へ広がる影ガイドを作成しました。気になる部分だけ修正してください。",
         ("*", "A light-sweep guide from rear oblique to full light is ready. Paint only the areas you want to adjust. Paint between keys to add that angle."): "斜め後ろから全体へ広がる影ガイドを作成しました。気になる部分だけ修正してください。キーの間で塗ると、その角度が自動で追加されます。",
@@ -42,7 +41,7 @@ TRANSLATIONS = {
         ("*", "Light Starts"): "光り始め",
         ("*", "Side"): "真横",
         ("*", "Full Light"): "全体が明部",
-        ("*", "Open Quick SDF Studio to paint"): "Quick SDF Studioを開いてペイントしてください",
+        ("*", "Open Quick SDF Paint to paint"): "Quick SDF Paintを開いてペイントしてください",
         ("*", "Paint Light or Shadow and keep all light angles consistent"): "明部または影を塗り、全角度の整合性を自動で保ちます",
         ("*", "Advanced"): "詳細設定",
         ("*", "Editing %s"): "%sを編集中",
@@ -83,8 +82,8 @@ TRANSLATIONS = {
         ("*", "Export Review Masks"): "確認用マスクを書き出す",
         ("*", "Restore Materials"): "マテリアルを復元",
         ("*", "Remove Quick SDF Project"): "Quick SDFプロジェクトを削除",
-        ("*", "Quick SDF Studio requires an interactive Blender window"): "Quick SDF StudioにはBlenderの操作可能なウィンドウが必要です",
-        ("*", "Exit the current Quick SDF Studio before opening another project"): "別のプロジェクトを開く前に現在のQuick SDF Studioを終了してください",
+        ("*", "Quick SDF Paint requires an interactive Blender window"): "Quick SDF PaintにはBlenderの操作可能なウィンドウが必要です",
+        ("*", "Exit the current Quick SDF Paint before opening another project"): "別のプロジェクトを開く前に現在のQuick SDF Paintを終了してください",
         ("*", "Retry Export"): "書き出しを再試行",
         ("*", "Adjusted angle continuity and exported"): "角度のつながりを自動調整して書き出しました",
         ("*", "Review Export Adjustments"): "書き出し時の自動調整を確認",
@@ -134,7 +133,7 @@ TRANSLATIONS["ja_JP"].update({
     ("*", "lights late"): "遅く明るくなる",
     ("*", "lights early"): "早く明るくなる",
     ("*", "normal shading"): "通常法線シェーディング",
-    ("*", "face SDF"): "顔SDF",
+    ("*", "threshold shading"): "スレッショルドシェーディング",
     ("*", "shadow off"): "影なし",
     ("*", "full shadow"): "影強度100%",
     ("*", "mask off"): "マスク0",

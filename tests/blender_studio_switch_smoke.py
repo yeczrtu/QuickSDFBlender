@@ -1,4 +1,4 @@
-"""Interactive regression smoke for one-click Quick SDF Studio switching.
+"""Interactive regression smoke for one-click Quick SDF Paint switching.
 
 Run with a real Blender window because workspace duplication/splitting and
 Texture Paint are unavailable in background mode::
@@ -210,6 +210,7 @@ def check() -> float | None:
             obj_a = STATE["obj_a"]
             _assert_project_is_fully_active(project_a, obj_a, runtime, studio)
             STATE["studio_workspace"] = bpy.context.window.workspace
+            assert bpy.context.window.workspace.name == studio.WORKSPACE_BASENAME
 
             # Merely clicking another Workspace must not turn Open Studio into
             # a misleading "another project" error for the same project.
@@ -312,6 +313,39 @@ def check() -> float | None:
             assert STATE["obj_a"].material_slots[0].material == STATE["material_a"]
             assert STATE["obj_b"].material_slots[0].material == STATE["material_b"]
             assert _canvas_fingerprint(STATE["canvas_a"], runtime) == STATE["canvas_a_fingerprint"]
+
+            # Simulate a .blend saved by 0.7.0. Reopening must reuse and rename
+            # the tagged workspace data-block instead of creating a duplicate.
+            legacy_workspace = STATE["studio_workspace"]
+            legacy_workspace.name = next(iter(studio.LEGACY_WORKSPACE_BASENAMES))
+            legacy_workspace[studio.WORKSPACE_PROJECT_TAG] = str(STATE["project_a"].uuid)
+            legacy_workspace[studio.WORKSPACE_VERSION_TAG] = studio.WORKSPACE_LAYOUT_VERSION
+            STATE["legacy_workspace_pointer"] = legacy_workspace.as_pointer()
+            STATE["legacy_workspace_count"] = len(bpy.data.workspaces)
+            assert bpy.ops.quicksdf.studio_enter() == {"FINISHED"}
+            STATE["phase"] = "WAIT_LEGACY_REOPEN"
+            STATE["attempts"] = 0
+            return 0.1
+
+        if phase == "WAIT_LEGACY_REOPEN":
+            return _wait_for_project(
+                STATE["project_a"], STATE["obj_a"], "VERIFY_LEGACY_REOPEN", runtime, studio
+            )
+
+        if phase == "VERIFY_LEGACY_REOPEN":
+            _assert_project_is_fully_active(
+                STATE["project_a"], STATE["obj_a"], runtime, studio
+            )
+            assert bpy.context.window.workspace.as_pointer() == STATE["legacy_workspace_pointer"]
+            assert bpy.context.window.workspace.name == studio.WORKSPACE_BASENAME
+            assert len(bpy.data.workspaces) == STATE["legacy_workspace_count"]
+            assert bpy.ops.quicksdf.studio_exit() == {"FINISHED"}
+            STATE["phase"] = "FINAL_EXITED"
+            return 0.1
+
+        if phase == "FINAL_EXITED":
+            assert studio.current_session() is None
+            assert bpy.context.window.workspace == STATE["original_workspace"]
             finish()
             return None
 
