@@ -1,4 +1,4 @@
-"""Blender 5.1 smoke test for schema-6 bitplane persistence.
+"""Blender 5.1/5.2 smoke test for schema-6 bitplane persistence.
 
 Run from the repository root with::
 
@@ -39,7 +39,7 @@ def _project_angle_images(project_uuid: str) -> tuple[bpy.types.Image, ...]:
 
 
 def main() -> None:
-    assert bpy.app.version[:2] == (5, 1), bpy.app.version_string
+    assert (5, 1) <= bpy.app.version[:2] < (5, 3), bpy.app.version_string
     assert SCHEMA_VERSION == 6
     quick_sdf_blender.register()
     try:

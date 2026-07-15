@@ -1,4 +1,4 @@
-"""Blender 5.1 render regression for the Quick SDF preview material.
+"""Blender 5.1/5.2 render regression for the Quick SDF preview material.
 
 The source material intentionally owns two Material Output nodes.  Quick SDF
 must attach to the active output, keep the paint Canvas wired to the preview

@@ -209,11 +209,19 @@ def main() -> None:
             lambda: live_preview.update_seek_preview(project, seek_angle),
         )
 
+        # Studio keeps the finalized Active Display in its gray8 session cache.
+        # Warm that cache outside the timed region so this probe measures the
+        # real stroke snapshot/upload path, not a cold diagnostic pixel read.
+        roundtrip_item = runtime.active_angle(project)
+        roundtrip_image = runtime.resolve_display_image(project, roundtrip_item)
+        runtime.cache_image_gray8(
+            roundtrip_image,
+            runtime.image_gray8(roundtrip_image),
+        )
+
         def gray_roundtrip() -> None:
-            item = runtime.active_angle(project)
-            image = runtime.resolve_display_image(project, item)
-            gray = runtime.image_gray8(image)
-            runtime.write_image_gray8(image, gray)
+            gray = runtime.image_gray8(roundtrip_image, use_cache=True)
+            runtime.write_image_gray8(roundtrip_image, gray)
 
         _timed(results, "display_gray_roundtrip_seconds", gray_roundtrip)
 

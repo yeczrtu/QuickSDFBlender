@@ -1,4 +1,4 @@
-"""Interactive Blender 5.1 regression for a real 3D Projection Paint stroke.
+"""Interactive Blender 5.1/5.2 regression for a real 3D Projection Paint stroke.
 
 Unlike array-level Smart Paint tests, this drives Quick SDF's public paint
 macro with ``PAINT_OT_image_paint`` stroke elements in a VIEW_3D region.  A

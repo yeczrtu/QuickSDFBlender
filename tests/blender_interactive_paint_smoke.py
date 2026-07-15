@@ -1,4 +1,4 @@
-"""Headless Blender 5.1 smoke for schema-6 interactive Smart Paint.
+"""Headless Blender 5.1/5.2 smoke for schema-6 interactive Smart Paint.
 
 Run from the repository root with::
 
@@ -359,7 +359,7 @@ def _test_structural_history(project) -> None:
 
 def run() -> None:
     assert bpy.app.background
-    assert bpy.app.version[:2] == (5, 1), bpy.app.version_string
+    assert (5, 1) <= bpy.app.version[:2] < (5, 3), bpy.app.version_string
     registered = False
     try:
         quick_sdf_blender.register()

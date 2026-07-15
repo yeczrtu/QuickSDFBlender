@@ -1,4 +1,4 @@
-"""Blender 5.1 regression smoke for adaptive angle-key authoring.
+"""Blender 5.1/5.2 regression smoke for adaptive angle-key authoring.
 
 Run with a real Blender window because Studio sessions and Texture Paint
 canvases do not exist in background mode::
@@ -346,7 +346,7 @@ def run() -> None:
     RESULT_PATH.unlink(missing_ok=True)
     try:
         assert not bpy.app.background
-        assert bpy.app.version[:2] == (5, 1), bpy.app.version_string
+        assert (5, 1) <= bpy.app.version[:2] < (5, 3), bpy.app.version_string
         assert bpy.ops.preferences.addon_enable(module="quick_sdf_blender") == {"FINISHED"}
         from quick_sdf_blender import runtime
 

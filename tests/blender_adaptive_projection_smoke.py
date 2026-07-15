@@ -1,4 +1,4 @@
-"""Blender 5.1 GUI regression for Projection Paint on an adaptive key.
+"""Blender 5.1/5.2 GUI regression for Projection Paint on an adaptive key.
 
 This test deliberately combines the two paths that older smoke tests kept
 separate: a session-only interpolated angle and Blender's real
@@ -373,7 +373,7 @@ def _run() -> None:
         RESULT_PATH.unlink(missing_ok=True)
         DETAIL_PATH.unlink(missing_ok=True)
         assert not bpy.app.background
-        assert bpy.app.version[:2] == (5, 1), bpy.app.version_string
+        assert (5, 1) <= bpy.app.version[:2] < (5, 3), bpy.app.version_string
         assert bpy.ops.preferences.addon_enable(module="quick_sdf_blender") == {
             "FINISHED"
         }

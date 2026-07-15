@@ -1,4 +1,4 @@
-"""Blender 5.1 smoke test for bounded 2K Display residency.
+"""Blender 5.1/5.2 smoke test for bounded 2K Display residency.
 
 Run from the repository root with::
 
@@ -207,7 +207,7 @@ def _test_dirty_pack_retry(project: object) -> None:
 
 
 def main() -> None:
-    assert bpy.app.version[:2] == (5, 1), bpy.app.version_string
+    assert (5, 1) <= bpy.app.version[:2] < (5, 3), bpy.app.version_string
     quick_sdf_blender.register()
     try:
         project = _make_project()
