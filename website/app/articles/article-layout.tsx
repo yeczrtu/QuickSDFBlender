@@ -14,11 +14,13 @@ export type TocItem = { id: string; label: string };
 export function ArticleLayout({
   article,
   lead,
+  titleParts,
   toc,
   children,
 }: {
   article: ArticleRecord;
   lead: string;
+  titleParts?: readonly ReactNode[];
   toc: readonly TocItem[];
   children: ReactNode;
 }) {
@@ -86,17 +88,26 @@ export function ArticleLayout({
 
         <header className="article-hero page-shell">
           <p className="article-category">{article.category}</p>
-          <h1>{article.title}</h1>
+          <h1>
+            {titleParts
+              ? titleParts.map((part, index) => (
+                  <span className="article-title-line" key={`${article.slug}-title-${index}`}>
+                    {part}
+                    {index < titleParts.length - 1 ? <wbr /> : null}
+                  </span>
+                ))
+              : article.title}
+          </h1>
           <p className="article-lead">{lead}</p>
           <dl className="article-meta">
             <div><dt>対象</dt><dd>{article.audience}</dd></div>
-            <div><dt>読了目安</dt><dd>{article.readingTime}</dd></div>
+            <div><dt>読了時間</dt><dd>{article.readingTime}</dd></div>
             <div><dt>公開日</dt><dd><time dateTime={article.published}>{formatArticleDate(article.published)}</time></dd></div>
             <div>
               <dt>執筆・検証</dt>
               <dd><a href="https://github.com/yeczrtu/QuickSDFBlender">Quick SDF Paint contributors</a></dd>
             </div>
-            <div><dt>公開</dt><dd><a href={`${basePath}/`}>Quick SDF Paint</a></dd></div>
+            <div><dt>発行元</dt><dd><a href={`${basePath}/`}>Quick SDF Paint</a></dd></div>
           </dl>
         </header>
 

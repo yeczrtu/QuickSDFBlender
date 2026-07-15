@@ -265,7 +265,7 @@ const articlePages = [
   },
   {
     slug: "sdf-threshold-interpolation",
-    title: "SDF距離補間の比較検証",
+    title: "SDF距離補間の比較",
     uniqueText: "比較する4つの方法",
     evidence: "比較実験の条件",
   },
@@ -279,8 +279,11 @@ const articlePages = [
 
 test("exports an index and three distinct long-form articles", async () => {
   const index = await readFile(new URL("../out/articles/index.html", import.meta.url), "utf8");
-  assert.match(index, /顔影スレッショルドマップを[^<]*仕組みから理解する/);
-  assert.match(index, /基礎構造、同一条件での補間比較、Blender 5\.1での実践手順/);
+  assert.match(
+    index.replaceAll("<wbr/>", "").replace(/<\/?span\b[^>]*>/g, ""),
+    /顔影スレッショルドマップの仕組みと制作方法/,
+  );
+  assert.match(index, /基本的な仕組み、同一条件での補間比較、Blender 5\.1での実践手順/);
   assert.doesNotMatch(index, /既存資料の要約だけでなく|既存要約ではない/);
 
   assert.equal(metaContent(index, "property", "og:title"), metaContent(index, "name", "twitter:title"));
@@ -314,7 +317,7 @@ test("exports an index and three distinct long-form articles", async () => {
     assert.equal(metaContent(html, "name", "twitter:card"), "summary_large_image");
     assert.match(html, /執筆・検証/);
     assert.match(html, /Quick SDF Paint contributors/);
-    assert.match(html, /<dt>公開<\/dt><dd><a href="\/QuickSDFBlender\/">Quick SDF Paint<\/a><\/dd>/);
+    assert.match(html, /<dt>発行元<\/dt><dd><a href="\/QuickSDFBlender\/">Quick SDF Paint<\/a><\/dd>/);
     assert.match(html, /関連する解説/);
     assert.doesNotMatch(html, /この記事で独自に行ったこと/);
     assert.doesNotMatch(html, /Face\s?SDF(?:は|とは)[^<。]{0,20}(?:一般名称です|標準名称です|一般的な名称です)/i);
@@ -348,6 +351,70 @@ test("keeps article tables and cross-links accessible and contextual", async () 
   assert.match(articleHtml["blender-threshold-map-workflow"], /物理的なライト角ではありません/);
 });
 
+test("keeps Japanese article prose, notation, and UI labels consistent", async () => {
+  const [index, data, layout, foundation, comparison, workflow, css] = await Promise.all([
+    readFile(new URL("../app/articles/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/articles/article-data.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/articles/article-layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/articles/face-shadow-threshold-map/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/articles/sdf-threshold-interpolation/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/articles/blender-threshold-map-workflow/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  const articleSource = `${index}\n${data}\n${foundation}\n${comparison}\n${workflow}`;
+  const proseWithoutUiLabels = articleSource.replace(/<code>[\s\S]*?<\/code>/g, "");
+
+  for (const pattern of [
+    /顔Mesh/,
+    /UV island/,
+    /bit depth/,
+    /round-to-nearest/,
+    /決定的な検証/,
+    /時間方向/,
+    /切替角/,
+    /近距離Point Light/,
+    /0～90度/,
+    /0°–90°/,
+    /0–1/,
+    /\b(?:Mesh|Timeline|Canvas|Project|Pose|Shape Key|Point Light)\b/,
+  ]) assert.doesNotMatch(proseWithoutUiLabels, pattern);
+
+  assert.match(data, /顔影スレッショルドマップとは：仕組みと制作方法/);
+  assert.match(data, /角度別マスクを1枚にまとめる方法：SDF距離補間の比較/);
+  assert.match(data, /Quick SDF Paint 0\.7\.1で顔影スレッショルドマップを作る：Blenderでの実践手順/);
+  assert.match(index, /Quick SDF Paint 技術解説/);
+  assert.match(index, /顔影スレッショルド<wbr\s*\/>マップの/);
+  assert.match(layout, /<dt>読了時間<\/dt>/);
+  assert.match(layout, /<dt>発行元<\/dt>/);
+
+  assert.match(foundation, /<code>L<\/code>[^<]*正規化ライト方向ベクトル/);
+  assert.match(foundation, /<code>φ<\/code>[\s\S]{0,100}水平方向の実ライト角/);
+  assert.match(foundation, /<code>t<\/code>[\s\S]{0,180}0～1に正規化した制作進行度/);
+  assert.match(foundation, /<code>u\(p\)<\/code>[\s\S]{0,80}正規化位置/);
+  assert.match(foundation, /Light\(t, p\) = \[ t ≥ u\(p\) \]/);
+  assert.match(foundation, /<SourceList>[\s\S]*?<h2>主な参考資料<\/h2>/);
+
+  assert.match(comparison, /512 × 512 px/);
+  assert.match(comparison, /半径8 px、カーネル幅17 px/);
+  assert.match(comparison, /切替位置MAE（制作目盛り換算、°）/);
+  assert.match(comparison, /className="article-table-scroll"/);
+  assert.match(comparison, /className="article-wide-table"/);
+  assert.match(comparison, /<SourceList>[\s\S]*?<h2>検証データと主な参考資料<\/h2>/);
+
+  assert.match(workflow, /1024 px、0°～90°/);
+  assert.match(workflow, /<code>Create &amp; Edit<\/code>/);
+  assert.match(workflow, /<code>Light<\/code>／<code>Shadow<\/code>/);
+  assert.match(workflow, /<code>Material Slot<\/code>/);
+  assert.match(workflow, /<code>SDF Area<\/code>/);
+
+  assert.match(css, /\.article-hero h1[\s\S]*?text-wrap: balance/);
+  assert.match(css, /\.article-hero h1[\s\S]*?word-break: keep-all/);
+  assert.match(css, /\.article-body[\s\S]*?line-break: strict/);
+  assert.match(css, /\.article-table-scroll[\s\S]*?overflow-x: auto/);
+  assert.match(css, /@media \(max-width: 760px\)[\s\S]*?\.article-breadcrumb[\s\S]*?overflow-x: visible/);
+  assert.match(css, /@media \(max-width: 760px\)[\s\S]*?font-size: clamp\(30px, 9vw, 34px\)/);
+});
+
 test("publishes source-backed original research rather than unsupported SDF claims", async () => {
   const [html, resultsText, generator, studyMath] = await Promise.all([
     readFile(new URL("../out/articles/sdf-threshold-interpolation/index.html", import.meta.url), "utf8"),
@@ -375,8 +442,8 @@ test("publishes source-backed original research rather than unsupported SDF clai
   const labels = {
     nearestKey: "最近傍キー",
     pixelLinear: "画素線形＋二値化",
-    blurredCumulative: "初回キー＋Box Blur",
-    sdfDistanceRatio: "Exact SDF距離比",
+    blurredCumulative: "初回Lightキー＋正規化ボックスブラー",
+    sdfDistanceRatio: "SDF距離比（exact EDT）",
   };
   for (const [method, label] of Object.entries(labels)) {
     const metrics = results.aggregate[method];
@@ -391,11 +458,11 @@ test("publishes source-backed original research rather than unsupported SDF clai
     assert.ok(html.includes(row), `${method} metrics must match results.json`);
   }
   assert.match(html, /結果を見た後のパラメーター調整なし/);
-  assert.match(html, /89評価角度/);
-  assert.match(html, /既定8キーとは別/);
+  assert.match(html, /1°～89°の89点/);
+  assert.match(html, /既定8キーとは異なり/);
   assert.doesNotMatch(html, /89中間角度|5度刻みの36枚|d_i\+1|S_i\+1|C0連続/);
-  assert.match(html, /画素中心上で最寄りの反対クラスの画素中心まで測る/);
-  assert.match(html, /連続境界を復元できるという意味ではありません/);
+  assert.match(html, /最寄りの反対クラスの画素中心までの距離/);
+  assert.match(html, /元の連続輪郭[^<]*復元できるという意味ではありません/);
   assert.match(html, /website\/scripts\/generate-threshold-study\.mjs/);
   assert.match(html, /website\/public\/research\/threshold-study\/results\.json/);
   assert.match(html, /SDFなら真の形状変化を復元できる[^<]*証明ではありません/);
@@ -411,13 +478,13 @@ test("documents the Quick SDF Paint 0.7.1 artist workflow without hidden steps",
   assert.match(html, /Quick SDF Paint 0\.7\.1を使い/);
   assert.match(html, /完成までの最短5手順/);
   assert.match(html, /16-bit RGBA PNG/);
-  assert.match(html, /0度はLight Starts、90度はFull Light/);
+  assert.match(html, /0°は<code>Light Starts<\/code>、90°は<code>Full Light<\/code>/);
   assert.match(html, /Shadow Amount[\s\S]{0,80}調整し、その後に<code>Update Shadow Guide<\/code>/);
-  assert.match(html, /実際に画素を変えた場合だけ自動キー/);
-  assert.match(html, /スクラブして確認するだけでは画像もキーも増えません/);
-  assert.match(html, /Undo[^<]*Delete/);
+  assert.match(html, /キーの間で実際に画素を変更した場合に限り[^<]*自動キー/);
+  assert.match(html, /スクラブして確認するだけでは、画像もキーも増えません/);
+  assert.match(html, /<code>Undo<\/code>[\s\S]{0,80}<code>Delete<\/code>/);
   assert.match(html, /SDF Area[\s\S]{0,100}Quick SDF Paint共通の補助マスク/);
-  assert.match(html, /同じUV座標へ重なっている場合[^<]*Material SlotまたはUVを分ける必要/);
+  assert.match(html, /同じUV座標へ重なっている場合[^<]*補助マスクだけでは分離できません[\s\S]{0,120}マテリアルスロットまたはUVを分ける必要/);
 });
 
 test("limits production claims to what the cited public sources support", async () => {
