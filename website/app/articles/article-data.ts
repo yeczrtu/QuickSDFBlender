@@ -23,7 +23,7 @@ export type ArticleRecord = {
 export const articles: readonly ArticleRecord[] = [
   {
     slug: "face-shadow-threshold-map",
-    title: "顔影スレッショルドマップとは — 仕組みと制作方法を体系的に解説",
+    title: "顔影スレッショルドマップとは：仕組みと制作方法",
     shortTitle: "顔影スレッショルドマップとは",
     description:
       "トゥーン顔影を光の向きで切り替えるスレッショルドマップについて、保存する値、制作工程、ほかの顔影手法との違い、適用範囲を整理します。",
@@ -36,10 +36,10 @@ export const articles: readonly ArticleRecord[] = [
   },
   {
     slug: "sdf-threshold-interpolation",
-    title: "角度別マスクを1枚にまとめる方法 — SDF距離補間の比較検証",
-    shortTitle: "SDF距離補間の比較検証",
+    title: "角度別マスクを1枚にまとめる方法：SDF距離補間の比較",
+    shortTitle: "SDF距離補間の比較",
     description:
-      "7枚の二値マスクを使い、最近傍、画素線形、簡易ブラー、SDF距離比を同一条件で比較。境界移動、誤差、8-bitと16-bitの量子化を実測します。",
+      "7枚の二値マスクを使い、最近傍、画素線形、正規化ボックスブラー、SDF距離比を同一条件で比較します。境界移動、誤差、8-bitと16-bitの量子化を実測します。",
     audience: "テクニカルアーティスト／ツール開発者",
     readingTime: "約15分",
     category: "アルゴリズムと検証",
@@ -49,10 +49,10 @@ export const articles: readonly ArticleRecord[] = [
   },
   {
     slug: "blender-threshold-map-workflow",
-    title: "Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る — Blender実践ワークフロー",
-    shortTitle: "Quick SDF Paint 0.7.1実践ワークフロー",
+    title: "Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る：Blenderでの実践手順",
+    shortTitle: "Quick SDF Paint 0.7.1の実践手順",
     description:
-      "Quick SDF Paint 0.7.1で法線から作った影ガイドを修正し、16-bit顔影スレッショルドマップを書き出す手順。UV、正面軸、ミラーの問題も切り分けます。",
+      "Quick SDF Paint 0.7.1で法線から作った影ガイドを修正し、16-bitの顔影スレッショルドマップを書き出す手順を説明します。UV、正面軸、ミラーの問題も切り分けます。",
     audience: "Blenderを使うアーティスト",
     readingTime: "約18分",
     category: "Blender実践",

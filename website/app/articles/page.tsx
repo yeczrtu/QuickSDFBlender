@@ -6,7 +6,7 @@ const pageUrl = `${siteOrigin}${basePath}/articles/`;
 export const metadata: Metadata = {
   title: "顔影スレッショルドマップ解説 | Quick SDF Paint",
   description:
-    "顔影スレッショルドマップの仕組み、SDF距離補間の比較検証、Blenderでの実践手順を、アーティスト向けに体系化した解説記事です。",
+    "顔影スレッショルドマップの仕組み、符号付き距離場（SDF）による補間の比較、Blenderでの実践手順を、アーティスト向けに整理した解説記事です。",
   alternates: { canonical: pageUrl },
   openGraph: {
     title: "顔影スレッショルドマップ解説 | Quick SDF Paint",
@@ -60,9 +60,9 @@ export default function ArticlesIndex() {
 
       <main id="articles">
         <header className="articles-index-hero page-shell">
-          <p className="article-category">Quick SDF Paint technical notes</p>
-          <h1>顔影スレッショルドマップを<br />仕組みから理解する</h1>
-          <p>角度別の白黒マスクを、光の向きに応じた一枚のデータへ変換する手法を扱います。基礎構造、同一条件での補間比較、Blender 5.1での実践手順を順番に説明します。</p>
+          <p className="article-category">Quick SDF Paint 技術解説</p>
+          <h1>顔影スレッショルドマップの仕組みと制作方法</h1>
+          <p>角度別の白黒マスクを、光の向きに応じた1枚のデータテクスチャへ変換する手法を扱います。基本的な仕組み、同一条件での補間比較、Blender 5.1での実践手順を順番に説明します。</p>
         </header>
 
         <section className="articles-index-grid page-shell" aria-label="解説記事">
@@ -74,7 +74,7 @@ export default function ArticlesIndex() {
               <p>{article.description}</p>
               <dl>
                 <div><dt>対象</dt><dd>{article.audience}</dd></div>
-                <div><dt>読了</dt><dd>{article.readingTime}</dd></div>
+                <div><dt>読了時間</dt><dd>{article.readingTime}</dd></div>
               </dl>
               <strong>記事を読む <span aria-hidden="true">→</span></strong>
             </a>
@@ -85,7 +85,7 @@ export default function ArticlesIndex() {
           <h2 id="articles-method-title">調査と検証の範囲</h2>
           <div>
             <p>公開資料から用語、既存事例、アルゴリズムを確認し、複数実装に共通する処理を制作工程に沿って整理しています。</p>
-            <p>比較記事の画像と数値は、リポジトリ内の決定的な検証スクリプトから生成しています。実践記事はBlender 5.1とQuick SDF Paint 0.7.1で確認した内容です。</p>
+            <p>比較記事の画像と数値は、同じ入力から同じ結果を再生成できる、リポジトリ内の検証スクリプトで作成しています。実践記事はBlender 5.1とQuick SDF Paint 0.7.1で動作を確認しています。</p>
           </div>
         </section>
       </main>
