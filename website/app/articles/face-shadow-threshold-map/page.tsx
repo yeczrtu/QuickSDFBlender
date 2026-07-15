@@ -83,7 +83,7 @@ export default function FaceShadowThresholdMapArticle() {
       <pre><code>{`t = normalize(φ; Light Starts, Full Light)\nLight(t, p) = [ t ≥ u(p) ]`}</code></pre>
       <p>式中の<code>[条件]</code>は、条件が真なら1、偽なら0を返す二値判定を表します。</p>
       <p>実装によって白黒、比較方向、0と1の意味は反転します。しかし本質は、各画素が制作進行度<code>t</code>上に1つの切替位置<code>u(p)</code>を持つことです。中間のグレーは「半分だけ明るい画素」ではなく、「その位置で状態が切り替わる画素」を意味します。影色、境界のぼかし、影の濃さは、判定後にシェーダー側で適用できます。</p>
-      <p>Quick SDF Paint 0.7.1のlilToon向け既定出力では、正規化した切替位置を反転し、16-bitの値に量子化します。</p>
+      <p>Quick SDF Paint 0.7.2のlilToon向け既定出力では、正規化した切替位置を反転し、16-bitの値に量子化します。</p>
       <pre><code>{`q_lilToon(p) = round((1 - u(p)) × 65535)`}</code></pre>
       <p>この反転を知らずに<code>u</code>として直接比較すると明暗の進行が逆になります。出力先ごとにチャンネル、反転、比較方向を確認してください。</p>
       <p>一般的なシャドウマップ（Shadow Map）とも役割が異なります。シャドウマップはライトから見た奥行きを使い、そのフレームにおける幾何学的な遮蔽を判定します。顔影スレッショルドマップはUVに固定された制作データであり、髪や手が顔を遮ったかどうかは判定しません。実際のシェーダーでは、顔の主要な明暗境界、リアルタイム影、AO、固定マスクを組み合わせて使えます。</p>
@@ -208,7 +208,7 @@ export default function FaceShadowThresholdMapArticle() {
         <li>ライト方向<code>L</code>から求めた制作進行度<code>t</code>と比較する</li>
       </ol>
       <p>SDFは2番目を実現する1つの手段です。何でも解決する陰影方式ではなく、主に横方向へ変化する顔影を、アーティストが輪郭として設計するための限定されたデータ表現です。</p>
-      <p>Blender上で法線ガイドを下描きとして使う具体的な修正手順は、<a href={articlePath("blender-threshold-map-workflow")}>Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る：Blenderでの実践手順</a>へ続きます。</p>
+      <p>Blender上で法線ガイドを下描きとして使う具体的な修正手順は、<a href={articlePath("blender-threshold-map-workflow")}>Quick SDF Paint 0.7.2で顔影スレッショルドマップを作る：Blenderでの実践手順</a>へ続きます。</p>
 
       <SourceList>
         <h2>主な参考資料</h2>

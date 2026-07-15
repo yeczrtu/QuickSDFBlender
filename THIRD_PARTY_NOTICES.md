@@ -20,6 +20,7 @@ GPL-3.0-or-later. The complete GPL-3.0-or-later text is included in `LICENSE`.
 
 ## NumPy
 
-Quick SDF Paint uses the NumPy installation provided by Blender 5.1. NumPy is not
-redistributed in the Quick SDF Paint Extension ZIP. NumPy is available under the
-BSD-3-Clause license: https://numpy.org/doc/stable/license.html
+Quick SDF Paint uses the NumPy installation provided by a supported Blender
+version. NumPy is not redistributed in the Quick SDF Paint Extension ZIP.
+NumPy is available under the BSD-3-Clause license:
+https://numpy.org/doc/stable/license.html

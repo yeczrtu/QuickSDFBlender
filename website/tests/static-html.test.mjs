@@ -58,7 +58,7 @@ test("exports a GitHub Pages document with project-relative assets", async () =>
 
   assert.match(html, /<html[^>]+lang="ja"/i);
   assert.match(html, /Quick SDF Paint/);
-  assert.match(html, /v0\.7\.1/);
+  assert.match(html, /v0\.7\.2/);
   assert.match(html, /トゥーンレンダリング用の顔影スレッショルドマップを作成/);
   assert.match(html, /角度別の白黒マスク/);
   assert.match(html, /SDF距離補間/);
@@ -149,7 +149,7 @@ test("uses sourced terminology without presenting one spelling as a standard nam
   assert.doesNotMatch(publicCopy, disallowedLightmapAliases);
   assert.doesNotMatch(publicCopy, deprecatedLabels);
   assert.match(packageManifest, /"name": "quick-sdf-paint-docs"/);
-  assert.match(packageManifest, /"version": "0\.7\.1"/);
+  assert.match(packageManifest, /"version": "0\.7\.2"/);
 });
 
 test("keeps terminology as a lower-page reference", async () => {
@@ -271,7 +271,7 @@ const articlePages = [
   },
   {
     slug: "blender-threshold-map-workflow",
-    title: "Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る",
+    title: "Quick SDF Paint 0.7.2で顔影スレッショルドマップを作る",
     uniqueText: "完成までの最短5手順",
     evidence: "動作確認条件",
   },
@@ -283,7 +283,7 @@ test("exports an index and three distinct long-form articles", async () => {
     index.replaceAll("<wbr/>", "").replace(/<\/?span\b[^>]*>/g, ""),
     /顔影スレッショルドマップの仕組みと制作方法/,
   );
-  assert.match(index, /基本的な仕組み、同一条件での補間比較、Blender 5\.1での実践手順/);
+  assert.match(index, /基本的な仕組み、同一条件での補間比較、Blender 5\.1／5\.2 LTSでの実践手順/);
   assert.doesNotMatch(index, /既存資料の要約だけでなく|既存要約ではない/);
 
   assert.equal(metaContent(index, "property", "og:title"), metaContent(index, "name", "twitter:title"));
@@ -381,7 +381,7 @@ test("keeps Japanese article prose, notation, and UI labels consistent", async (
 
   assert.match(data, /顔影スレッショルドマップとは：仕組みと制作方法/);
   assert.match(data, /角度別マスクを1枚にまとめる方法：SDF距離補間の比較/);
-  assert.match(data, /Quick SDF Paint 0\.7\.1で顔影スレッショルドマップを作る：Blenderでの実践手順/);
+  assert.match(data, /Quick SDF Paint 0\.7\.2で顔影スレッショルドマップを作る：Blenderでの実践手順/);
   assert.match(index, /Quick SDF Paint 技術解説/);
   assert.match(index, /顔影スレッショルド<wbr\s*\/>マップの/);
   assert.match(layout, /<dt>読了時間<\/dt>/);
@@ -470,12 +470,12 @@ test("publishes source-backed original research rather than unsupported SDF clai
   assert.match(html, /TPAMI\.2003\.1177156/);
 });
 
-test("documents the Quick SDF Paint 0.7.1 artist workflow without hidden steps", async () => {
+test("documents the Quick SDF Paint 0.7.2 artist workflow without hidden steps", async () => {
   const html = await readFile(
     new URL("../out/articles/blender-threshold-map-workflow/index.html", import.meta.url),
     "utf8",
   );
-  assert.match(html, /Quick SDF Paint 0\.7\.1を使い/);
+  assert.match(html, /Quick SDF Paint 0\.7\.2を使い/);
   assert.match(html, /完成までの最短5手順/);
   assert.match(html, /16-bit RGBA PNG/);
   assert.match(html, /0°は<code>Light Starts<\/code>、90°は<code>Full Light<\/code>/);
