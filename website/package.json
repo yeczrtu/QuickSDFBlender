@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "next dev --webpack",
     "build": "next build --webpack && node scripts/finalize-pages.mjs",
-    "test": "node --test tests/static-html.test.mjs",
+    "test": "node --test",
+    "study": "node scripts/generate-threshold-study.mjs",
     "lint": "eslint . --ignore-pattern out --ignore-pattern .next"
   },
   "dependencies": {
