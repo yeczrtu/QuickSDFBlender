@@ -403,27 +403,11 @@ export default function Home() {
           </aside>
         </section>
 
-        <section className="concept-section page-shell" aria-labelledby="terminology-title">
+        <section className="pipeline-section page-shell">
           <div className="pipeline-card" aria-label={t.pipelineLabel}>
             <strong>{t.pipelineLabel}</strong>
             <ol>{t.pipeline.map((item) => <li key={item}>{item}</li>)}</ol>
           </div>
-          <aside className="terminology-note">
-            <h2 id="terminology-title">{t.terminologyTitle}</h2>
-            <p>{t.terminologyBody}</p>
-            <ul>
-              {t.terminologyLinks.map(({ label, sources }) => (
-                <li key={label}>
-                  <span>{label}</span>
-                  <span className="terminology-sources">
-                    {sources.map(([source, href]) => (
-                      <a href={href} target="_blank" rel="noreferrer" key={href}>{source}<span aria-hidden="true">↗</span></a>
-                    ))}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </aside>
         </section>
 
         <section className="basics-section page-shell" aria-labelledby="basics-title">
@@ -537,6 +521,27 @@ export default function Home() {
           <div className="page-shell help-grid">
             <header className="section-title"><h2>{t.helpTitle}</h2><p>{t.helpLead}</p></header>
             <div className="trouble-list">{t.troubles.map(([title, body], index) => <details key={title} open={index === 0}><summary>{title}<span aria-hidden="true">＋</span></summary><p>{body}</p></details>)}</div>
+          </div>
+        </section>
+
+        <section className="manual-section terminology-section" aria-labelledby="terminology-title">
+          <div className="page-shell">
+            <aside className="terminology-note">
+              <h2 id="terminology-title">{t.terminologyTitle}</h2>
+              <p>{t.terminologyBody}</p>
+              <ul>
+                {t.terminologyLinks.map(({ label, sources }) => (
+                  <li key={label}>
+                    <span>{label}</span>
+                    <span className="terminology-sources">
+                      {sources.map(([source, href]) => (
+                        <a href={href} target="_blank" rel="noreferrer" key={href}>{source}<span aria-hidden="true">↗</span></a>
+                      ))}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </aside>
           </div>
         </section>
 
