@@ -1973,6 +1973,25 @@ def _load_pre_cleanup(_unused: Any) -> None:
 
 
 @persistent
+def _load_post_transient_cleanup(_unused: Any) -> None:
+    """Remove derived Studio state captured by Blender's recovery autosave."""
+
+    cleanup_export_adjustment_previews()
+    try:
+        from .live_preview import purge_project_temporaries
+
+        purge_project_temporaries()
+    except (ImportError, ReferenceError, RuntimeError):
+        pass
+    for scene in bpy.data.scenes:
+        for project in getattr(scene, "quick_sdf_projects", ()):
+            try:
+                project.onion_enabled = False
+            except (AttributeError, ReferenceError, TypeError):
+                pass
+
+
+@persistent
 def _load_or_undo_post(_unused: Any) -> None:
     global _GRAY_UPLOAD_BUFFER
 
@@ -2116,6 +2135,8 @@ def _deferred_base_check() -> None:
 def register_runtime() -> None:
     if _load_pre_cleanup not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_load_pre_cleanup)
+    if _load_post_transient_cleanup not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_load_post_transient_cleanup)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         if _load_or_undo_post not in handlers:
             handlers.append(_load_or_undo_post)
@@ -2155,6 +2176,8 @@ def unregister_runtime() -> None:
         bpy.app.timers.unregister(_deferred_base_check)
     while _load_pre_cleanup in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_load_pre_cleanup)
+    while _load_post_transient_cleanup in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_load_post_transient_cleanup)
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         while _load_or_undo_post in handlers:
             handlers.remove(_load_or_undo_post)

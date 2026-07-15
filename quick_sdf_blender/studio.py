@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+import json
 import time
 from typing import Any, Callable
 
@@ -28,6 +29,7 @@ TIMELINE_SPACE_TYPE = "NODE_EDITOR"
 PROVISIONAL_DISPLAY_ROLE = "provisional_display"
 TIMELINE_HOST_TAG = "_qsdf_runtime_timeline_host"
 TIMELINE_HOST_NAME = ".Quick SDF Timeline Runtime"
+PROJECTION_RECOVERY_KEY = "_qsdf_projection_recovery_v1"
 
 
 class StudioError(RuntimeError):
@@ -1700,7 +1702,68 @@ def _adaptive_clip_start(obj: Any | None) -> float:
     return max(1.0e-6, extent * 1.0e-4)
 
 
+def _store_projection_recovery(
+    scene: Any,
+    session: StudioSession,
+    window: Any,
+) -> None:
+    """Journal settings that Blender 5.2 autosave can capture mid-session."""
+
+    workspace = getattr(window, "workspace", None)
+    screen = getattr(window, "screen", None)
+    if workspace is None or screen is None or workspace.get(PROJECTION_RECOVERY_KEY):
+        return
+    image_paint = scene.tool_settings.image_paint
+    workspace[PROJECTION_RECOVERY_KEY] = json.dumps(
+        {
+            "scene": str(getattr(scene, "name", "")),
+            "screen": str(getattr(screen, "name", "")),
+            "normal_falloff": bool(getattr(image_paint, "use_normal_falloff", True)),
+            "clip_starts": [float(space.clip_start) for space in _studio_view_spaces(window)],
+        },
+        separators=(",", ":"),
+    )
+
+
+def _clear_projection_recovery(window: Any | None) -> None:
+    workspace = getattr(window, "workspace", None)
+    if workspace is not None and PROJECTION_RECOVERY_KEY in workspace:
+        del workspace[PROJECTION_RECOVERY_KEY]
+
+
+def _restore_serialized_projection_settings() -> None:
+    """Restore settings from an autosave that bypassed normal save handlers."""
+
+    for workspace in bpy.data.workspaces:
+        serialized = workspace.get(PROJECTION_RECOVERY_KEY)
+        if not serialized:
+            continue
+        try:
+            record = json.loads(str(serialized))
+            scene = bpy.data.scenes.get(str(record.get("scene", "")))
+            if scene is not None and hasattr(scene.tool_settings.image_paint, "use_normal_falloff"):
+                scene.tool_settings.image_paint.use_normal_falloff = bool(
+                    record.get("normal_falloff", True)
+                )
+            screen = bpy.data.screens.get(str(record.get("screen", "")))
+            spaces = tuple(
+                area.spaces.active
+                for area in getattr(screen, "areas", ())
+                if area.type == "VIEW_3D" and hasattr(area.spaces.active, "clip_start")
+            )
+            for space, value in zip(spaces, record.get("clip_starts", ())):
+                space.clip_start = float(value)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        finally:
+            try:
+                del workspace[PROJECTION_RECOVERY_KEY]
+            except (KeyError, ReferenceError, TypeError):
+                pass
+
+
 def _apply_projection_settings(scene: Any, session: StudioSession, window: Any, obj: Any | None) -> None:
+    _store_projection_recovery(scene, session, window)
     image_paint = scene.tool_settings.image_paint
     if session.previous_normal_falloff is None and hasattr(image_paint, "use_normal_falloff"):
         session.previous_normal_falloff = bool(image_paint.use_normal_falloff)
@@ -1728,6 +1791,7 @@ def _restore_projection_settings(scene: Any | None, session: StudioSession, wind
         value = previous.get(int(space.as_pointer()))
         if value is not None:
             space.clip_start = value
+    _clear_projection_recovery(window)
     session.projection_settings_suspended = True
 
 
@@ -2601,6 +2665,22 @@ def _load_pre(_unused: Any) -> None:
 
 
 @persistent
+def _load_post(_unused: Any) -> None:
+    """Discard process-only Studio artifacts serialized by Blender autosave."""
+
+    _remove_timeline_hosts()
+    _restore_serialized_projection_settings()
+    try:
+        from . import runtime
+
+        for image in tuple(bpy.data.images):
+            if image.get(runtime.ROLE_KEY) == PROVISIONAL_DISPLAY_ROLE:
+                bpy.data.images.remove(image)
+    except (AttributeError, ImportError, ReferenceError, RuntimeError):
+        pass
+
+
+@persistent
 def _undo_post(_unused: Any) -> None:
     global _SESSION
     if _SESSION is not None and (find_window(_SESSION.window_pointer) is None or resolve_session_project() is None):
@@ -2625,6 +2705,7 @@ def register_studio() -> None:
         (bpy.app.handlers.save_pre, _save_pre),
         (bpy.app.handlers.save_post, _save_post),
         (bpy.app.handlers.load_pre, _load_pre),
+        (bpy.app.handlers.load_post, _load_post),
         (bpy.app.handlers.undo_post, _undo_post),
         (bpy.app.handlers.redo_post, _undo_post),
     ):
@@ -2653,6 +2734,7 @@ def unregister_studio() -> None:
         (bpy.app.handlers.save_pre, _save_pre),
         (bpy.app.handlers.save_post, _save_post),
         (bpy.app.handlers.load_pre, _load_pre),
+        (bpy.app.handlers.load_post, _load_post),
         (bpy.app.handlers.undo_post, _undo_post),
         (bpy.app.handlers.redo_post, _undo_post),
     ):
