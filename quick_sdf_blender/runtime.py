@@ -280,8 +280,13 @@ def bitplane_revision_token(angle_item: Any, role: BitplaneRole | str) -> tuple[
     )
 
 
-def resolve_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | None:
-    """Resolve one project-owned angle-independent mask after Undo/Load."""
+def find_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | None:
+    """Find one project-owned mask without changing its stored references.
+
+    UI draw callbacks use this read-only variant because Blender forbids ID
+    property writes while a region is being drawn. Call
+    :func:`resolve_aux_mask_image` when stale references should be repaired.
+    """
 
     if aux_item is None:
         return None
@@ -314,6 +319,13 @@ def resolve_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | Non
             ),
             None,
         )
+    return candidate
+
+
+def resolve_aux_mask_image(project: Any, aux_item: Any) -> bpy.types.Image | None:
+    """Resolve one project-owned angle-independent mask after Undo/Load."""
+
+    candidate = find_aux_mask_image(project, aux_item)
     if candidate is not None:
         aux_item.image = candidate
         aux_item.image_name = candidate.name

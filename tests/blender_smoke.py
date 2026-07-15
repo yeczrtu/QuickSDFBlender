@@ -390,6 +390,29 @@ def run(output_directory: Path) -> None:
             aux_by_role["SHADOW_STRENGTH"].uuid,
         ),
     }
+
+    # UI validation must locate stale mask references without mutating Blender
+    # IDs from a panel draw callback. Explicit runtime resolution still repairs
+    # those references for Undo/Load and operator paths.
+    from quick_sdf_blender import ui as ui_module
+
+    sdf_area_item = aux_by_role["SDF_AREA"]
+    stale_name = "Quick SDF Missing Mask Reference"
+    sdf_area_item.image = None
+    sdf_area_item.image_name = stale_name
+    sdf_channel = next(
+        item for item in project.packing_channels if str(item.output_channel) == "B"
+    )
+    assert ui_module._packing_channel_error(project, "B", sdf_channel) == ""
+    assert sdf_area_item.image is None
+    assert sdf_area_item.image_name == stale_name
+    assert runtime.find_aux_mask_image(project, sdf_area_item) == sdf_area_image
+    assert sdf_area_item.image is None
+    assert sdf_area_item.image_name == stale_name
+    assert runtime.resolve_aux_mask_image(project, sdf_area_item) == sdf_area_image
+    assert sdf_area_item.image == sdf_area_image
+    assert sdf_area_item.image_name == sdf_area_image.name
+
     assert not project.packing_customized
     expected_active = min(DEFAULT_ANGLES, key=lambda value: abs(value - 45.0))
     assert math.isclose(

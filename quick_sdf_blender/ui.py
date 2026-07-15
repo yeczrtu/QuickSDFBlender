@@ -182,7 +182,9 @@ def _packing_channel_error(project: Any, output: str, channel: Any) -> str:
         item = None
     if item is None:
         return ""
-    image = runtime.resolve_aux_mask_image(project, item)
+    # Panel draw callbacks must never repair ID references. Blender rejects
+    # property writes while restricted draw data is active.
+    image = runtime.find_aux_mask_image(project, item)
     if image is None:
         return tr("%s: Mask image is missing") % output
     expected = int(getattr(project, "resolution", 0))
