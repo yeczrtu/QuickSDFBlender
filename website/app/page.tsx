@@ -327,8 +327,8 @@ function ScreenFigure({
   fullSizeLabel,
   caption,
   legend,
-  width = 2048,
-  height = 1080,
+  width = 1920,
+  height = 1001,
   className = "",
 }: {
   src: string;
@@ -343,6 +343,8 @@ function ScreenFigure({
   return (
     <figure className={`screen-figure ${className}`.trim()}>
       <a href={src} target="_blank" rel="noreferrer" aria-label={`${alt} — ${fullSizeLabel}`}>
+        {/* Static GitHub Pages export keeps the original capture byte-for-byte. */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={src} alt={alt} width={width} height={height} loading="lazy" />
       </a>
       {caption || legend ? (
@@ -486,8 +488,10 @@ export default function Home() {
             </div>
             <figure className="screen-figure motion-figure">
               <a href={`${media}quick-sdf-angle-seek.gif`} target="_blank" rel="noreferrer" aria-label={`${t.imageAlts.angle} — ${t.openFullSize}`}>
-                <img className="motion-live" src={`${media}quick-sdf-angle-seek.gif`} alt={t.gifAlt} width="960" height="540" loading="lazy" />
-                <img className="motion-still" src={`${media}quick-sdf-angle-seek-poster.png`} alt={t.imageAlts.angle} width="1280" height="720" loading="lazy" />
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img className="motion-live" src={`${media}quick-sdf-angle-seek.gif`} alt={t.gifAlt} width="800" height="450" loading="lazy" />
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img className="motion-still" src={`${media}quick-sdf-angle-seek-poster.png`} alt={t.imageAlts.angle} width="800" height="450" loading="lazy" />
               </a>
             </figure>
             <div className="angle-explanation">
@@ -504,7 +508,10 @@ export default function Home() {
             </div>
             <ScreenFigure src={`${media}quick-sdf-export.png`} alt={t.imageAlts.export} fullSizeLabel={t.openFullSize} legend={t.step5Legend} className="wide-figure" />
             <div className="output-panel">
-              <figure><img src={`${media}quick-sdf-threshold-example.png`} alt={t.imageAlts.texture} width="1024" height="1024" loading="lazy" /></figure>
+              <figure>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={`${media}quick-sdf-threshold-example.png`} alt={t.imageAlts.texture} width="1024" height="1024" loading="lazy" />
+              </figure>
               <div>
                 <h3>{t.outputTitle}</h3>
                 <p>{t.outputBody}</p>

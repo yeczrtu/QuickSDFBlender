@@ -62,7 +62,7 @@ export default function ArticlesIndex() {
         <header className="articles-index-hero page-shell">
           <p className="article-category">Quick SDF Paint technical notes</p>
           <h1>顔影スレッショルドマップを<br />仕組みから理解する</h1>
-          <p>角度別の白黒マスクを、光の向きに応じた一枚のデータへ変換する手法を扱います。既存資料の要約だけでなく、同一条件での比較実験とBlenderでの制作結果を含めています。</p>
+          <p>角度別の白黒マスクを、光の向きに応じた一枚のデータへ変換する手法を扱います。基礎構造、同一条件での補間比較、Blender 5.1での実践手順を順番に説明します。</p>
         </header>
 
         <section className="articles-index-grid page-shell" aria-label="解説記事">
@@ -82,9 +82,9 @@ export default function ArticlesIndex() {
         </section>
 
         <section className="articles-method page-shell" aria-labelledby="articles-method-title">
-          <h2 id="articles-method-title">記事の作り方</h2>
+          <h2 id="articles-method-title">調査と検証の範囲</h2>
           <div>
-            <p>公開資料は、用語、既存事例、アルゴリズムの出典として参照しています。文章や図の構成は転用せず、複数実装に共通する処理を整理し直しました。</p>
+            <p>公開資料から用語、既存事例、アルゴリズムを確認し、複数実装に共通する処理を制作工程に沿って整理しています。</p>
             <p>比較記事の画像と数値は、リポジトリ内の決定的な検証スクリプトから生成しています。実践記事はBlender 5.1とQuick SDF Paint 0.7.1で確認した内容です。</p>
           </div>
         </section>
