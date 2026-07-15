@@ -60,6 +60,11 @@ export default function BlenderWorkflowArticle() {
   return (
     <ArticleLayout
       article={article}
+      titleParts={[
+        <>Quick SDF Paint <wbr />0.7.1で</>,
+        <>顔影スレッショルド<wbr />マップを作る：</>,
+        <>Blenderでの<wbr />実践手順</>,
+      ]}
       toc={toc}
       lead="Quick SDF Paint 0.7.1を使い、法線ガイドから顔影スレッショルドマップを書き出す実践手順です。角度ごとに別の影絵を完成させるのではなく、一つの影境界が制作上の進行度に応じて顔の上をどう移動するかを設計します。"
     >

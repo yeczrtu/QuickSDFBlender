@@ -3,6 +3,12 @@ import { articlePath, articles, basePath, siteOrigin } from "./article-data";
 
 const pageUrl = `${siteOrigin}${basePath}/articles/`;
 
+const articleCardTitles = {
+  "face-shadow-threshold-map": <>顔影スレッショルドマップ<wbr />とは</>,
+  "sdf-threshold-interpolation": <>SDF距離補間の比較</>,
+  "blender-threshold-map-workflow": <>Quick SDF Paint 0.7.1の<wbr />実践手順</>,
+};
+
 export const metadata: Metadata = {
   title: "顔影スレッショルドマップ解説 | Quick SDF Paint",
   description:
@@ -61,7 +67,10 @@ export default function ArticlesIndex() {
       <main id="articles">
         <header className="articles-index-hero page-shell">
           <p className="article-category">Quick SDF Paint 技術解説</p>
-          <h1>顔影スレッショルドマップの仕組みと制作方法</h1>
+          <h1>
+            <span className="article-title-line">顔影スレッショルド<wbr />マップの<wbr /></span>
+            <span className="article-title-line">仕組みと制作方法</span>
+          </h1>
           <p>角度別の白黒マスクを、光の向きに応じた1枚のデータテクスチャへ変換する手法を扱います。基本的な仕組み、同一条件での補間比較、Blender 5.1での実践手順を順番に説明します。</p>
         </header>
 
@@ -70,7 +79,7 @@ export default function ArticlesIndex() {
             <a className="article-index-card" href={articlePath(article.slug)} key={article.slug}>
               <span className="article-index-number">0{index + 1}</span>
               <span className="article-index-category">{article.category}</span>
-              <h2>{article.shortTitle}</h2>
+              <h2>{articleCardTitles[article.slug]}</h2>
               <p>{article.description}</p>
               <dl>
                 <div><dt>対象</dt><dd>{article.audience}</dd></div>

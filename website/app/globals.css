@@ -1228,10 +1228,16 @@ h3 {
 
 .article-hero h1 {
   max-width: 960px;
-  font-size: clamp(38px, 5.5vw, 66px);
+  font-size: clamp(38px, 5.1vw, 62px);
   letter-spacing: -0.01em;
   line-break: strict;
   text-wrap: balance;
+  word-break: keep-all;
+}
+
+.article-title-line {
+  display: block;
+  white-space: nowrap;
 }
 
 .article-lead {
@@ -1716,10 +1722,11 @@ h3 {
 }
 
 .articles-index-hero h1 {
-  font-size: clamp(42px, 7vw, 78px);
+  font-size: clamp(42px, 6vw, 68px);
   letter-spacing: -0.01em;
   line-break: strict;
   text-wrap: balance;
+  word-break: keep-all;
 }
 
 .articles-index-hero > p:last-child {
@@ -1765,6 +1772,9 @@ h3 {
   position: relative;
   margin-bottom: 18px;
   font-size: 27px;
+  overflow-wrap: normal;
+  text-wrap: balance;
+  word-break: keep-all;
 }
 
 .article-index-card > p {
@@ -1975,13 +1985,13 @@ h3 {
   }
 
   .article-breadcrumb {
-    overflow-x: auto;
-    white-space: nowrap;
+    overflow-x: visible;
+    white-space: normal;
   }
 
   .article-breadcrumb ol {
-    width: max-content;
-    flex-wrap: nowrap;
+    width: auto;
+    flex-wrap: wrap;
   }
 
   .article-hero {
@@ -1991,6 +2001,11 @@ h3 {
   .article-hero h1,
   .articles-index-hero h1 {
     font-size: clamp(30px, 9vw, 34px);
+  }
+
+  .article-title-line {
+    display: inline;
+    white-space: normal;
   }
 
   .articles-index-hero h1 br {

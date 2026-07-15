@@ -14,11 +14,13 @@ export type TocItem = { id: string; label: string };
 export function ArticleLayout({
   article,
   lead,
+  titleParts,
   toc,
   children,
 }: {
   article: ArticleRecord;
   lead: string;
+  titleParts?: readonly ReactNode[];
   toc: readonly TocItem[];
   children: ReactNode;
 }) {
@@ -86,7 +88,16 @@ export function ArticleLayout({
 
         <header className="article-hero page-shell">
           <p className="article-category">{article.category}</p>
-          <h1>{article.title}</h1>
+          <h1>
+            {titleParts
+              ? titleParts.map((part, index) => (
+                  <span className="article-title-line" key={`${article.slug}-title-${index}`}>
+                    {part}
+                    {index < titleParts.length - 1 ? <wbr /> : null}
+                  </span>
+                ))
+              : article.title}
+          </h1>
           <p className="article-lead">{lead}</p>
           <dl className="article-meta">
             <div><dt>対象</dt><dd>{article.audience}</dd></div>

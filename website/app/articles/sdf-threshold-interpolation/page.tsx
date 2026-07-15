@@ -78,6 +78,10 @@ export default function SdfThresholdInterpolationArticle() {
   return (
     <ArticleLayout
       article={article}
+      titleParts={[
+        <>角度別マスクを1枚に<wbr />まとめる</>,
+        <>方法：<wbr />SDF距離補間の比較</>,
+      ]}
       toc={toc}
       lead="同じ7枚の二値マスクを、最近傍、画素線形、ボックスブラー、符号付き距離場（Signed Distance Field、SDF）の距離比でキー間へ復元しました。SDFが有効な条件だけでなく、凹形状、成分の出現、細線で起きる誤差も実測します。"
     >

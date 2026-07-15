@@ -279,7 +279,10 @@ const articlePages = [
 
 test("exports an index and three distinct long-form articles", async () => {
   const index = await readFile(new URL("../out/articles/index.html", import.meta.url), "utf8");
-  assert.match(index, /顔影スレッショルドマップの仕組みと制作方法/);
+  assert.match(
+    index.replaceAll("<wbr/>", "").replace(/<\/?span\b[^>]*>/g, ""),
+    /顔影スレッショルドマップの仕組みと制作方法/,
+  );
   assert.match(index, /基本的な仕組み、同一条件での補間比較、Blender 5\.1での実践手順/);
   assert.doesNotMatch(index, /既存資料の要約だけでなく|既存要約ではない/);
 
@@ -380,6 +383,7 @@ test("keeps Japanese article prose, notation, and UI labels consistent", async (
   assert.match(data, /角度別マスクを1枚にまとめる方法：SDF距離補間の比較/);
   assert.match(data, /Quick SDF Paint 0\.7\.1で顔影スレッショルドマップを作る：Blenderでの実践手順/);
   assert.match(index, /Quick SDF Paint 技術解説/);
+  assert.match(index, /顔影スレッショルド<wbr\s*\/>マップの/);
   assert.match(layout, /<dt>読了時間<\/dt>/);
   assert.match(layout, /<dt>発行元<\/dt>/);
 
@@ -404,8 +408,10 @@ test("keeps Japanese article prose, notation, and UI labels consistent", async (
   assert.match(workflow, /<code>SDF Area<\/code>/);
 
   assert.match(css, /\.article-hero h1[\s\S]*?text-wrap: balance/);
+  assert.match(css, /\.article-hero h1[\s\S]*?word-break: keep-all/);
   assert.match(css, /\.article-body[\s\S]*?line-break: strict/);
   assert.match(css, /\.article-table-scroll[\s\S]*?overflow-x: auto/);
+  assert.match(css, /@media \(max-width: 760px\)[\s\S]*?\.article-breadcrumb[\s\S]*?overflow-x: visible/);
   assert.match(css, /@media \(max-width: 760px\)[\s\S]*?font-size: clamp\(30px, 9vw, 34px\)/);
 });
 

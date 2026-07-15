@@ -59,6 +59,10 @@ export default function FaceShadowThresholdMapArticle() {
   return (
     <ArticleLayout
       article={article}
+      titleParts={[
+        <>顔影スレッショルド<wbr />マップとは：</>,
+        <>仕組みと制作方法</>,
+      ]}
       toc={toc}
       lead="顔影スレッショルドマップは、完成した影の明るさではなく、顔の各画素が制作進行度のどこで明部へ切り替わるかを保存するデータです。特定の製品に依存しない形で、制作・補間・格納・シェーダー評価の4段階に分けて説明します。"
     >
