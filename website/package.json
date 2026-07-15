@@ -1,6 +1,6 @@
 {
-  "name": "quick-sdf-studio-docs",
-  "version": "0.6.1",
+  "name": "quick-sdf-paint-docs",
+  "version": "0.7.1",
   "private": true,
   "engines": {
     "node": ">=22.13.0"

@@ -250,6 +250,112 @@ h3 {
   font-size: 16px;
 }
 
+.concept-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 1fr);
+  gap: 18px;
+  padding-bottom: 72px;
+}
+
+.pipeline-card,
+.terminology-note {
+  padding: 22px 24px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.pipeline-card > strong {
+  display: block;
+  margin-bottom: 14px;
+  color: var(--blue-soft);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pipeline-card ol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 30px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pipeline-card li {
+  position: relative;
+  color: var(--soft);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.pipeline-card li + li::before {
+  position: absolute;
+  left: -20px;
+  color: var(--orange);
+  content: "→";
+}
+
+.terminology-note {
+  border-left: 3px solid var(--orange);
+}
+
+.terminology-note h2 {
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.terminology-note p {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.terminology-note ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.terminology-note li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--soft);
+  font-size: 10px;
+}
+
+.terminology-sources {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.terminology-sources a {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--blue-soft);
+  background: var(--surface-2);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.terminology-sources a:hover {
+  color: var(--text);
+  border-color: #4b5a69;
+}
+
 .intro-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1033,6 +1139,10 @@ h3 {
     padding-top: 72px;
   }
 
+  .concept-section {
+    grid-template-columns: 1fr;
+  }
+
   .basics-section dl,
   .install-steps {
     grid-template-columns: 1fr 1fr;
@@ -1103,6 +1213,27 @@ h3 {
     grid-template-columns: 1fr;
     gap: 36px;
     padding-block: 62px 42px;
+  }
+
+  .concept-section {
+    padding-bottom: 48px;
+  }
+
+  .pipeline-card ol {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+
+  .pipeline-card li + li::before {
+    top: -17px;
+    left: 0;
+    transform: rotate(90deg);
+  }
+
+  .terminology-note li {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
   }
 
   .model-credit {
