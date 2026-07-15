@@ -186,7 +186,7 @@ def review_threshold_rgba16(
     *,
     maximum: int = _PREVIEW_MAXIMUM,
 ) -> np.ndarray:
-    """Evaluate a lilToon face-SDF texture at continuous authored progress.
+    """Evaluate a lilToon threshold-map texture at continuous authored progress.
 
     Positive angles (including zero) use R and negative angles use G. The
     authored 0..90 sweep maps to lilToon's horizontal forward dot in -0.5..0.5

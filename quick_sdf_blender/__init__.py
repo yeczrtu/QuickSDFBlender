@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 bl_info = {
-    "name": "Quick SDF Studio",
+    "name": "Quick SDF Paint",
     "author": "Quick SDF contributors",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (5, 1, 0),
     "location": "3D View > Sidebar > Quick SDF",
-    "description": "Paint production-ready toon face shadows with an artist-first angle timeline",
+    "description": "Paint face-shadow threshold maps for toon rendering",
     "category": "Paint",
 }
 

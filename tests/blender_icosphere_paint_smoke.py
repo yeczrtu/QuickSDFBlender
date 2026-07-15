@@ -240,7 +240,7 @@ def _tick() -> float | None:
                 STATE["waits"] = int(STATE["waits"]) + 1
                 if int(STATE["waits"]) > 250:
                     raise AssertionError(
-                        project.diagnostic_message or "Quick SDF Studio did not open"
+                        project.diagnostic_message or "Quick SDF Paint did not open"
                     )
                 return 0.04
             STATE["details"]["tools_after_enter"] = _assert_active_tools()
@@ -318,7 +318,7 @@ def _tick() -> float | None:
                 if int(STATE["exit_waits"]) <= 200:
                     return 0.05
                 raise AssertionError(
-                    "Quick SDF Studio did not restore the previous workspace: "
+                    "Quick SDF Paint did not restore the previous workspace: "
                     f"session={studio.current_session()!r}, "
                     f"workspace={bpy.context.window.workspace.name!r}"
                 )

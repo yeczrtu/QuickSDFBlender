@@ -573,7 +573,7 @@ def _validated_side_stack(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Validate one artist-facing 0..90 degree mask lane.
 
-    Quick SDF Studio authors the right and left lanes independently instead of
+    Quick SDF Paint authors the right and left lanes independently instead of
     encoding the side in an angle sign. Keeping this validation separate from
     the signed-stack convenience API makes it impossible to accidentally swap
     the R and G output channels.

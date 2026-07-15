@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Artist-facing monotonic paint rules used by Quick SDF Studio.
+"""Artist-facing monotonic paint rules used by Quick SDF Paint.
 
 The public functions in this module are Blender-independent.  The Blender
 operator captures a native Texture Paint stroke, derives its footprint, and
