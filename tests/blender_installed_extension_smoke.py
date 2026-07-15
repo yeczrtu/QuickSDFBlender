@@ -48,7 +48,7 @@ def run(module_name: str, expected_version: str, isolated_root: Path) -> None:
 
     native = importlib.import_module(f"{module_name}.native")
     assert native.available()
-    assert native.version() == 6
+    assert native.version() == 7
     assert native.native_threshold_available()
     assert native.native_guide_bake_available()
     assert native.native_repair_available()

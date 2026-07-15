@@ -244,6 +244,16 @@ def _paint() -> float | None:
         # completion. Rebake must preserve both that footprint and its RGB.
         project.guide_shadow_amount = 0.0
         assert bpy.ops.quicksdf.bake_base() == {"FINISHED"}
+        from quick_sdf_blender import operators
+
+        bake_deadline = time.monotonic() + 15.0
+        while operators._BAKE_JOB is not None and time.monotonic() < bake_deadline:
+            delay = operators._poll_bake_job()
+            if delay:
+                time.sleep(min(float(delay), 0.02))
+        assert operators._BAKE_JOB is None, "Rebake did not settle"
+        if bpy.app.timers.is_registered(operators._poll_bake_job):
+            bpy.app.timers.unregister(operators._poll_bake_job)
         rebaked = runtime.image_rgba(canvas)
         np.testing.assert_array_equal(rebaked[..., :3][changed], after[..., :3][changed])
         coverage_rebaked = runtime.coverage_mask(angle_item)

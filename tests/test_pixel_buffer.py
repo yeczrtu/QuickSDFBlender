@@ -4,7 +4,11 @@ import unittest
 
 import numpy as np
 
-from quick_sdf_blender.pixel_buffer import blender_float_rgba_to_top_down_u8
+from quick_sdf_blender.pixel_buffer import (
+    blender_float_rgba_to_top_down_gray8,
+    blender_float_rgba_to_top_down_u8,
+    top_down_gray8_to_blender_float_rgba,
+)
 
 
 class BlenderFloatRgbaConversionTests(unittest.TestCase):
@@ -84,6 +88,44 @@ class BlenderFloatRgbaConversionTests(unittest.TestCase):
             blender_float_rgba_to_top_down_u8(read_only, 2, 1)
         with self.assertRaisesRegex(ValueError, "expected 8"):
             blender_float_rgba_to_top_down_u8(np.zeros(4, np.float32), 2, 1)
+
+    def test_direct_gray8_path_matches_rgba_red_without_rgba_result(self) -> None:
+        rng = np.random.default_rng(773)
+        blender_rows = rng.uniform(-0.1, 1.1, size=(9, 13, 4)).astype(np.float32)
+        expected = blender_float_rgba_to_top_down_u8(
+            blender_rows.copy().reshape(-1), 13, 9
+        )[..., 0]
+        result = blender_float_rgba_to_top_down_gray8(
+            blender_rows.reshape(-1), 13, 9
+        )
+        np.testing.assert_array_equal(result, expected)
+        self.assertEqual(result.shape, (9, 13))
+        self.assertEqual(result.nbytes, 9 * 13)
+        self.assertTrue(result.flags.c_contiguous)
+
+    def test_gray8_upload_uses_reusable_bottom_up_float_buffer(self) -> None:
+        gray = np.asarray([[0, 127, 255], [1, 128, 254]], dtype=np.uint8)
+        reusable = np.full(gray.size * 4, np.nan, dtype=np.float32)
+        result = top_down_gray8_to_blender_float_rgba(gray, out=reusable)
+        self.assertIs(result, reusable)
+        rgba = result.reshape(2, 3, 4)
+        expected_gray = gray[::-1].astype(np.float32) / np.float32(255.0)
+        np.testing.assert_allclose(rgba[..., 0], expected_gray, rtol=0.0, atol=1e-7)
+        np.testing.assert_allclose(rgba[..., 1], expected_gray, rtol=0.0, atol=1e-7)
+        np.testing.assert_allclose(rgba[..., 2], expected_gray, rtol=0.0, atol=1e-7)
+        np.testing.assert_array_equal(rgba[..., 3], 1.0)
+
+    def test_gray8_upload_validation(self) -> None:
+        gray = np.zeros((2, 3), dtype=np.uint8)
+        with self.assertRaisesRegex(TypeError, "uint8"):
+            top_down_gray8_to_blender_float_rgba(gray.astype(np.float32))
+        with self.assertRaisesRegex(ValueError, "two-dimensional"):
+            top_down_gray8_to_blender_float_rgba(gray[..., None])
+        with self.assertRaisesRegex(ValueError, "expected 24"):
+            top_down_gray8_to_blender_float_rgba(
+                gray,
+                out=np.empty(23, dtype=np.float32),
+            )
 
 
 if __name__ == "__main__":

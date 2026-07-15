@@ -27,8 +27,9 @@ import numpy as np
 
 MAGIC: Final = b"QSDFBIT\0"
 FORMAT_VERSION: Final = 1
-DEFAULT_CACHE_BYTE_BUDGET: Final = 128 * 1024 * 1024
+DEFAULT_CACHE_BYTE_BUDGET: Final = 64 * 1024 * 1024
 DEFAULT_MAX_RAW_BYTES: Final = 512 * 1024 * 1024
+DEFAULT_INSERT_CHUNK_BYTES: Final = 256 * 1024
 
 
 class BitplaneError(ValueError):
@@ -286,6 +287,87 @@ def decode_bitplane(
     return np.ascontiguousarray(unpacked.reshape(header.shape), dtype=np.bool_)
 
 
+def decode_bitplane_packed(
+    blob: bytes | bytearray | memoryview,
+    *,
+    expected_role: BitplaneRole | str | int | None = None,
+    max_raw_bytes: int = DEFAULT_MAX_RAW_BYTES,
+) -> tuple[BitplaneHeader, bytes]:
+    """Validate a bitplane and return its original little-bit packed pixels.
+
+    Export snapshot code can consume this representation without expanding a
+    full boolean image.  The returned bytes are top-down row-major and have
+    exactly ``header.raw_size`` bytes.
+    """
+
+    if isinstance(max_raw_bytes, bool) or not isinstance(max_raw_bytes, int):
+        raise TypeError("max_raw_bytes must be an integer")
+    if max_raw_bytes <= 0:
+        raise ValueError("max_raw_bytes must be positive")
+    view = _as_blob_view(blob)
+    header = inspect_bitplane_header(view)
+    if expected_role is not None:
+        semantic_role = _coerce_role(expected_role)
+        if header.role is not semantic_role:
+            raise BitplaneError(
+                f"bitplane role is {header.role.name}, expected {semantic_role.name}"
+            )
+    return header, _decode_payload(view, header, max_raw_bytes=max_raw_bytes)
+
+
+def insert_bitplane_into_uint16(
+    blob: bytes | bytearray | memoryview,
+    bit_index: int,
+    out: np.ndarray,
+    *,
+    expected_role: BitplaneRole | str | int | None = None,
+    chunk_bytes: int = DEFAULT_INSERT_CHUNK_BYTES,
+) -> BitplaneHeader:
+    """OR one serialized plane into a uint16 per-pixel key bit field.
+
+    Only a bounded lookup chunk is expanded.  This is the schema-6 bridge for
+    ABI-7 ``PackedLane`` snapshots and avoids the decoded bitplane LRU.
+    """
+
+    if isinstance(bit_index, bool) or not isinstance(bit_index, (int, np.integer)):
+        raise TypeError("bit_index must be an integer")
+    bit_index = int(bit_index)
+    if not 0 <= bit_index < 16:
+        raise ValueError("bit_index must be in the range 0..15")
+    if not isinstance(out, np.ndarray):
+        raise TypeError("out must be a NumPy array")
+    if out.ndim != 2 or out.dtype != np.uint16:
+        raise TypeError("out must be a two-dimensional uint16 array")
+    if not out.flags.c_contiguous or not out.flags.writeable:
+        raise ValueError("out must be writable and C-contiguous")
+    if isinstance(chunk_bytes, bool) or not isinstance(chunk_bytes, int):
+        raise TypeError("chunk_bytes must be an integer")
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+
+    header, raw = decode_bitplane_packed(blob, expected_role=expected_role)
+    if out.shape != header.shape:
+        raise ValueError(
+            f"out shape {out.shape} does not match bitplane shape {header.shape}"
+        )
+    packed = np.frombuffer(raw, dtype=np.uint8)
+    output = out.reshape(-1)
+    lookup = (
+        (np.arange(256, dtype=np.uint16)[:, None] >> np.arange(8, dtype=np.uint16))
+        & np.uint16(1)
+    )
+    output_mask = np.uint16(1 << bit_index)
+    for byte_start in range(0, packed.size, chunk_bytes):
+        byte_end = min(packed.size, byte_start + chunk_bytes)
+        pixel_start = byte_start * 8
+        pixel_end = min(header.pixel_count, byte_end * 8)
+        expanded = lookup[packed[byte_start:byte_end]].reshape(-1)
+        output[pixel_start:pixel_end] |= (
+            expanded[: pixel_end - pixel_start] * output_mask
+        )
+    return header
+
+
 @dataclass(frozen=True, slots=True)
 class _CacheEntry:
     identifier: str
@@ -402,11 +484,14 @@ __all__ = [
     "BitplaneRole",
     "DecodedBitplaneCache",
     "DEFAULT_CACHE_BYTE_BUDGET",
+    "DEFAULT_INSERT_CHUNK_BYTES",
     "DEFAULT_MAX_RAW_BYTES",
     "FORMAT_VERSION",
     "HEADER_SIZE",
     "MAGIC",
     "decode_bitplane",
+    "decode_bitplane_packed",
     "encode_bitplane",
+    "insert_bitplane_into_uint16",
     "inspect_bitplane_header",
 ]

@@ -6,7 +6,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Quick SDF Studio",
     "author": "Quick SDF contributors",
-    "version": (0, 6, 1),
+    "version": (0, 7, 0),
     "blender": (5, 1, 0),
     "location": "3D View > Sidebar > Quick SDF",
     "description": "Paint production-ready toon face shadows with an artist-first angle timeline",
@@ -48,6 +48,7 @@ def register():
         # references and a second enable attempt fails.
         from . import i18n, model, operators, preview, runtime, studio, timeline, tools, ui
 
+        operators.shutdown_bake_job(message="Base update cancelled during add-on cleanup")
         operators.shutdown_export_job(message="Export cancelled during add-on cleanup")
 
         for cleanup in (
@@ -77,6 +78,7 @@ def unregister():
 
     from . import i18n, live_preview, model, operators, preview, runtime, studio, timeline, tools, ui
 
+    operators.shutdown_bake_job(message="Base update cancelled because the add-on was disabled")
     operators.shutdown_export_job(message="Export cancelled because the add-on was disabled")
     ui.unregister_keymaps()
     studio.unregister_studio()

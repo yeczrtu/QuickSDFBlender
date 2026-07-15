@@ -2069,12 +2069,6 @@ def _configure_session_target(
     ensure_studio_material_preview(context, session=session)
     if frame_content:
         _frame_studio_content(context, window, view_area, image_area)
-    try:
-        from .runtime import refresh_base_staleness
-
-        refresh_base_staleness(project, scene)
-    except (AttributeError, ReferenceError, RuntimeError):
-        pass
     project.warning_message = ""
     return project
 
@@ -2326,13 +2320,6 @@ def enter_studio(
     obj = getattr(project, "target_object", None)
     if obj is None or getattr(obj, "type", "") != "MESH":
         raise StudioError("The Quick SDF target must be a local mesh")
-    try:
-        from .runtime import refresh_base_staleness
-
-        refresh_base_staleness(project, context.scene)
-    except (AttributeError, ReferenceError, RuntimeError):
-        pass
-
     window = context.window
     scene = context.scene
     previous_workspace = window.workspace

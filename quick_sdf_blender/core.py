@@ -84,6 +84,42 @@ class MonotonicRepairResult:
     protected_changed_pixel_count: int
 
 
+@dataclass(frozen=True)
+class PackedLane:
+    """A 0..90 lane stored as one bit per key in each image pixel.
+
+    Bit ``i`` corresponds to ``angles[i]``.  Studio lanes are limited to
+    sixteen keys, so the representation stays a compact ``uint16`` plane and
+    can be passed to the ABI-7 native core without expanding an ``N x H x W``
+    boolean stack.
+    """
+
+    angles: np.ndarray
+    display_bits: np.ndarray
+    base_bits: np.ndarray
+    coverage_bits: np.ndarray
+
+    @property
+    def count(self) -> int:
+        return int(self.angles.size)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(int(value) for value in self.display_bits.shape)
+
+
+@dataclass(frozen=True)
+class PackedLaneRepairResult:
+    """Compact monotonic-repair result produced from a :class:`PackedLane`."""
+
+    transition_indices: np.ndarray
+    changed_count: np.ndarray
+    changed_sample_count: int
+    changed_pixel_count: int
+    protected_changed_sample_count: int
+    protected_changed_pixel_count: int
+
+
 def _as_binary(values: np.ndarray | Sequence[object], *, ndim: int) -> np.ndarray:
     """Convert common normalized/8-bit/16-bit mask arrays to bool."""
 
@@ -587,6 +623,150 @@ def validate_side_monotonic(
     )
 
 
+def pack_lane_bits(
+    mask_stack: np.ndarray | Sequence[object],
+    angles: Sequence[float] | np.ndarray,
+    base_stack: np.ndarray | Sequence[object],
+    coverage_stack: np.ndarray | Sequence[object],
+) -> PackedLane:
+    """Pack three lane stacks into ABI-7 per-pixel ``uint16`` bit fields."""
+
+    masks, values = _validated_side_stack(mask_stack, angles, name="lane")
+    base = _as_binary(base_stack, ndim=3)
+    coverage = _as_binary(coverage_stack, ndim=3)
+    if base.shape != masks.shape or coverage.shape != masks.shape:
+        raise ValueError("mask, base, and coverage stacks must have the same shape")
+    if masks.shape[0] > 16:
+        raise ValueError("packed lanes support at most 16 angle keys")
+
+    # _validated_side_stack sorts the display stack. Apply the same stable
+    # order to the other two planes before assigning their bits.
+    original_angles = _validated_angles(angles, masks.shape[0])
+    order = np.argsort(original_angles, kind="stable")
+    base = np.ascontiguousarray(base[order])
+    coverage = np.ascontiguousarray(coverage[order])
+    shape = masks.shape[1:]
+    display_bits = np.zeros(shape, dtype=np.uint16)
+    base_bits = np.zeros(shape, dtype=np.uint16)
+    coverage_bits = np.zeros(shape, dtype=np.uint16)
+    for index in range(masks.shape[0]):
+        bit = np.uint16(1 << index)
+        display_bits[masks[index]] |= bit
+        base_bits[base[index]] |= bit
+        coverage_bits[coverage[index]] |= bit
+    return PackedLane(
+        angles=np.ascontiguousarray(values, dtype=np.float64),
+        display_bits=display_bits,
+        base_bits=base_bits,
+        coverage_bits=coverage_bits,
+    )
+
+
+def unpack_lane_bits(bits: np.ndarray | Sequence[object], count: int) -> np.ndarray:
+    """Expand an ABI-7 bit field to a boolean stack (reference/debug path)."""
+
+    values = np.asarray(bits)
+    if values.ndim != 2 or any(size <= 0 for size in values.shape):
+        raise ValueError("packed lane bits must be a non-empty 2D plane")
+    if values.dtype != np.uint16:
+        if not np.issubdtype(values.dtype, np.integer):
+            raise TypeError("packed lane bits must contain integer values")
+        if np.any(values < 0) or np.any(values > np.iinfo(np.uint16).max):
+            raise ValueError("packed lane bits must fit in uint16")
+        values = np.asarray(values, dtype=np.uint16)
+    key_count = int(count)
+    if key_count < 1 or key_count > 16:
+        raise ValueError("packed lane key count must be in [1, 16]")
+    shifts = np.arange(key_count, dtype=np.uint16)[:, None, None]
+    return np.ascontiguousarray(((values[None, ...] >> shifts) & 1) != 0)
+
+
+def repair_packed_lane(lane: PackedLane) -> PackedLaneRepairResult:
+    """Pure NumPy reference for ABI-7 compact monotonic repair."""
+
+    if not isinstance(lane, PackedLane):
+        raise TypeError("lane must be a PackedLane")
+    values = _validated_angles(lane.angles, lane.count)
+    if lane.count < 1 or lane.count > 16:
+        raise ValueError("packed lanes support between 1 and 16 angle keys")
+    if np.any(np.diff(values) <= _ANGLE_EPSILON):
+        raise ValueError("packed lane angles must be strictly increasing")
+    planes = []
+    for name, plane in (
+        ("display", lane.display_bits),
+        ("base", lane.base_bits),
+        ("coverage", lane.coverage_bits),
+    ):
+        array = np.asarray(plane)
+        if array.ndim != 2 or any(size <= 0 for size in array.shape):
+            raise ValueError(f"{name}_bits must be a non-empty 2D plane")
+        if array.dtype != np.uint16:
+            raise TypeError(f"{name}_bits must use uint16")
+        planes.append(np.ascontiguousarray(array))
+    display_bits, base_bits, coverage_bits = planes
+    if base_bits.shape != display_bits.shape or coverage_bits.shape != display_bits.shape:
+        raise ValueError("packed display, base, and coverage planes must share a shape")
+
+    protected_cost = np.zeros(display_bits.shape, dtype=np.int16)
+    display_cost = np.zeros(display_bits.shape, dtype=np.int16)
+    base_cost = np.zeros(display_bits.shape, dtype=np.int16)
+    for index in range(lane.count):
+        bit = np.uint16(1 << index)
+        display = (display_bits & bit) != 0
+        base = (base_bits & bit) != 0
+        protected = ((coverage_bits & bit) != 0) | (display != base)
+        display_cost += (~display).astype(np.int16)
+        base_cost += (~base).astype(np.int16)
+        protected_cost += (protected & ~display).astype(np.int16)
+
+    best_protected = protected_cost.copy()
+    best_display = display_cost.copy()
+    best_base = base_cost.copy()
+    transitions = np.zeros(display_bits.shape, dtype=np.uint8)
+    for transition in range(1, lane.count + 1):
+        bit = np.uint16(1 << (transition - 1))
+        display = (display_bits & bit) != 0
+        base = (base_bits & bit) != 0
+        protected = ((coverage_bits & bit) != 0) | (display != base)
+        display_delta = np.where(display, 1, -1).astype(np.int16)
+        protected_cost += display_delta * protected.astype(np.int16)
+        display_cost += display_delta
+        base_cost += np.where(base, 1, -1).astype(np.int16)
+        better = (protected_cost < best_protected) | (
+            (protected_cost == best_protected)
+            & (
+                (display_cost < best_display)
+                | ((display_cost == best_display) & (base_cost < best_base))
+            )
+        )
+        best_protected[better] = protected_cost[better]
+        best_display[better] = display_cost[better]
+        best_base[better] = base_cost[better]
+        transitions[better] = np.uint8(transition)
+
+    changed_count = np.zeros(display_bits.shape, dtype=np.uint8)
+    protected_changed_count = np.zeros(display_bits.shape, dtype=np.uint8)
+    for index in range(lane.count):
+        bit = np.uint16(1 << index)
+        display = (display_bits & bit) != 0
+        base = (base_bits & bit) != 0
+        repaired = index >= transitions
+        changed = repaired != display
+        protected = ((coverage_bits & bit) != 0) | (display != base)
+        changed_count += changed.astype(np.uint8)
+        protected_changed_count += (changed & protected).astype(np.uint8)
+    return PackedLaneRepairResult(
+        transition_indices=np.ascontiguousarray(transitions),
+        changed_count=np.ascontiguousarray(changed_count),
+        changed_sample_count=int(np.sum(changed_count, dtype=np.uint64)),
+        changed_pixel_count=int(np.count_nonzero(changed_count)),
+        protected_changed_sample_count=int(
+            np.sum(protected_changed_count, dtype=np.uint64)
+        ),
+        protected_changed_pixel_count=int(np.count_nonzero(protected_changed_count)),
+    )
+
+
 def repair_side_monotonic(
     mask_stack: np.ndarray | Sequence[object],
     base_stack: np.ndarray | Sequence[object],
@@ -660,6 +840,60 @@ def _threshold_for_lane(masks: np.ndarray, angles: np.ndarray) -> np.ndarray:
     return _threshold_for_side(masks, angles, indices, {})
 
 
+def generate_threshold_transitions(
+    transition_indices: np.ndarray | Sequence[object],
+    angles: Sequence[float] | np.ndarray,
+    *,
+    out: np.ndarray | None = None,
+    channel: int = 0,
+) -> np.ndarray:
+    """Generate one exact threshold channel from compact transition indices.
+
+    ``transition_indices`` stores the number of leading Shadow keys per pixel:
+    zero is always Light and ``len(angles)`` is always Shadow.  ``out`` may be
+    either a two-dimensional uint16 plane or an HxWxC uint16 image; the latter
+    lets the native/export path write directly into an RGBA destination.
+    """
+
+    values = np.asarray(angles, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or values.size > 16:
+        raise ValueError("angles must contain between 2 and 16 keys")
+    if not np.all(np.isfinite(values)) or np.any(np.diff(values) <= _ANGLE_EPSILON):
+        raise ValueError("angles must be finite and strictly increasing")
+    if not np.isclose(values[0], 0.0, atol=_ANGLE_EPSILON, rtol=0.0) or not np.isclose(
+        values[-1], 90.0, atol=_ANGLE_EPSILON, rtol=0.0
+    ):
+        raise ValueError("angles must include 0 and 90 degree endpoints")
+    transitions = np.asarray(transition_indices)
+    if transitions.ndim != 2 or any(size <= 0 for size in transitions.shape):
+        raise ValueError("transition indices must be a non-empty 2D plane")
+    if not np.issubdtype(transitions.dtype, np.integer):
+        raise TypeError("transition indices must contain integers")
+    if np.any(transitions < 0) or np.any(transitions > values.size):
+        raise ValueError("transition indices are outside the angle sequence")
+    masks = np.arange(values.size, dtype=np.int16)[:, None, None] >= transitions[None, ...]
+    threshold = _threshold_for_lane(np.ascontiguousarray(masks), values)
+    if out is None:
+        return threshold
+    destination = np.asarray(out)
+    if destination.dtype != np.uint16:
+        raise TypeError("threshold output must use uint16")
+    if not destination.flags.writeable:
+        raise ValueError("threshold output must be writeable")
+    if destination.ndim == 2:
+        if destination.shape != threshold.shape:
+            raise ValueError("threshold output shape does not match transition plane")
+        destination[...] = threshold
+    elif destination.ndim == 3:
+        selected = int(channel)
+        if destination.shape[:2] != threshold.shape or not 0 <= selected < destination.shape[2]:
+            raise ValueError("threshold output channel or shape is invalid")
+        destination[..., selected] = threshold
+    else:
+        raise ValueError("threshold output must be a 2D plane or HxWxC image")
+    return destination
+
+
 def generate_threshold_pair_channels(
     right_masks: np.ndarray | Sequence[object],
     right_angles: Sequence[float] | np.ndarray,
@@ -712,14 +946,20 @@ __all__ = [
     "MonotonicValidation",
     "MonotonicRepairResult",
     "RangeScope",
+    "PackedLane",
+    "PackedLaneRepairResult",
     "exact_edt",
     "exact_signed_edt",
     "generate_threshold_channels",
     "generate_threshold_pair_channels",
+    "generate_threshold_transitions",
     "guard_clip_proposal",
     "interpolate_binary_masks",
+    "pack_lane_bits",
     "range_target_indices",
+    "repair_packed_lane",
     "repair_side_monotonic",
+    "unpack_lane_bits",
     "validate_monotonic",
     "validate_side_monotonic",
 ]

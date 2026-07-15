@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import binascii
-import hashlib
+import ctypes
 from pathlib import Path
 import struct
 import tempfile
@@ -16,16 +16,26 @@ from quick_sdf_blender.core import (
     RangeScope,
     exact_edt,
     exact_signed_edt,
+    generate_threshold_transitions,
     generate_threshold_pair_channels,
     guard_clip_proposal,
     interpolate_binary_masks,
+    pack_lane_bits,
     range_target_indices,
     repair_side_monotonic,
+    repair_packed_lane,
+    unpack_lane_bits,
     validate_monotonic,
     validate_side_monotonic,
 )
 from quick_sdf_blender.packing import PackingChannelSpec, PackingSource, pack_rgba16
-from quick_sdf_blender.png16 import PNG_SIGNATURE, encode_png_rgba16, write_png_rgba16
+from quick_sdf_blender.png16 import (
+    PNG_SIGNATURE,
+    commit_png_temporary,
+    encode_png_rgba16,
+    write_png_rgba16,
+    write_png_rgba16_temporary,
+)
 
 
 ANGLES = np.arange(-90.0, 91.0, 15.0)
@@ -87,9 +97,18 @@ def decode_png(data: bytes) -> tuple[dict[str, int], np.ndarray]:
     raw = zlib.decompress(b"".join(payload for kind, payload in chunks if kind == b"IDAT"))
     stride = width * 8 + 1
     rows = []
+    previous = np.zeros(width * 8, dtype=np.uint8)
     for y in range(height):
-        assert raw[y * stride] == 0
-        rows.append(raw[y * stride + 1 : (y + 1) * stride])
+        filter_type = raw[y * stride]
+        row = np.frombuffer(
+            raw[y * stride + 1 : (y + 1) * stride], dtype=np.uint8
+        ).copy()
+        if filter_type == 2:
+            row += previous
+        else:
+            assert filter_type == 0
+        rows.append(row.tobytes())
+        previous = row
     pixels = np.frombuffer(b"".join(rows), dtype=">u2").reshape(height, width, 4)
     return {
         "width": width,
@@ -152,10 +171,8 @@ class MonotonicRepairTests(unittest.TestCase):
         rgba = pack_golden_liltoon_channels(channels)
         np.testing.assert_array_equal(repaired_right, right)
         np.testing.assert_array_equal(repaired_left, left)
-        self.assertEqual(
-            hashlib.sha256(encode_png_rgba16(rgba)).hexdigest(),
-            "5ad840cffad7c3c8ebf0de83324426234dfb4aa195950c38155f73e40605ac79",
-        )
+        _, decoded = decode_png(encode_png_rgba16(rgba))
+        np.testing.assert_array_equal(decoded, rgba)
 
     def test_coverage_protection_wins_before_total_and_base_cost(self) -> None:
         masks = np.asarray([True, False, True], dtype=np.bool_)[:, None, None]
@@ -207,6 +224,37 @@ class MonotonicRepairTests(unittest.TestCase):
         masks = np.zeros((3, 2, 2), dtype=np.bool_)
         with self.assertRaisesRegex(ValueError, "same shape"):
             repair_side_monotonic(masks, masks[:, :, :1], masks)
+
+
+class PackedLaneTests(unittest.TestCase):
+    def test_compact_repair_and_threshold_match_stack_reference(self) -> None:
+        rng = np.random.default_rng(7001)
+        angles = np.arange(8, dtype=np.float64) * (90.0 / 7.0)
+        transitions = rng.integers(0, 9, size=(19, 23), dtype=np.uint8)
+        display = np.arange(8)[:, None, None] >= transitions[None, ...]
+        # Deliberately make base/coverage unrelated to exercise repair costs.
+        base = rng.random(display.shape) > 0.48
+        coverage = rng.random(display.shape) > 0.8
+        lane = pack_lane_bits(display, angles, base, coverage)
+        np.testing.assert_array_equal(unpack_lane_bits(lane.display_bits, 8), display)
+        compact = repair_packed_lane(lane)
+        reference = repair_side_monotonic(display, base, coverage)
+        np.testing.assert_array_equal(
+            compact.transition_indices, reference.transition_indices
+        )
+        np.testing.assert_array_equal(
+            compact.changed_count,
+            np.count_nonzero(reference.changed_mask, axis=0).astype(np.uint8),
+        )
+        self.assertEqual(compact.changed_sample_count, reference.changed_sample_count)
+        threshold = generate_threshold_transitions(transitions, angles)
+        pair = generate_threshold_pair_channels(display, angles, display, angles)
+        np.testing.assert_array_equal(threshold, pair[..., 0])
+
+    def test_compact_lane_rejects_more_than_sixteen_keys(self) -> None:
+        stack = np.zeros((17, 1, 1), dtype=np.bool_)
+        with self.assertRaisesRegex(ValueError, "at most 16"):
+            pack_lane_bits(stack, np.linspace(0.0, 90.0, 17), stack, stack)
 
 
 class ExactEdtTests(unittest.TestCase):
@@ -420,6 +468,29 @@ class PngTests(unittest.TestCase):
             write_png_rgba16(path, pixels, overwrite=True)
             _, decoded = decode_png(path.read_bytes())
             np.testing.assert_array_equal(decoded, pixels)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_worker_temporary_can_be_revision_checked_before_publish(self) -> None:
+        pixels = np.arange(4 * 7 * 4, dtype=np.uint16).reshape(4, 7, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "threshold.png"
+            temporary = write_png_rgba16_temporary(path, pixels)
+            self.assertTrue(temporary.exists())
+            self.assertFalse(path.exists())
+            commit_png_temporary(temporary, path)
+            self.assertFalse(temporary.exists())
+            _, decoded = decode_png(path.read_bytes())
+            np.testing.assert_array_equal(decoded, pixels)
+
+    def test_cancelled_worker_png_removes_partial_temporary(self) -> None:
+        pixels = np.zeros((32, 37, 4), dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cancelled.png"
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                write_png_rgba16_temporary(
+                    path, pixels, cancel_requested=ctypes.c_int(1)
+                )
+            self.assertFalse(path.exists())
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
     def test_rejects_non_uint16_or_wrong_shape(self) -> None:

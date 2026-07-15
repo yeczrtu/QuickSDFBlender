@@ -25,6 +25,7 @@ from .history import History
 _HISTORIES: dict[str, History] = {}
 _UNDO_FENCES: set[str] = set()
 _EXPORT_JOB: dict[str, object] | None = None
+_BAKE_JOB: dict[str, object] | None = None
 
 
 def _purge_history_orphans(project_uuid: str = "") -> None:
@@ -138,33 +139,56 @@ def _extract_evaluated_bake_input(context, project):
         if uv_layer is None:
             raise ValueError("The evaluated mesh no longer contains the project UV map")
         mesh.calc_loop_triangles()
-        corner_normals = mesh.corner_normals
-        triangles_uv = []
-        triangles_normal = []
-        triangle_centers = []
-        slot = int(project.material_slot_index)
-        for triangle in mesh.loop_triangles:
-            polygon = mesh.polygons[triangle.polygon_index]
-            if polygon.material_index != slot:
-                continue
-            triangles_uv.append([tuple(uv_layer.data[index].uv) for index in triangle.loops])
-            normals = []
-            for index in triangle.loops:
-                value = corner_normals[index]
-                vector = getattr(value, "vector", value)
-                normals.append(tuple(vector))
-            triangles_normal.append(normals)
-            center = sum(
-                (mesh.vertices[index].co for index in triangle.vertices),
-                mesh.vertices[triangle.vertices[0]].co * 0.0,
-            ) / 3.0
-            triangle_centers.append(tuple(center))
-        if not triangles_uv:
+        triangle_count = len(mesh.loop_triangles)
+        loop_count = len(mesh.loops)
+        polygon_count = len(mesh.polygons)
+        vertex_count = len(mesh.vertices)
+        triangle_polygons = np.empty(triangle_count, dtype=np.int32)
+        triangle_loops = np.empty(triangle_count * 3, dtype=np.int32)
+        triangle_vertices = np.empty(triangle_count * 3, dtype=np.int32)
+        polygon_materials = np.empty(polygon_count, dtype=np.int32)
+        uv_values = np.empty(loop_count * 2, dtype=np.float32)
+        normal_values = np.empty(loop_count * 3, dtype=np.float32)
+        vertex_values = np.empty(vertex_count * 3, dtype=np.float32)
+        try:
+            mesh.loop_triangles.foreach_get("polygon_index", triangle_polygons)
+            mesh.loop_triangles.foreach_get("loops", triangle_loops)
+            mesh.loop_triangles.foreach_get("vertices", triangle_vertices)
+            mesh.polygons.foreach_get("material_index", polygon_materials)
+            uv_layer.data.foreach_get("uv", uv_values)
+            mesh.corner_normals.foreach_get("vector", normal_values)
+            mesh.vertices.foreach_get("co", vertex_values)
+        except (AttributeError, TypeError, ValueError):
+            # Defensive fallback for a Blender build exposing corner normals as
+            # a sequence rather than a foreach_get collection.
+            triangle_polygons[:] = [item.polygon_index for item in mesh.loop_triangles]
+            triangle_loops[:] = [value for item in mesh.loop_triangles for value in item.loops]
+            triangle_vertices[:] = [value for item in mesh.loop_triangles for value in item.vertices]
+            polygon_materials[:] = [item.material_index for item in mesh.polygons]
+            uv_values[:] = [value for item in uv_layer.data for value in tuple(item.uv)]
+            normal_values[:] = [
+                value
+                for item in mesh.corner_normals
+                for value in tuple(getattr(item, "vector", item))
+            ]
+            vertex_values[:] = [value for item in mesh.vertices for value in tuple(item.co)]
+        triangle_loops = triangle_loops.reshape(-1, 3)
+        triangle_vertices = triangle_vertices.reshape(-1, 3)
+        selected = polygon_materials[triangle_polygons] == int(project.material_slot_index)
+        if not np.any(selected):
             raise ValueError("No evaluated faces use the selected material slot")
+        selected_loops = triangle_loops[selected]
+        selected_vertices = triangle_vertices[selected]
+        uv_values = uv_values.reshape(-1, 2)
+        normal_values = normal_values.reshape(-1, 3)
+        vertex_values = vertex_values.reshape(-1, 3)
         return (
-            np.ascontiguousarray(triangles_uv, dtype=np.float32),
-            np.ascontiguousarray(triangles_normal, dtype=np.float32),
-            np.ascontiguousarray(triangle_centers, dtype=np.float32),
+            np.ascontiguousarray(uv_values[selected_loops], dtype=np.float32),
+            np.ascontiguousarray(normal_values[selected_loops], dtype=np.float32),
+            np.ascontiguousarray(
+                vertex_values[selected_vertices].mean(axis=1, dtype=np.float32),
+                dtype=np.float32,
+            ),
         )
     finally:
         evaluated.to_mesh_clear()
@@ -205,9 +229,7 @@ def _write_sdf_area_occupancy(project, occupancy, *, force: bool = False) -> boo
     expected = (int(project.resolution), int(project.resolution))
     if mask.shape != expected:
         raise ValueError(f"SDF Area shape {mask.shape} does not match {expected}")
-    rgba = np.ones((*mask.shape, 4), dtype=np.float32)
-    rgba[..., :3] = mask[..., None]
-    runtime.write_image_rgba(image, rgba)
+    runtime.write_image_gray8(image, mask.astype(np.uint8) * np.uint8(255))
     image[runtime.AUX_MASK_INITIALIZED_KEY] = True
     item.dirty = bool(force)
     mark_aux_mask_changed(project, item)
@@ -335,14 +357,12 @@ def _bake_project(context, project) -> None:
                 display = runtime.resolve_display_image(project, item)
                 if display is None:
                     raise ValueError(f"Angle data is incomplete at {float(item.angle):g} degrees")
-                base_rgba = np.ones((*mask.shape, 4), dtype=np.float32)
-                base_rgba[..., :3] = mask[..., None]
-                old_display = runtime.image_rgba(display)
+                composed = np.asarray(mask, dtype=np.uint8) * np.uint8(255)
+                old_display = runtime.image_gray8(display)
                 overridden = runtime.coverage_mask(item)
-                composed = base_rgba.copy()
-                composed[..., :3][overridden] = old_display[..., :3][overridden]
+                composed[overridden] = old_display[overridden]
                 runtime.set_base_mask(item, mask)
-                runtime.write_image_rgba(display, composed)
+                runtime.write_image_gray8(display, composed)
                 item.is_generated = True
                 item.dirty = True
         if project.boundary_tracks:
@@ -363,6 +383,236 @@ def _bake_project(context, project) -> None:
     finally:
         window_manager.progress_end()
         runtime.end_base_bake(str(project.uuid))
+
+
+def _boundary_revision_token(project) -> tuple:
+    return tuple(
+        (
+            str(getattr(track, "uuid", "")),
+            str(getattr(track, "side", "RIGHT")),
+            bool(getattr(track, "enabled", True)),
+            bool(getattr(track, "closed", False)),
+            str(getattr(track, "fill_mode", "INSIDE")),
+            int(getattr(track, "paint_value", 0)),
+            int(getattr(track, "island_index", -1)),
+            tuple(
+                (
+                    str(getattr(key, "uuid", "")),
+                    str(getattr(key, "angle_uuid", "")),
+                    str(getattr(key, "side", "RIGHT")),
+                    float(getattr(key, "angle", 0.0)),
+                    tuple(tuple(float(value) for value in point.co) for point in key.points),
+                )
+                for key in track.keys
+            ),
+        )
+        for track in project.boundary_tracks
+    )
+
+
+def _bake_revision_token(project) -> tuple:
+    return (
+        _export_revision_token(project),
+        tuple(float(value) for value in project.forward_vector),
+        tuple(float(value) for value in project.up_vector),
+        float(project.guide_shadow_amount),
+        _boundary_revision_token(project),
+    )
+
+
+def _compute_async_bake(request, cancel_flag=None):
+    """Run the Blender-independent Native guide bake on one worker."""
+
+    import numpy as np
+
+    from .native import bake_face_shadow_guide
+
+    masks_by_uuid = {}
+    occupancy = None
+    guide_warning = False
+    for lane in request["lanes"]:
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Base update cancelled")
+        masks, local_occupancy = bake_face_shadow_guide(
+            request["triangle_uvs"],
+            request["corner_normals"],
+            lane["angles"],
+            request["forward"],
+            request["up"],
+            lane["side"],
+            request["shadow_amount"],
+            request["resolution"],
+            request["resolution"],
+            cancel_flag=cancel_flag,
+        )
+        if occupancy is None:
+            occupancy = local_occupancy
+        for uuid_value, mask in zip(lane["uuids"], masks):
+            masks_by_uuid[str(uuid_value)] = np.ascontiguousarray(mask, dtype=np.bool_)
+        if np.any(local_occupancy):
+            middle = int(np.argmin(np.abs(lane["angles"] - 45.0)))
+            light_ratio = float(np.mean(masks[middle, local_occupancy]))
+            changed = np.any(masks[1:] != masks[:-1], axis=0)
+            variation = float(np.mean(changed[local_occupancy]))
+            guide_warning = guide_warning or (
+                light_ratio <= 0.02 or light_ratio >= 0.98 or variation < 0.01
+            )
+    if occupancy is None:
+        raise ValueError("Base update has no angle lane")
+    return {
+        "masks": masks_by_uuid,
+        "occupancy": np.ascontiguousarray(occupancy, dtype=np.bool_),
+        "guide_warning": guide_warning,
+    }
+
+
+def _find_angle_uuid(project, uuid_value: str):
+    return next(
+        (item for item in project.angles if str(item.uuid) == str(uuid_value)),
+        None,
+    )
+
+
+def _restore_bake_records(project, records) -> None:
+    """Best-effort reverse restore for a cancelled publish transaction."""
+
+    import numpy as np
+
+    failures = []
+    for record in reversed(records):
+        try:
+            item = _find_angle_uuid(project, record["uuid"])
+            if item is None:
+                raise RuntimeError(f"Angle {record['uuid']} was removed")
+            image = runtime.resolve_display_image(project, item)
+            if image is None:
+                raise RuntimeError(f"Display {record['uuid']} is missing")
+            if runtime.BASE_BITPLANE_KEY in item:
+                del item[runtime.BASE_BITPLANE_KEY]
+            item[runtime.BASE_BITPLANE_KEY] = bytes(record["base_blob"])
+            item.base_revision = int(record["base_revision"])
+            if runtime.COVERAGE_BITPLANE_KEY in item:
+                del item[runtime.COVERAGE_BITPLANE_KEY]
+            item[runtime.COVERAGE_BITPLANE_KEY] = bytes(record["coverage_blob"])
+            item.coverage_revision = int(record["coverage_revision"])
+            gray = np.frombuffer(
+                zlib.decompress(record["gray"]), dtype=np.uint8
+            ).reshape(record["shape"])
+            runtime.write_image_gray8(image, gray)
+            image[runtime.IMAGE_REVISION_KEY] = int(record["image_revision"])
+            item.is_generated = bool(record["is_generated"])
+            item.dirty = bool(record["dirty"])
+            from .residency import mark_changed
+
+            mark_changed(image, synchronous=True)
+        except Exception as exc:
+            failures.append(str(exc))
+    runtime._BITPLANE_CACHE.clear()
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def _publish_async_bake_key(project, job, uuid_value: str) -> None:
+    import numpy as np
+
+    item = _find_angle_uuid(project, uuid_value)
+    if item is None:
+        raise RuntimeError("An angle key was removed during Base update")
+    image = runtime.resolve_display_image(project, item)
+    if image is None:
+        raise RuntimeError(f"Angle data is incomplete at {float(item.angle):g} degrees")
+    old_gray = runtime.image_gray8(image)
+    old_base = runtime.base_mask(item)
+    old_coverage = runtime.coverage_mask(item)
+    effective_coverage = np.array(old_coverage, copy=True)
+    if not project.boundary_tracks:
+        effective_coverage |= old_gray != np.where(old_base, 255, 0).astype(np.uint8)
+    new_base = job["result"]["masks"].pop(str(uuid_value))
+    generated = new_base
+    if project.boundary_tracks:
+        from .boundary import evaluate_boundary_mask
+
+        generated = evaluate_boundary_mask(
+            project,
+            float(item.angle),
+            str(item.side),
+            new_base,
+            uv_perimeters=job.get("uv_perimeters"),
+        )
+    composed = np.asarray(generated, dtype=np.uint8) * np.uint8(255)
+    composed[effective_coverage] = old_gray[effective_coverage]
+    record = {
+        "uuid": str(item.uuid),
+        "gray": zlib.compress(old_gray.tobytes(order="C"), 1),
+        "shape": tuple(old_gray.shape),
+        # IDProperty byte buffers can be invalidated when the property is
+        # replaced. Materialize independent storage for transactional rollback.
+        "base_blob": memoryview(runtime.bitplane_blob(item, "BASE")).tobytes(),
+        "base_revision": int(item.base_revision),
+        "coverage_blob": memoryview(
+            runtime.bitplane_blob(item, "COVERAGE")
+        ).tobytes(),
+        "coverage_revision": int(item.coverage_revision),
+        "image_revision": int(image.get(runtime.IMAGE_REVISION_KEY, 0)),
+        "is_generated": bool(item.is_generated),
+        "dirty": bool(item.dirty),
+    }
+    job["rollback"].append(record)
+    runtime.set_base_mask(item, new_base)
+    if not np.array_equal(effective_coverage, old_coverage):
+        runtime.set_coverage_mask(item, effective_coverage)
+    runtime.write_image_gray8(image, composed)
+    item.is_generated = True
+    item.dirty = True
+
+
+def _finish_async_bake(project, job) -> None:
+    import numpy as np
+
+    signature = runtime.compute_base_signature(project, bpy.context.scene)
+    occupancy = job["result"]["occupancy"]
+    _write_sdf_area_occupancy(project, occupancy, force=False)
+    if np.any(occupancy):
+        rows, columns = np.nonzero(occupancy)
+        height, width = occupancy.shape
+        project.thumbnail_uv_bbox = (
+            float(columns.min()) / width,
+            1.0 - float(rows.max() + 1) / height,
+            float(columns.max() + 1) / width,
+            1.0 - float(rows.min()) / height,
+        )
+    if bool(getattr(project, "mirror_enabled", True)):
+        try:
+            _detect_project_symmetry(
+                project,
+                job["triangle_uvs"],
+                job["corner_normals"],
+                job["triangle_centers"],
+            )
+        except (RuntimeError, ValueError) as exc:
+            project.warning_message = f"Base updated; Mirror analysis was skipped: {exc}"
+    project.base_needs_update = False
+    project.base_signature = signature
+    project.base_source = "NORMAL_GUIDE"
+    project.guide_version = 2
+    project.guide_direction_warning = bool(job["result"]["guide_warning"])
+    project.guide_direction_message = (
+        "The guide is nearly uniform; confirm which way the face points"
+        if project.guide_direction_warning
+        else ""
+    )
+    project.dirty = True
+    clear_histories(str(project.uuid))
+    try:
+        from .live_preview import invalidate
+
+        invalidate(str(project.uuid))
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        runtime.sync_canvas(bpy.context, project)
+    except (AttributeError, ReferenceError, RuntimeError) as exc:
+        project.warning_message = f"Base updated; Canvas refresh was deferred: {exc}"
 
 
 def _create_project_data(context, *, sync_ui: bool = True, activate: bool = True):
@@ -476,6 +726,9 @@ class QUICKSDF_OT_project_remove(bpy.types.Operator):
     def execute(self, context):
         project = _project(context)
         index = context.scene.quick_sdf_active_project_index
+        shutdown_bake_job(
+            str(project.uuid), message="Base update cancelled because the project was removed"
+        )
         shutdown_export_job(str(project.uuid), message="Export cancelled because the project was removed")
         try:
             from .studio import is_studio_active, exit_studio
@@ -630,6 +883,10 @@ class QUICKSDF_OT_bake_base(bpy.types.Operator):
             project.onion_enabled = False
             runtime.sync_canvas(context, project)
         try:
+            if not bpy.app.background and getattr(context, "window", None) is not None:
+                _start_bake_job(context, project)
+                self.report({"INFO"}, "Updating Base in the background")
+                return {"FINISHED"}
             _bake_project(context, project)
             runtime.sync_canvas(context, project)
         except Exception as exc:
@@ -979,19 +1236,33 @@ def _packing_channel(project, output_channel: str):
     return packing_channel_for(project, str(output_channel).upper())
 
 
-def _record_aux_image_change(project, item, image, before, label: str) -> bool:
+def _record_aux_image_change(
+    project,
+    item,
+    image,
+    before,
+    label: str,
+    *,
+    after=None,
+) -> bool:
     """Publish one static-mask edit to Quick SDF history and export revision."""
 
     import numpy as np
 
-    after = runtime.image_rgba8(image)
+    after = runtime.image_gray8(image) if after is None else np.asarray(after)
     if before.shape == after.shape and np.array_equal(before, after):
         return False
     history = _HISTORIES.setdefault(str(project.uuid), History(compression_level=1))
-    if history.can_redo:
+    had_redo = history.can_redo
+    transaction = history.begin_transaction(label)
+    transaction.add_delta(image.name, before, after)
+    if transaction.needs_rollback or not transaction.commit():
+        if history.active_transaction is transaction:
+            transaction.rollback()
+        runtime.write_image_gray8(image, before)
+        raise RuntimeError("This mask edit is too large for the Quick SDF Undo history")
+    if had_redo:
         _purge_history_orphans(str(project.uuid))
-    if not history.push(label, {image.name: before}, {image.name: after}):
-        history.clear()
     _UNDO_FENCES.add(str(project.uuid))
     from .model import mark_aux_mask_changed
 
@@ -1167,12 +1438,12 @@ class QUICKSDF_OT_aux_mask_import(bpy.types.Operator):
         if source_image is None:
             self.report({"ERROR"}, "Choose a source image")
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         try:
             runtime.copy_image_channel_to_aux(source_image, image, self.component)
             _record_aux_image_change(project, item, image, before, "Import Mask")
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            runtime.write_image_rgba8(image, before)
+            runtime.write_image_gray8(image, before)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -1195,7 +1466,7 @@ class QUICKSDF_OT_aux_mask_fill(bpy.types.Operator):
         image = runtime.resolve_aux_mask_image(project, item)
         if item is None or image is None:
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         runtime.fill_aux_mask_image(image, self.value)
         _record_aux_image_change(project, item, image, before, "Fill Mask")
         runtime.sync_canvas(context, project)
@@ -1220,12 +1491,12 @@ class QUICKSDF_OT_aux_mask_reset_sdf_area(bpy.types.Operator):
         image = runtime.resolve_aux_mask_image(project, item)
         if image is None:
             return {"CANCELLED"}
-        before = runtime.image_rgba8(image)
+        before = runtime.image_gray8(image)
         try:
             _reset_sdf_area_from_uv(context, project, force=True)
             _record_aux_image_change(project, item, image, before, "Reset SDF Area")
         except (RuntimeError, TypeError, ValueError) as exc:
-            runtime.write_image_rgba8(image, before)
+            runtime.write_image_gray8(image, before)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         runtime.sync_canvas(context, project)
@@ -1752,7 +2023,7 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             except (ImportError, AttributeError, ReferenceError, RuntimeError):
                 pass
 
-        def complete_active_stroke(active_item, source_image) -> None:
+        def complete_active_stroke(active_item, source_image, gray=None) -> None:
             source_image[runtime.IMAGE_REVISION_KEY] = int(
                 source_image.get(runtime.IMAGE_REVISION_KEY, 0)
             ) + 1
@@ -1760,6 +2031,14 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             active_item.dirty = True
             project.first_stroke_complete = True
             project.dirty = True
+            try:
+                from .residency import mark_changed
+
+                mark_changed(source_image, synchronous=True)
+            except (ImportError, OSError, ReferenceError, RuntimeError):
+                pass
+            if gray is not None:
+                runtime.cache_image_gray8(source_image, gray)
             try:
                 from .live_preview import invalidate
 
@@ -1782,25 +2061,30 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             try:
                 if item is None or image is None:
                     raise ValueError("The additional mask disappeared during the stroke")
-                current = runtime.image_rgba8(image)
+                current = runtime.image_gray8(image)
                 if current.shape != before_rgba.shape:
                     raise ValueError("The additional mask changed size during the stroke")
-                if np.any(current[..., 3] != 255):
-                    current[..., 3] = 255
-                    runtime.write_image_rgba8(image, current)
-                changed = np.any(current[..., :3] != before_rgba[..., :3], axis=2)
+                changed = current != before_rgba
                 if not np.any(changed):
                     return {"FINISHED"}
                 image[runtime.IMAGE_REVISION_KEY] = int(
                     image.get(runtime.IMAGE_REVISION_KEY, 0)
                 ) + 1
+                try:
+                    from .residency import mark_changed
+
+                    mark_changed(image, synchronous=True)
+                except (ImportError, OSError, ReferenceError, RuntimeError):
+                    pass
                 _record_aux_image_change(
                     project,
                     item,
                     image,
                     before_rgba,
                     "Paint Additional Mask",
+                    after=current,
                 )
+                runtime.cache_image_gray8(image, current)
                 try:
                     from .studio import tag_studio_redraw
 
@@ -1809,12 +2093,15 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     pass
                 return {"FINISHED"}
             except Exception as exc:
-                clear_histories(str(project.uuid))
+                restored = False
                 if image is not None:
                     try:
-                        runtime.write_image_rgba8(image, before_rgba)
+                        runtime.write_image_gray8(image, before_rgba)
+                        restored = True
                     except Exception:
                         pass
+                if not restored:
+                    clear_histories(str(project.uuid))
                 self.report({"ERROR"}, f"Could not finish the mask stroke: {exc}")
                 return {"CANCELLED"}
             finally:
@@ -1837,8 +2124,9 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             )
             active_item = None if provisional_stroke else runtime.active_angle(project)
             source_image = bpy.data.images.get(display_name)
-            before_history: dict[str, np.ndarray] = {}
             metadata_before: dict[str, tuple[bool, bool]] = {}
+            history = None
+            transaction = None
             interactive_no_change = False
             try:
                 if source_image is None:
@@ -1847,18 +2135,11 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     active_item is None or str(active_item.uuid) != active_uuid
                 ):
                     raise ValueError("The active angle changed before the stroke finished")
-                source_rgba = runtime.image_rgba8(source_image)
-                source_gray = source_rgba[..., 0].copy()
+                source_gray = runtime.image_gray8(source_image)
                 if source_gray.shape != before_gray.shape or (
                     coverage_before is not None and coverage_before.shape != before_gray.shape
                 ):
                     raise ValueError("The active paint image changed size during the stroke")
-                # Work images are always opaque. Erase-alpha Brush Assets may
-                # still alter the hidden buffer, so normalize that metadata
-                # without treating it as an artist-visible paint action.
-                if np.any(source_rgba[..., 3] != 255):
-                    source_rgba[..., 3] = 255
-                    runtime.write_image_rgba8(source_image, source_rgba)
                 touched = source_gray != before_gray
                 if not np.any(touched):
                     interactive_no_change = True
@@ -1887,17 +2168,32 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     created_metadata = provisional_created_metadata(project, active_item)
                 except (ImportError, ReferenceError, RuntimeError):
                     created_metadata = None
+                history = _HISTORIES.setdefault(
+                    str(project.uuid),
+                    History(compression_level=1),
+                )
+                metadata = {"created_key": created_metadata} if created_metadata else None
+                had_redo = history.can_redo
+                transaction = history.begin_transaction(
+                    "Paint + Auto Key" if created_metadata else "Smart Paint",
+                    metadata=metadata,
+                )
                 display_key = f"display:{active_uuid}"
-                before_history[display_key] = before_gray
-                after_history = {display_key: source_gray}
+                transaction.add_delta(display_key, before_gray, source_gray)
                 if coverage_uuid and coverage_before is not None:
                     coverage_after = coverage_before.copy()
                     coverage_after[touched] = True
                     coverage_key = f"coverage:{active_uuid}"
-                    before_history[coverage_key] = coverage_before
-                    after_history[coverage_key] = coverage_after
+                    transaction.add_delta(coverage_key, coverage_before, coverage_after)
                 else:
                     raise ValueError("The active angle Coverage is missing")
+                if transaction.needs_rollback:
+                    raise RuntimeError("This stroke is too large for the Quick SDF Undo history")
+                runtime.set_coverage_mask(active_item, coverage_after)
+                metadata_before[active_uuid] = (
+                    bool(getattr(active_item, "is_manual", False)),
+                    bool(getattr(active_item, "dirty", False)),
+                )
 
                 # Propagate only pixels that actually crossed the binary
                 # threshold. This retains Blender's native soft brush and
@@ -1906,7 +2202,6 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                 became_light = touched & (before_gray < 128) & (source_gray >= 128)
                 became_shadow = touched & (before_gray >= 128) & (source_gray < 128)
                 active_angle = float(active_item.angle)
-                planned_writes = []
                 for candidate in sorted(
                     (
                         item
@@ -1943,58 +2238,57 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                     destination_coverage_after[changed] = True
                     candidate_display_key = f"display:{candidate.uuid}"
                     candidate_coverage_key = f"coverage:{candidate.uuid}"
-                    before_history[candidate_display_key] = destination_before
-                    before_history[candidate_coverage_key] = destination_coverage_before
-                    after_history[candidate_display_key] = destination_after
-                    after_history[candidate_coverage_key] = destination_coverage_after
+                    transaction.add_delta(
+                        candidate_display_key,
+                        destination_before,
+                        destination_after,
+                    )
+                    transaction.add_delta(
+                        candidate_coverage_key,
+                        destination_coverage_before,
+                        destination_coverage_after,
+                    )
+                    if transaction.needs_rollback:
+                        raise RuntimeError(
+                            "This stroke is too large for the Quick SDF Undo history"
+                        )
                     metadata_before[str(candidate.uuid)] = (
                         bool(getattr(candidate, "is_manual", False)),
                         bool(getattr(candidate, "dirty", False)),
                     )
-                    planned_writes.append(
-                        (
-                            candidate,
-                            image,
-                            destination_after,
-                            destination_coverage_after,
-                        )
-                    )
-
-                metadata_before[active_uuid] = (
-                    bool(getattr(active_item, "is_manual", False)),
-                    bool(getattr(active_item, "dirty", False)),
-                )
-                for candidate, image, destination_after, destination_coverage_after in planned_writes:
                     runtime.write_image_gray8(image, destination_after)
                     runtime.set_coverage_mask(candidate, destination_coverage_after)
                     candidate.is_manual = True
                     candidate.dirty = True
-                runtime.set_coverage_mask(active_item, coverage_after)
-                history = _HISTORIES.setdefault(
-                    str(project.uuid),
-                    History(compression_level=1),
-                )
-                metadata = {"created_key": created_metadata} if created_metadata else None
-                had_redo = history.can_redo
-                if not history.push(
-                    "Paint + Auto Key" if created_metadata else "Smart Paint",
-                    before_history,
-                    after_history,
-                    metadata=metadata,
-                ):
+                    del (
+                        destination_before,
+                        destination_after,
+                        destination_coverage_before,
+                        destination_coverage_after,
+                    )
+                if not transaction.commit():
                     raise RuntimeError("This stroke is too large for the Quick SDF Undo history")
+                transaction = None
                 if had_redo:
                     _purge_history_orphans(str(project.uuid))
                 from .studio import finish_provisional_stroke
 
                 finish_provisional_stroke(context, project, changed=True)
-                complete_active_stroke(active_item, source_image)
+                complete_active_stroke(active_item, source_image, source_gray)
                 return {"FINISHED"}
             except Exception as exc:
-                clear_histories(str(project.uuid))
+                rollback_errors: tuple[str, ...] = ()
+                rollback_safe = False
                 try:
-                    if before_history:
-                        _write_history_values(project, before_history)
+                    if (
+                        transaction is not None
+                        and history is not None
+                        and history.active_transaction is transaction
+                    ):
+                        rollback_errors = _rollback_history_transaction(
+                            project, transaction
+                        )
+                        rollback_safe = not rollback_errors
                     elif source_image is not None:
                         runtime.write_image_gray8(source_image, before_gray)
                 except Exception:
@@ -2004,15 +2298,27 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
                         (item for item in project.angles if str(item.uuid) == item_uuid),
                         None,
                     )
-                    if candidate is not None:
-                        candidate.is_manual, candidate.dirty = flags
+                    if candidate is None:
+                        rollback_safe = False
+                    else:
+                        try:
+                            candidate.is_manual, candidate.dirty = flags
+                        except (AttributeError, ReferenceError):
+                            rollback_safe = False
                 try:
                     from .studio import finish_provisional_stroke
 
                     finish_provisional_stroke(context, project, changed=False)
                 except (ImportError, ReferenceError, RuntimeError):
-                    pass
-                self.report({"ERROR"}, f"Could not finish the paint stroke: {exc}")
+                    rollback_safe = False
+                if not rollback_safe:
+                    clear_histories(str(project.uuid))
+                suffix = (
+                    f" Rollback also failed for: {', '.join(rollback_errors)}"
+                    if rollback_errors
+                    else ""
+                )
+                self.report({"ERROR"}, f"Could not finish the paint stroke: {exc}{suffix}")
                 return {"CANCELLED"}
             finally:
                 finish_stroke(no_change=interactive_no_change)
@@ -2132,10 +2438,13 @@ class QUICKSDF_OT_propagate_overrides(bpy.types.Operator):
             history = _HISTORIES.setdefault(
                 str(project.uuid), History(compression_level=1)
             )
-            if history.can_redo:
-                _purge_history_orphans(str(project.uuid))
+            had_redo = history.can_redo
             if not history.push("Smart Paint", before_history, after_history):
-                history.clear()
+                raise RuntimeError(
+                    "This stroke is too large for the Quick SDF Undo history"
+                )
+            if had_redo:
+                _purge_history_orphans(str(project.uuid))
             try:
                 from .live_preview import invalidate
 
@@ -2355,7 +2664,7 @@ def _history_values(project, names) -> dict[str, object]:
         else:
             image = bpy.data.images.get(name)
             if image is not None:
-                result[name] = runtime.image_rgba8(image)
+                result[name] = runtime.image_gray8(image)
     return result
 
 
@@ -2376,7 +2685,27 @@ def _write_history_values(project, values) -> None:
             image = bpy.data.images.get(name)
             if image is None:
                 raise ValueError(f"The history image {name!r} is missing")
-            runtime.write_image_rgba8(image, value)
+            runtime.write_image_gray8(image, value)
+
+
+def _rollback_history_transaction(project, transaction) -> tuple[str, ...]:
+    """Best-effort streamed rollback which does not stop after one bad key."""
+
+    errors: list[str] = []
+    for key in transaction.keys:
+        try:
+            current = _history_values(project, (key,)).get(key)
+            if current is None:
+                raise ValueError("the current layer is missing")
+            restored = transaction.restore_before(key, current)
+            _write_history_values(project, {key: restored})
+        except Exception as error:
+            errors.append(f"{key} ({error})")
+    try:
+        transaction.rollback()
+    except Exception as error:
+        errors.append(f"transaction ({error})")
+    return tuple(errors)
 
 
 def _mark_history_images_changed(project, image_names) -> None:
@@ -2667,6 +2996,94 @@ def _prepare_threshold_inputs(project):
     }
 
 
+def _prepare_packed_export_plan(project):
+    """Prepare ABI-7 metadata and incremental bpy snapshot builders."""
+
+    packing = _snapshot_packing_inputs(project)
+    previous_status = (
+        str(getattr(project, "validation_message", "")),
+        str(getattr(project, "warning_message", "")),
+        str(getattr(project, "diagnostic_message", "")),
+        bool(getattr(project, "has_violations", False)),
+    )
+    try:
+        errors, _warnings, _report = runtime.validate_project(
+            project, include_monotonic=False
+        )
+    finally:
+        (
+            project.validation_message,
+            project.warning_message,
+            project.diagnostic_message,
+            project.has_violations,
+        ) = previous_status
+    if errors:
+        raise ValueError(errors[0])
+    mirror_mode = str(getattr(project, "symmetry_mode", "AUTO"))
+    if mirror_mode == "AUTO":
+        mirror_mode = str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR"))
+    linked = bool(getattr(project, "mirror_enabled", True)) and mirror_mode != "INDEPENDENT"
+    result = {
+        "packed": True,
+        "linked": linked,
+        "packing": packing,
+        "snapshot_builders": [],
+    }
+    if not linked:
+        result["snapshot_builders"] = [
+            ("right", runtime.PackedLaneSnapshot(project, "RIGHT")),
+            ("left", runtime.PackedLaneSnapshot(project, "LEFT")),
+        ]
+        return result
+
+    available = {
+        str(getattr(item, "side", "RIGHT")) for item in getattr(project, "angles", ())
+    }
+    author_side = str(getattr(project, "authoring_side", "RIGHT"))
+    if author_side not in available:
+        author_side = "RIGHT" if "RIGHT" in available else "LEFT"
+    mode_map = {
+        "OVERLAPPED_UV": "OVERLAPPED",
+        "TEXTURE_MIRROR": "TEXTURE_MIRROR",
+        "ISLAND_PAIR": "ISLAND_PAIR",
+    }
+    selected_mode = mode_map.get(mirror_mode, "TEXTURE_MIRROR")
+    pairs = None
+    if selected_mode == "ISLAND_PAIR":
+        resolution = int(project.resolution)
+        pairs = _symmetry_island_pairs(project, (resolution, resolution))
+    result.update(
+        {
+            "author_side": author_side,
+            "mirror_mode": selected_mode,
+            "island_pairs": pairs,
+            "snapshot_builders": [
+                ("source", runtime.PackedLaneSnapshot(project, author_side))
+            ],
+        }
+    )
+    return result
+
+
+def _finish_packed_export_plan(plan):
+    builders = list(plan.pop("snapshot_builders", ()))
+    for name, builder in builders:
+        if not builder.done:
+            raise RuntimeError("Export snapshot is incomplete")
+        plan[name] = builder.finish()
+    return plan
+
+
+def _prepare_packed_threshold_inputs(project):
+    """Synchronous ABI-7 snapshot for scripts and background Blender."""
+
+    plan = _prepare_packed_export_plan(project)
+    for _name, builder in plan["snapshot_builders"]:
+        while not builder.done:
+            builder.step(project)
+    return _finish_packed_export_plan(plan)
+
+
 def _snapshot_packing_inputs(project):
     """Copy the project-local recipe and all referenced masks on the main thread."""
 
@@ -2711,7 +3128,8 @@ def _snapshot_packing_inputs(project):
                 raise ValueError(
                     f"Packing {output}: mask size {tuple(image.size[:])} does not match {expected[::-1]}"
                 )
-            signals[mask_uuid] = runtime.image_channel_u16(image, 0)
+            if mask_uuid not in signals:
+                signals[mask_uuid] = runtime.image_channel_u16(image, 0)
         try:
             specs.append(
                 PackingChannelSpec(
@@ -2794,6 +3212,8 @@ def _export_revision_token(project):
         int(getattr(project, "material_slot_index", 0)),
         str(getattr(project, "uv_map_name", "")),
         int(getattr(project, "resolution", 0)),
+        str(getattr(project, "base_signature", "")),
+        bool(getattr(project, "base_needs_update", False)),
         bool(getattr(project, "mirror_enabled", True)),
         str(getattr(project, "symmetry_mode", "AUTO")),
         str(getattr(project, "symmetry_candidate", "TEXTURE_MIRROR")),
@@ -2904,8 +3324,201 @@ def _change_heatmap(changed_mask):
     return np.count_nonzero(changed, axis=0).astype(np.float32) / float(changed.shape[0])
 
 
-def _compute_export_result(inputs, cancel_flag=None):
+def _repair_packed_export_lane(lane, cancel_flag=None):
+    try:
+        from . import native
+
+        return native.repair_packed_lane(lane, cancel_flag=cancel_flag)
+    except (ImportError, OSError, AttributeError):
+        from .core import repair_packed_lane
+
+        return repair_packed_lane(lane)
+
+
+def _generate_transition_channel(
+    transition_indices,
+    angles,
+    destination,
+    channel,
+    cancel_flag=None,
+    progress=None,
+):
+    try:
+        from . import native
+
+        return native.generate_threshold_transitions(
+            transition_indices,
+            angles,
+            out=destination,
+            channel=channel,
+            cancel_flag=cancel_flag,
+            progress=progress,
+        )
+    except (ImportError, OSError, AttributeError):
+        from .core import generate_threshold_transitions
+
+        return generate_threshold_transitions(
+            transition_indices,
+            angles,
+            out=destination,
+            channel=channel,
+        )
+
+
+def _compute_packed_export_result(inputs, cancel_flag=None, progress=None):
+    """Repair and generate directly from ABI-7 bit fields."""
+
+    import numpy as np
+
+    from .packing import PackingSource, pack_rgba16
+    from .symmetry import mirror_side_layer
+
+    def cancelled():
+        return bool(cancel_flag is not None and int(getattr(cancel_flag, "value", 0)))
+
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    specs = inputs["packing"]["specs"]
+    sources = {
+        str(getattr(spec.source, "value", spec.source)).upper() for spec in specs
+    }
+    need_right = PackingSource.RIGHT_THRESHOLD.value in sources
+    need_left = PackingSource.LEFT_THRESHOLD.value in sources
+    repairs = []
+    if bool(inputs["linked"]):
+        source = inputs["source"]
+        repair = _repair_packed_export_lane(source, cancel_flag)
+        repairs.append(repair)
+        height, width = source.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint16)
+        author_right = str(inputs["author_side"]) == "RIGHT"
+        source_channel = 0 if author_right else 1
+        mirror_channel = 1 - source_channel
+        need_source = need_right if author_right else need_left
+        need_mirror = need_left if author_right else need_right
+        mode = str(inputs["mirror_mode"])
+        pairs = inputs.get("island_pairs")
+        if mode == "ISLAND_PAIR":
+            if need_source:
+                _generate_transition_channel(
+                    repair.transition_indices,
+                    source.angles,
+                    rgba,
+                    source_channel,
+                    cancel_flag,
+                    progress,
+                )
+            if need_mirror:
+                mirrored_transition = mirror_side_layer(
+                    repair.transition_indices,
+                    mode,
+                    island_pairs=pairs,
+                    # Legacy stack mirroring starts the opposite lane as
+                    # all-Shadow outside paired target islands.  In compact
+                    # transition form that sentinel is ``key_count``, not 0
+                    # (which means always Light).
+                    target_template=np.full_like(
+                        repair.transition_indices, source.count
+                    ),
+                )
+                _generate_transition_channel(
+                    mirrored_transition,
+                    source.angles,
+                    rgba,
+                    mirror_channel,
+                    cancel_flag,
+                    progress,
+                )
+        elif need_source or need_mirror:
+            _generate_transition_channel(
+                repair.transition_indices,
+                source.angles,
+                rgba,
+                source_channel,
+                cancel_flag,
+                progress,
+            )
+            if need_mirror:
+                rgba[..., mirror_channel] = mirror_side_layer(
+                    rgba[..., source_channel],
+                    mode,
+                    island_pairs=pairs,
+                )
+        source_heatmap = repair.changed_count.astype(np.float32) / float(source.count)
+        heatmap = np.maximum(
+            source_heatmap,
+            mirror_side_layer(
+                source_heatmap,
+                mode,
+                island_pairs=pairs,
+            ),
+        )
+    else:
+        right_lane = inputs["right"]
+        left_lane = inputs["left"]
+        right = _repair_packed_export_lane(right_lane, cancel_flag)
+        left = _repair_packed_export_lane(left_lane, cancel_flag)
+        repairs.extend((right, left))
+        height, width = right_lane.shape
+        if left_lane.shape != (height, width):
+            raise ValueError("Right and Left packed lanes must share a resolution")
+        rgba = np.zeros((height, width, 4), dtype=np.uint16)
+        if need_right:
+            _generate_transition_channel(
+                right.transition_indices,
+                right_lane.angles,
+                rgba,
+                0,
+                cancel_flag,
+                progress,
+            )
+        if need_left:
+            _generate_transition_channel(
+                left.transition_indices,
+                left_lane.angles,
+                rgba,
+                1,
+                cancel_flag,
+                progress,
+            )
+        heatmap = np.maximum(
+            right.changed_count.astype(np.float32) / float(right_lane.count),
+            left.changed_count.astype(np.float32) / float(left_lane.count),
+        )
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    signals = dict(inputs["packing"]["signals"])
+    if need_right:
+        signals[PackingSource.RIGHT_THRESHOLD] = rgba[..., 0]
+    if need_left:
+        signals[PackingSource.LEFT_THRESHOLD] = rgba[..., 1]
+    pack_rgba16(
+        signals,
+        specs,
+        shape=inputs["packing"].get("shape", rgba.shape[:2]),
+        out=rgba,
+    )
+    if cancelled():
+        raise RuntimeError("Export cancelled")
+    return {
+        "rgba": rgba,
+        "heatmap": np.ascontiguousarray(heatmap, dtype=np.float32),
+        "changed_sample_count": sum(item.changed_sample_count for item in repairs),
+        "changed_pixel_count": sum(item.changed_pixel_count for item in repairs),
+        "protected_changed_sample_count": sum(
+            item.protected_changed_sample_count for item in repairs
+        ),
+        "protected_changed_pixel_count": sum(
+            item.protected_changed_pixel_count for item in repairs
+        ),
+    }
+
+
+def _compute_export_result(inputs, cancel_flag=None, progress=None):
     """Repair copied stacks, then generate a byte-compatible threshold image."""
+
+    if bool(inputs.get("packed", False)):
+        return _compute_packed_export_result(inputs, cancel_flag, progress)
 
     import numpy as np
 
@@ -2973,8 +3586,65 @@ def _compute_export_result(inputs, cancel_flag=None):
     }
 
 
+def _bounded_export_preview(rgba, maximum: int = 512):
+    import numpy as np
+
+    values = np.asarray(rgba, dtype=np.uint16)
+    height, width = values.shape[:2]
+    if max(height, width) <= int(maximum):
+        return np.ascontiguousarray(values)
+    scale = float(maximum) / float(max(height, width))
+    target_height = max(1, int(round(height * scale)))
+    target_width = max(1, int(round(width * scale)))
+    rows = np.rint(np.linspace(0, height - 1, target_height)).astype(np.intp)
+    columns = np.rint(np.linspace(0, width - 1, target_width)).astype(np.intp)
+    return np.ascontiguousarray(values[rows[:, None], columns[None, :]])
+
+
+def _compute_export_file_result(
+    inputs,
+    path,
+    cancel_flag=None,
+    progress=None,
+    temporary_holder=None,
+):
+    """Generate, fsync a temporary PNG, and return only bounded review data."""
+
+    from .png16 import write_png_rgba16_temporary
+    from .preview_cache import max_pool
+
+    result = _compute_export_result(inputs, cancel_flag, progress)
+    rgba = result.pop("rgba")
+    temporary = None
+    try:
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Export cancelled")
+        result["preview_rgba"] = _bounded_export_preview(rgba)
+        result["heatmap"] = max_pool(result["heatmap"], 512)
+        temporary = write_png_rgba16_temporary(
+            path, rgba, cancel_requested=cancel_flag
+        )
+        if temporary_holder is not None:
+            temporary_holder["path"] = str(temporary)
+        if cancel_flag is not None and int(getattr(cancel_flag, "value", 0)):
+            raise RuntimeError("Export cancelled")
+        result["temporary_path"] = str(temporary)
+        temporary = None
+        return result
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink()
+            except FileNotFoundError:
+                pass
+            if temporary_holder is not None:
+                temporary_holder.pop("path", None)
+
+
 def _publish_export_result(project, result) -> None:
-    rgba = result["rgba"]
+    rgba = result.get("preview_rgba", result.get("rgba"))
+    if rgba is None:
+        raise ValueError("Export result has no review preview")
     runtime.update_threshold_preview(project, rgba)
     changed_pixels = int(result["changed_pixel_count"])
     project.export_adjustment_pixel_count = changed_pixels
@@ -3001,6 +3671,212 @@ def _project_by_uuid(uuid: str):
     return None
 
 
+def _finish_bake_job(message: str, *, error: bool = False, wait: bool = True) -> None:
+    global _BAKE_JOB
+
+    job = _BAKE_JOB
+    _BAKE_JOB = None
+    if job is None:
+        return
+    cancel_flag = job.get("cancel_flag")
+    if error and cancel_flag is not None:
+        cancel_flag.value = 1
+    manager = job.get("manager")
+    if manager is not None:
+        manager.shutdown(wait=wait)
+    project = _project_by_uuid(str(job.get("project_uuid", "")))
+    rollback_error = ""
+    if project is not None and not bool(job.get("committed", False)) and job.get("rollback"):
+        try:
+            _restore_bake_records(project, job["rollback"])
+            runtime.sync_canvas(bpy.context, project)
+        except Exception as exc:
+            rollback_error = str(exc)
+    if bool(job.get("publish_started", False)):
+        runtime.end_base_bake(str(job.get("project_uuid", "")))
+    if project is not None:
+        project.job_running = False
+        project.job_progress = 0.0 if error else 1.0
+        project.job_message = message
+        if error:
+            if rollback_error:
+                message = f"{message}; rollback warning: {rollback_error}"
+            project.diagnostic_message = message
+    job.clear()
+    import gc
+
+    gc.collect()
+
+
+def _poll_bake_job() -> float | None:
+    job = _BAKE_JOB
+    if job is None:
+        return None
+    project = _project_by_uuid(str(job["project_uuid"]))
+    if project is None:
+        shutdown_bake_job(message="Base update cancelled because the project was removed")
+        return None
+    if int(getattr(job.get("cancel_flag"), "value", 0)):
+        _finish_bake_job("Base update cancelled", error=True)
+        return None
+    if _bake_revision_token(project) != job.get("revision_token"):
+        _finish_bake_job(
+            "Base update cancelled because the project changed",
+            error=True,
+        )
+        return None
+
+    if str(job.get("stage", "WORKER")) == "WORKER":
+        from .jobs import JobState
+
+        manager = job.get("manager")
+        state = manager.poll() if manager is not None else None
+        if state in {JobState.PENDING, JobState.RUNNING}:
+            project.job_progress = min(0.55, float(project.job_progress) + 0.01)
+            project.job_message = "Updating shadow guide…"
+            return 0.05
+        try:
+            if manager is None:
+                raise RuntimeError("Base update worker was not started")
+            result = manager.take_result()
+            manager.shutdown(wait=True)
+            job["manager"] = None
+            if runtime.compute_base_signature(project, bpy.context.scene) != job["source_signature"]:
+                raise RuntimeError("The mesh or pose changed during Base update")
+            missing = [
+                uuid_value
+                for uuid_value in job["angle_uuids"]
+                if uuid_value not in result["masks"]
+            ]
+            if missing:
+                raise RuntimeError("Base update did not return every angle key")
+            job["result"] = result
+            job["pending"] = list(job["angle_uuids"])
+            job["stage"] = "PUBLISH"
+            runtime.begin_base_bake(str(project.uuid))
+            job["publish_started"] = True
+            project.job_progress = 0.6
+            project.job_message = "Applying updated shadow guide…"
+            return 0.01
+        except Exception as exc:
+            _finish_bake_job(f"Base update failed: {exc}", error=True)
+            return None
+
+    try:
+        pending = job["pending"]
+        if pending:
+            uuid_value = pending.pop(0)
+            _publish_async_bake_key(project, job, uuid_value)
+            job["revision_token"] = _bake_revision_token(project)
+            completed = len(job["angle_uuids"]) - len(pending)
+            project.job_progress = 0.6 + 0.35 * completed / max(1, len(job["angle_uuids"]))
+            return 0.01
+        _finish_async_bake(project, job)
+        job["committed"] = True
+        job["rollback"].clear()
+        _finish_bake_job("Base updated; painted corrections were preserved")
+        return None
+    except Exception as exc:
+        _finish_bake_job(f"Base update failed: {exc}", error=True)
+        return None
+
+
+def _start_bake_job(context, project) -> None:
+    global _BAKE_JOB
+
+    if _BAKE_JOB is not None or _EXPORT_JOB is not None:
+        raise RuntimeError("Another Quick SDF job is already running")
+    import ctypes
+    import numpy as np
+
+    from .jobs import GenerationJobManager
+
+    triangle_uvs, corner_normals, triangle_centers = _extract_evaluated_bake_input(
+        context, project
+    )
+    lanes = []
+    angle_uuids = []
+    for side in ("RIGHT", "LEFT"):
+        items = sorted(
+            (item for item in project.angles if str(item.side) == side),
+            key=lambda item: float(item.angle),
+        )
+        if not items:
+            continue
+        uuids = tuple(str(item.uuid) for item in items)
+        angle_uuids.extend(uuids)
+        lanes.append(
+            {
+                "side": side,
+                "uuids": uuids,
+                "angles": np.asarray(
+                    [float(item.angle) for item in items], dtype=np.float64
+                ),
+            }
+        )
+    if not lanes:
+        raise ValueError("Base update requires angle keys")
+    request = {
+        "triangle_uvs": triangle_uvs,
+        "corner_normals": corner_normals,
+        "lanes": tuple(lanes),
+        "forward": tuple(float(value) for value in project.forward_vector),
+        "up": tuple(float(value) for value in project.up_vector),
+        "shadow_amount": float(project.guide_shadow_amount),
+        "resolution": int(project.resolution),
+    }
+    uv_perimeters = None
+    if project.boundary_tracks:
+        from .boundary import _project_uv_boundaries
+
+        uv_perimeters = _project_uv_boundaries(project)
+    cancel_flag = ctypes.c_int(0)
+    manager = GenerationJobManager(thread_name_prefix="QuickSDFBake")
+    manager.submit(_compute_async_bake, request, cancel_flag)
+    _BAKE_JOB = {
+        "manager": manager,
+        "project_uuid": str(project.uuid),
+        "cancel_flag": cancel_flag,
+        "revision_token": _bake_revision_token(project),
+        "source_signature": runtime.compute_base_signature(project, context.scene),
+        "stage": "WORKER",
+        "angle_uuids": tuple(angle_uuids),
+        "triangle_uvs": triangle_uvs,
+        "corner_normals": corner_normals,
+        "triangle_centers": triangle_centers,
+        "uv_perimeters": uv_perimeters,
+        "rollback": [],
+        "publish_started": False,
+        "committed": False,
+    }
+    project.job_running = True
+    project.job_progress = 0.02
+    project.job_message = "Updating shadow guide…"
+    project.diagnostic_message = ""
+    if not bpy.app.timers.is_registered(_poll_bake_job):
+        bpy.app.timers.register(_poll_bake_job, first_interval=0.05)
+
+
+def shutdown_bake_job(
+    project_uuid: str = "", *, message: str = "Base update cancelled", wait: bool = True
+) -> bool:
+    job = _BAKE_JOB
+    if job is None or (
+        project_uuid and str(job.get("project_uuid", "")) != str(project_uuid)
+    ):
+        return False
+    cancel_flag = job.get("cancel_flag")
+    if cancel_flag is not None:
+        cancel_flag.value = 1
+    manager = job.get("manager")
+    if manager is not None:
+        manager.cancel()
+    _finish_bake_job(message, error=True, wait=wait)
+    if bpy.app.timers.is_registered(_poll_bake_job):
+        bpy.app.timers.unregister(_poll_bake_job)
+    return True
+
+
 def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) -> None:
     global _EXPORT_JOB
     job = _EXPORT_JOB
@@ -3010,6 +3886,13 @@ def _finish_export_job(message: str, *, error: bool = False, wait: bool = True) 
     manager = job.get("manager")
     if manager is not None:
         manager.shutdown(wait=wait)
+    temporary_holder = job.get("temporary_holder") or {}
+    temporary_path = temporary_holder.pop("path", None) or job.get("temporary_path")
+    if temporary_path:
+        try:
+            Path(temporary_path).unlink()
+        except FileNotFoundError:
+            pass
     project = _project_by_uuid(str(job.get("project_uuid", "")))
     if project is not None:
         project.job_running = False
@@ -3034,34 +3917,95 @@ def _poll_export_job() -> float | None:
     if "settled_message" in job:
         _finish_export_job(str(job["settled_message"]))
         return None
-    from .jobs import JobState
-
-    manager = job["manager"]
     project = _project_by_uuid(str(job["project_uuid"]))
     if project is None:
         shutdown_export_job(
             message="Export cancelled because the project was removed", wait=True
         )
         return None
+    if _export_revision_token(project) != job.get("revision_token"):
+        cancel_flag = job.get("cancel_flag")
+        if cancel_flag is not None:
+            cancel_flag.value = 1
+        _finish_export_job(
+            "Export paused because the project changed; retry to save the latest paint",
+            error=True,
+        )
+        return None
+
+    if str(job.get("stage", "SNAPSHOT")) == "SNAPSHOT":
+        try:
+            if int(getattr(job.get("cancel_flag"), "value", 0)):
+                raise RuntimeError("Export cancelled")
+            builders = job["plan"]["snapshot_builders"]
+            cursor = int(job.get("snapshot_cursor", 0))
+            while cursor < len(builders) and builders[cursor][1].done:
+                cursor += 1
+            if cursor < len(builders):
+                builders[cursor][1].step(project)
+                job["snapshot_done"] = int(job.get("snapshot_done", 0)) + 1
+                job["snapshot_cursor"] = cursor
+                total = max(1, int(job.get("snapshot_total", 1)))
+                project.job_progress = 0.02 + 0.18 * min(
+                    1.0, float(job["snapshot_done"]) / float(total)
+                )
+                project.job_message = "Preparing export data…"
+                return 0.01
+
+            from .jobs import GenerationJobManager
+
+            inputs = _finish_packed_export_plan(job.pop("plan"))
+            manager = GenerationJobManager()
+            manager.submit(
+                _compute_export_file_result,
+                inputs,
+                job["path"],
+                job["cancel_flag"],
+                job["native_progress"],
+                job["temporary_holder"],
+            )
+            job["manager"] = manager
+            job["stage"] = "WORKER"
+            project.job_progress = 0.2
+            project.job_message = "Generating face shadow texture…"
+            return 0.05
+        except Exception as exc:
+            _finish_export_job(f"Export failed: {exc}", error=True)
+            return None
+
+    from .jobs import JobState
+
+    manager = job.get("manager")
+    if manager is None:
+        _finish_export_job("Export failed: worker was not started", error=True)
+        return None
     state = manager.poll()
     if state in {JobState.PENDING, JobState.RUNNING}:
-        project.job_progress = min(0.92, float(project.job_progress) + 0.015)
+        completed = max(0, int(getattr(job.get("native_progress"), "value", 0)))
+        progress_total = max(1, int(job.get("native_progress_total", 16)))
+        project.job_progress = max(
+            float(project.job_progress),
+            min(0.90, 0.2 + 0.7 * float(completed) / float(progress_total)),
+        )
         project.job_message = "Generating face shadow texture…"
-        return 0.1
+        return 0.05
     try:
         result = manager.take_result()
         project.job_progress = 0.95
+        job["temporary_path"] = str(result["temporary_path"])
         if _export_revision_token(project) != job.get("revision_token"):
-            _finish_export_job(
-                "Export paused because the project changed; retry to save the latest paint",
-                error=True,
+            raise RuntimeError(
+                "Project changed during export; retry to save the latest paint"
             )
-            return None
-        from .png16 import write_png_rgba16
+        from .png16 import commit_png_temporary
 
-        written = write_png_rgba16(
-            job["path"], result["rgba"], overwrite=bool(job["overwrite"])
+        written = commit_png_temporary(
+            job["temporary_path"],
+            job["path"],
+            overwrite=bool(job["overwrite"]),
         )
+        job["temporary_path"] = ""
+        job["temporary_holder"].pop("path", None)
         project.output_path = str(written)
     except Exception as exc:
         _finish_export_job(f"Export failed: {exc}", error=True)
@@ -3091,28 +4035,41 @@ def _poll_export_job() -> float | None:
     return 0.5
 
 
-def _start_export_job(project, inputs, path: Path, overwrite: bool) -> None:
+def _start_export_job(project, plan, path: Path, overwrite: bool) -> None:
     global _EXPORT_JOB
-    if _EXPORT_JOB is not None:
-        raise RuntimeError("Another Quick SDF export is already running")
-    from .jobs import GenerationJobManager
+    if _EXPORT_JOB is not None or _BAKE_JOB is not None:
+        raise RuntimeError("Another Quick SDF job is already running")
     import ctypes
 
     revision_token = _export_revision_token(project)
-    manager = GenerationJobManager()
     cancel_flag = ctypes.c_int(0)
-    manager.submit(_compute_export_result, inputs, cancel_flag)
+    native_progress = ctypes.c_int(0)
+    snapshot_total = sum(
+        int(builder.count) for _name, builder in plan.get("snapshot_builders", ())
+    )
     _EXPORT_JOB = {
-        "manager": manager,
+        "manager": None,
+        "stage": "SNAPSHOT",
+        "plan": plan,
         "project_uuid": str(project.uuid),
         "path": Path(path),
         "overwrite": bool(overwrite),
         "cancel_flag": cancel_flag,
+        "native_progress": native_progress,
+        "native_progress_total": max(
+            int(builder.count)
+            for _name, builder in plan.get("snapshot_builders", ())
+        ),
         "revision_token": revision_token,
+        "snapshot_cursor": 0,
+        "snapshot_done": 0,
+        "snapshot_total": snapshot_total,
+        "temporary_path": "",
+        "temporary_holder": {},
     }
     project.job_running = True
     project.job_progress = 0.01
-    project.job_message = "Generating face shadow texture…"
+    project.job_message = "Preparing export data…"
     if not bpy.app.timers.is_registered(_poll_export_job):
         bpy.app.timers.register(_poll_export_job, first_interval=0.05)
 
@@ -3155,7 +4112,7 @@ def _generate(project, context):
 
 
 def _generate_export(project, context):
-    inputs = _prepare_threshold_inputs(project)
+    inputs = _prepare_packed_threshold_inputs(project)
     window_manager = context.window_manager
     window_manager.progress_begin(0, 2)
     try:
@@ -3291,8 +4248,8 @@ class QUICKSDF_OT_export_texture(bpy.types.Operator):
             return {"CANCELLED"}
         if not bpy.app.background and getattr(context, "window", None) is not None:
             try:
-                inputs = _prepare_threshold_inputs(project)
-                _start_export_job(project, inputs, path, allow_overwrite)
+                plan = _prepare_packed_export_plan(project)
+                _start_export_job(project, plan, path, allow_overwrite)
                 self.report({"INFO"}, "Generating face shadow texture")
                 return {"FINISHED"}
             except (OSError, ValueError, RuntimeError) as exc:
@@ -3401,13 +4358,15 @@ class QUICKSDF_OT_cancel_job(bpy.types.Operator):
         project = _require_project(self, context)
         if project is None:
             return {"CANCELLED"}
-        return (
-            {"FINISHED"}
-            if shutdown_export_job(
-                str(project.uuid), message="Export cancelled", wait=True
-            )
-            else {"CANCELLED"}
-        )
+        if shutdown_bake_job(
+            str(project.uuid), message="Base update cancelled", wait=True
+        ):
+            return {"FINISHED"}
+        if shutdown_export_job(
+            str(project.uuid), message="Export cancelled", wait=True
+        ):
+            return {"FINISHED"}
+        return {"CANCELLED"}
 
 
 class QUICKSDF_OT_cancel_auto_key(bpy.types.Operator):

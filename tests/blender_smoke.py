@@ -17,6 +17,7 @@ import math
 from pathlib import Path
 import struct
 import sys
+import time
 import zlib
 
 
@@ -107,10 +108,19 @@ def _decode_rgba16(path: Path) -> tuple[dict[str, int], np.ndarray]:
     stride = width * 8 + 1
     assert len(raw) == height * stride
     rows: list[bytes] = []
+    previous = np.zeros(width * 8, dtype=np.uint8)
     for row in range(height):
         start = row * stride
-        assert raw[start] == 0, "smoke decoder expects PNG filter type 0"
-        rows.append(raw[start + 1 : start + stride])
+        filter_type = raw[start]
+        scanline = np.frombuffer(
+            raw[start + 1 : start + stride], dtype=np.uint8
+        ).copy()
+        if filter_type == 2:
+            scanline += previous
+        else:
+            assert filter_type == 0, "unsupported PNG scanline filter"
+        rows.append(scanline.tobytes())
+        previous = scanline
     pixels = np.frombuffer(b"".join(rows), dtype=">u2").reshape(height, width, 4)
     header = {
         "width": width,
@@ -177,7 +187,7 @@ def _pack_expected_thresholds(
 
 def _assert_export_worker_side_contracts() -> None:
     from quick_sdf_blender import operators
-    from quick_sdf_blender.core import generate_threshold_pair_channels
+    from quick_sdf_blender.core import generate_threshold_pair_channels, pack_lane_bits
     from quick_sdf_blender.symmetry import IslandPair, mirror_side_stack
 
     angles = np.asarray([0.0, 45.0, 90.0], dtype=np.float64)
@@ -216,11 +226,30 @@ def _assert_export_worker_side_contracts() -> None:
     )
     assert independent["changed_pixel_count"] == 0
 
-    full = np.ones(right.shape[1:], dtype=np.bool_)
+    packed_independent = operators._compute_export_result(
+        {
+            "packed": True,
+            "linked": False,
+            "right": pack_lane_bits(right, angles, ~right, coverage),
+            "left": pack_lane_bits(
+                left, angles, np.roll(left, 1, axis=0), coverage
+            ),
+            "packing": packing,
+        }
+    )
+    np.testing.assert_array_equal(packed_independent["rgba"], independent["rgba"])
+    np.testing.assert_array_equal(
+        packed_independent["heatmap"], independent["heatmap"]
+    )
+
+    source_half = np.asarray(
+        [[True, True, False, False], [True, True, False, False]], dtype=np.bool_
+    )
+    target_half = ~source_half
     for mode, pairs in (
         ("OVERLAPPED", None),
         ("TEXTURE_MIRROR", None),
-        ("ISLAND_PAIR", [IslandPair(full, full)]),
+        ("ISLAND_PAIR", [IslandPair(source_half, target_half)]),
     ):
         mirrored = mirror_side_stack(left, mode, island_pairs=pairs)
         linked_left = operators._compute_export_result(
@@ -241,6 +270,21 @@ def _assert_export_worker_side_contracts() -> None:
             _pack_expected_thresholds(linked_channels, packing),
         )
         assert linked_left["changed_pixel_count"] == 0
+        packed_linked = operators._compute_export_result(
+            {
+                "packed": True,
+                "linked": True,
+                "author_side": "LEFT",
+                "source": pack_lane_bits(left, angles, ~left, coverage),
+                "mirror_mode": mode,
+                "island_pairs": pairs,
+                "packing": packing,
+            }
+        )
+        np.testing.assert_array_equal(packed_linked["rgba"], linked_left["rgba"])
+        np.testing.assert_array_equal(
+            packed_linked["heatmap"], linked_left["heatmap"]
+        )
 
 
 def run(output_directory: Path) -> None:
@@ -253,6 +297,7 @@ def run(output_directory: Path) -> None:
     png_path = output_directory / "quick_sdf_smoke_rgba16.png"
     custom_png_path = output_directory / "quick_sdf_smoke_custom_rgba16.png"
     repaired_png_path = output_directory / "quick_sdf_smoke_repaired_rgba16.png"
+    async_png_path = output_directory / "quick_sdf_smoke_async_rgba16.png"
     if blend_path.exists():
         blend_path.unlink()
     if png_path.exists():
@@ -261,6 +306,8 @@ def run(output_directory: Path) -> None:
         custom_png_path.unlink()
     if repaired_png_path.exists():
         repaired_png_path.unlink()
+    if async_png_path.exists():
+        async_png_path.unlink()
 
     print("[Quick SDF smoke] enable through Blender preferences")
     # This is deliberately not a direct ``register()`` call.  Blender wraps
@@ -468,7 +515,7 @@ def run(output_directory: Path) -> None:
     runtime.write_image_rgba(propagation_source, propagation_shadow)
     assert np.any(runtime.image_rgba(propagation_source) != propagation_snapshot)
 
-    original_image_rgba8 = runtime.image_rgba8
+    original_image_gray8 = runtime.image_gray8
     failure_injected = False
 
     def fail_before_active_collection(image):
@@ -476,9 +523,9 @@ def run(output_directory: Path) -> None:
         if image == fail_display:
             failure_injected = True
             raise RuntimeError("simulated pre-active collection failure")
-        return original_image_rgba8(image)
+        return original_image_gray8(image)
 
-    runtime.image_rgba8 = fail_before_active_collection
+    runtime.image_gray8 = fail_before_active_collection
     try:
         try:
             failed_propagation_result = bpy.ops.quicksdf.propagate_overrides()
@@ -487,7 +534,7 @@ def run(output_directory: Path) -> None:
         else:
             assert failed_propagation_result == {"CANCELLED"}, failed_propagation_result
     finally:
-        runtime.image_rgba8 = original_image_rgba8
+        runtime.image_gray8 = original_image_gray8
     assert failure_injected
     assert not runtime.has_paint_snapshot(project)
     np.testing.assert_array_equal(
@@ -522,6 +569,88 @@ def run(output_directory: Path) -> None:
         np.testing.assert_array_equal(coverage, before_coverage)
         np.testing.assert_array_equal(display[..., :3][covered], before_display[..., :3][covered])
 
+    print("[Quick SDF smoke] async Rebake is cancellable and transactional")
+    from quick_sdf_blender import operators
+
+    def bake_fingerprint():
+        return tuple(
+            (
+                str(item.uuid),
+                hashlib.sha256(
+                    runtime.image_gray8(runtime.resolve_display_image(project, item)).tobytes()
+                ).hexdigest(),
+                hashlib.sha256(runtime.bitplane_blob(item, "BASE")).hexdigest(),
+                hashlib.sha256(runtime.bitplane_blob(item, "COVERAGE")).hexdigest(),
+            )
+            for item in project.angles
+        )
+
+    before_cancelled_bake = bake_fingerprint()
+    operators._start_bake_job(bpy.context, project)
+    assert operators.shutdown_bake_job(
+        str(project.uuid), message="Smoke Base cancellation", wait=True
+    )
+    assert operators._BAKE_JOB is None
+    assert bake_fingerprint() == before_cancelled_bake
+
+    project.guide_shadow_amount = 42.0
+    before_failed_publish = bake_fingerprint()
+    original_publish_bake_key = operators._publish_async_bake_key
+    published = {"count": 0}
+
+    def fail_second_bake_publish(project_value, job_value, uuid_value):
+        if published["count"] == 1:
+            raise RuntimeError("simulated async Base publish failure")
+        published["count"] += 1
+        return original_publish_bake_key(project_value, job_value, uuid_value)
+
+    operators._publish_async_bake_key = fail_second_bake_publish
+    try:
+        operators._start_bake_job(bpy.context, project)
+        deadline = time.monotonic() + 15.0
+        while operators._BAKE_JOB is not None and time.monotonic() < deadline:
+            delay = operators._poll_bake_job()
+            if delay:
+                time.sleep(min(float(delay), 0.02))
+    finally:
+        operators._publish_async_bake_key = original_publish_bake_key
+    assert operators._BAKE_JOB is None
+    assert published["count"] == 1
+    after_failed_publish = bake_fingerprint()
+    if after_failed_publish != before_failed_publish:
+        for before_item, after_item in zip(before_failed_publish, after_failed_publish):
+            if before_item != after_item:
+                print("[Quick SDF smoke] async rollback mismatch", before_item, after_item)
+    assert after_failed_publish == before_failed_publish
+
+    project.guide_shadow_amount = 41.0
+    protected_before = {
+        item.uuid: (
+            runtime.image_gray8(runtime.resolve_display_image(project, item)).copy(),
+            runtime.coverage_mask(item).copy(),
+        )
+        for item in project.angles
+    }
+    operators._start_bake_job(bpy.context, project)
+    deadline = time.monotonic() + 15.0
+    while operators._BAKE_JOB is not None and time.monotonic() < deadline:
+        delay = operators._poll_bake_job()
+        if delay:
+            time.sleep(min(float(delay), 0.02))
+    assert operators._BAKE_JOB is None, "asynchronous Base update did not settle"
+    if bpy.app.timers.is_registered(operators._poll_bake_job):
+        bpy.app.timers.unregister(operators._poll_bake_job)
+    assert not project.job_running
+    assert project.base_source == "NORMAL_GUIDE"
+    for item in project.angles:
+        before_gray, before_coverage = protected_before[item.uuid]
+        after_gray = runtime.image_gray8(runtime.resolve_display_image(project, item))
+        after_coverage = runtime.coverage_mask(item)
+        np.testing.assert_array_equal(after_coverage, before_coverage)
+        np.testing.assert_array_equal(
+            after_gray[before_coverage], before_gray[before_coverage]
+        )
+
     print("[Quick SDF smoke] preview material is reversible")
     original_material = cube.material_slots[0].material
     original_link = cube.material_slots[0].link
@@ -550,14 +679,49 @@ def run(output_directory: Path) -> None:
     assert project.generated_image is not None
     assert project.generated_image.get(runtime.PROJECT_UUID_KEY) == project.uuid
     assert project.generated_image.get(runtime.ROLE_KEY) == runtime.THRESHOLD_ROLE
-    from quick_sdf_blender import operators
-
     strict_channels = operators._compute_threshold_channels(
         operators._prepare_strict_threshold_inputs(project)
     )
     strict_expected = operators._pack_threshold_channels(
         strict_channels, operators._snapshot_packing_inputs(project)
     )
+
+    print("[Quick SDF smoke] incremental packed snapshot and worker-side PNG")
+    conflict_plan = operators._prepare_packed_export_plan(project)
+    operators._start_export_job(project, conflict_plan, async_png_path, True)
+    project.packing_revision += 1
+    assert operators._poll_export_job() is None
+    assert operators._EXPORT_JOB is None
+    assert not async_png_path.exists()
+
+    cancel_plan = operators._prepare_packed_export_plan(project)
+    operators._start_export_job(project, cancel_plan, async_png_path, True)
+    while operators._EXPORT_JOB is not None and str(
+        operators._EXPORT_JOB.get("stage", "")
+    ) == "SNAPSHOT":
+        operators._poll_export_job()
+    assert operators.shutdown_export_job(
+        str(project.uuid), message="Smoke cancellation", wait=True
+    )
+    assert operators._EXPORT_JOB is None
+    assert not async_png_path.exists()
+    assert not tuple(async_png_path.parent.glob(f".{async_png_path.name}.*.tmp"))
+
+    async_plan = operators._prepare_packed_export_plan(project)
+    operators._start_export_job(project, async_plan, async_png_path, True)
+    deadline = time.monotonic() + 15.0
+    while operators._EXPORT_JOB is not None and time.monotonic() < deadline:
+        delay = operators._poll_export_job()
+        if delay:
+            time.sleep(min(float(delay), 0.02))
+    assert operators._EXPORT_JOB is None, "asynchronous export did not settle"
+    if bpy.app.timers.is_registered(operators._poll_export_job):
+        bpy.app.timers.unregister(operators._poll_export_job)
+    assert async_png_path.is_file()
+    _async_header, async_pixels = _decode_rgba16(async_png_path)
+    np.testing.assert_array_equal(async_pixels, strict_expected)
+    assert not tuple(async_png_path.parent.glob(f".{async_png_path.name}.*.tmp"))
+
     _expect_finished(
         bpy.ops.quicksdf.export_texture(filepath=str(png_path), overwrite=True),
         "export_texture",

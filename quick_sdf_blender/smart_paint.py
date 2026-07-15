@@ -30,6 +30,28 @@ class SmartTransitionResult:
     affected_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SmartTransitionPatch:
+    """One angle's zero-copy propagation instructions.
+
+    The boolean arrays are borrowed from the stroke-level transition masks.
+    They must not be mutated.  ``include_touched`` is true only for the active
+    key, where soft brush changes that did not cross 0.5 still gain Coverage.
+    """
+
+    index: int
+    became_light: np.ndarray | None
+    became_shadow: np.ndarray | None
+    touched: np.ndarray | None
+
+
+@dataclass(frozen=True, slots=True)
+class SmartKeyPatchResult:
+    mask: np.ndarray
+    coverage: np.ndarray
+    footprint: np.ndarray
+
+
 def affected_key_indices(
     angles: Sequence[float] | np.ndarray,
     active_index: int,
@@ -87,6 +109,125 @@ def apply_smart_stroke(
     return SmartStrokeResult(result, result_coverage, indices)
 
 
+def gray8_transition_masks(
+    before: np.ndarray,
+    after: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return touched, Shadow-to-Light and Light-to-Shadow pixel masks."""
+
+    first = np.asarray(before)
+    second = np.asarray(after)
+    if first.ndim != 2 or second.ndim != 2 or first.shape != second.shape:
+        raise ValueError("before and after must be matching two-dimensional planes")
+    if first.dtype != np.uint8 or second.dtype != np.uint8:
+        raise TypeError("before and after must use uint8")
+    touched = first != second
+    first_light = first >= 128
+    second_light = second >= 128
+    became_light = touched & ~first_light & second_light
+    became_shadow = touched & first_light & ~second_light
+    return touched, became_light, became_shadow
+
+
+def _validated_transition_areas(
+    angle_count: int,
+    active_index: int,
+    touched: np.ndarray,
+    became_light: np.ndarray,
+    became_shadow: np.ndarray,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    if isinstance(angle_count, bool) or not isinstance(angle_count, (int, np.integer)):
+        raise TypeError("angle_count must be an integer")
+    if angle_count <= 0:
+        raise ValueError("angle_count must be positive")
+    if isinstance(active_index, bool) or not 0 <= int(active_index) < angle_count:
+        raise IndexError("active_index is outside the angle lane")
+    areas = []
+    shape: tuple[int, int] | None = None
+    for name, value in (
+        ("touched", touched),
+        ("became_light", became_light),
+        ("became_shadow", became_shadow),
+    ):
+        area = np.asarray(value)
+        if area.ndim != 2:
+            raise ValueError(f"{name} must be a two-dimensional image")
+        if area.dtype != np.bool_:
+            raise TypeError(f"{name} must be boolean")
+        if shape is None:
+            shape = area.shape
+        elif area.shape != shape:
+            raise ValueError("transition masks must have matching shapes")
+        areas.append(area)
+    touched_area, light_area, shadow_area = areas
+    if np.any(light_area & shadow_area):
+        raise ValueError("a pixel cannot become both Light and Shadow")
+    if np.any((light_area | shadow_area) & ~touched_area):
+        raise ValueError("threshold transitions must be part of the touched area")
+    return int(active_index), touched_area, light_area, shadow_area
+
+
+def iter_smart_transition_patches(
+    angle_count: int,
+    active_index: int,
+    touched: np.ndarray,
+    became_light: np.ndarray,
+    became_shadow: np.ndarray,
+):
+    """Yield propagation work one key at a time without allocating a stack."""
+
+    active, touched_area, light_area, shadow_area = _validated_transition_areas(
+        angle_count,
+        active_index,
+        touched,
+        became_light,
+        became_shadow,
+    )
+    has_touched = bool(np.any(touched_area))
+    has_light = bool(np.any(light_area))
+    has_shadow = bool(np.any(shadow_area))
+    for index in range(angle_count):
+        light = light_area if has_light and index >= active else None
+        shadow = shadow_area if has_shadow and index <= active else None
+        native_touched = touched_area if has_touched and index == active else None
+        if light is not None or shadow is not None or native_touched is not None:
+            yield SmartTransitionPatch(index, light, shadow, native_touched)
+
+
+def apply_smart_transition_patch(
+    mask: np.ndarray,
+    coverage: np.ndarray,
+    patch: SmartTransitionPatch,
+) -> SmartKeyPatchResult:
+    """Apply one streamed patch, allocating only this key's result planes."""
+
+    source_mask = np.asarray(mask)
+    source_coverage = np.asarray(coverage)
+    if source_mask.ndim != 2 or source_mask.dtype != np.bool_:
+        raise TypeError("mask must be a two-dimensional boolean plane")
+    if source_coverage.shape != source_mask.shape or source_coverage.dtype != np.bool_:
+        raise TypeError("coverage must be a matching boolean plane")
+    if not isinstance(patch, SmartTransitionPatch):
+        raise TypeError("patch must be a SmartTransitionPatch")
+    result_mask = source_mask.copy()
+    result_coverage = source_coverage.copy()
+    footprint = np.zeros(source_mask.shape, dtype=np.bool_)
+    for area, value in ((patch.became_light, True), (patch.became_shadow, False)):
+        if area is None:
+            continue
+        if area.shape != source_mask.shape or area.dtype != np.bool_:
+            raise ValueError("patch transition mask does not match the destination")
+        result_mask[area] = value
+        result_coverage[area] = True
+        footprint |= area
+    if patch.touched is not None:
+        if patch.touched.shape != source_mask.shape or patch.touched.dtype != np.bool_:
+            raise ValueError("patch touched mask does not match the destination")
+        result_coverage[patch.touched] = True
+        footprint |= patch.touched
+    return SmartKeyPatchResult(result_mask, result_coverage, footprint)
+
+
 def apply_smart_transitions(
     mask_stack: np.ndarray,
     coverage_stack: np.ndarray,
@@ -121,50 +262,40 @@ def apply_smart_transitions(
     if isinstance(active_index, bool) or not 0 <= int(active_index) < masks.shape[0]:
         raise IndexError("active_index is outside the angle lane")
 
-    shape = masks.shape[1:]
-    areas = []
-    for name, value in (
-        ("touched", touched),
-        ("became_light", became_light),
-        ("became_shadow", became_shadow),
-    ):
-        area = np.asarray(value)
-        if area.shape != shape:
-            raise ValueError(f"{name} must match one mask image")
-        if area.dtype != np.bool_:
-            raise TypeError(f"{name} must be boolean")
-        areas.append(area)
-    touched_area, light_area, shadow_area = areas
-    if np.any(light_area & shadow_area):
-        raise ValueError("a pixel cannot become both Light and Shadow")
-    if np.any((light_area | shadow_area) & ~touched_area):
-        raise ValueError("threshold transitions must be part of the touched area")
-
     active = int(active_index)
     result = masks.copy()
     result_coverage = coverage.copy()
     footprints = np.zeros_like(masks, dtype=np.bool_)
-    footprints[active] |= touched_area
-    result_coverage[active, touched_area] = True
-
-    if np.any(light_area):
-        for index in range(active, masks.shape[0]):
-            result[index, light_area] = True
-            result_coverage[index, light_area] = True
-            footprints[index] |= light_area
-    if np.any(shadow_area):
-        for index in range(0, active + 1):
-            result[index, shadow_area] = False
-            result_coverage[index, shadow_area] = True
-            footprints[index] |= shadow_area
-
-    affected = tuple(
-        int(index) for index in range(masks.shape[0]) if np.any(footprints[index])
-    )
+    affected_list: list[int] = []
+    for patch in iter_smart_transition_patches(
+        masks.shape[0],
+        active,
+        touched,
+        became_light,
+        became_shadow,
+    ):
+        key_result = apply_smart_transition_patch(
+            result[patch.index],
+            result_coverage[patch.index],
+            patch,
+        )
+        result[patch.index] = key_result.mask
+        result_coverage[patch.index] = key_result.coverage
+        footprints[patch.index] = key_result.footprint
+        affected_list.append(patch.index)
+    affected = tuple(affected_list)
     return SmartTransitionResult(result, result_coverage, footprints, affected)
 
 
 __all__ = [
-    "SmartStrokeResult", "SmartTransitionResult", "affected_key_indices",
-    "apply_smart_stroke", "apply_smart_transitions",
+    "SmartKeyPatchResult",
+    "SmartStrokeResult",
+    "SmartTransitionPatch",
+    "SmartTransitionResult",
+    "affected_key_indices",
+    "apply_smart_stroke",
+    "apply_smart_transition_patch",
+    "apply_smart_transitions",
+    "gray8_transition_masks",
+    "iter_smart_transition_patches",
 ]

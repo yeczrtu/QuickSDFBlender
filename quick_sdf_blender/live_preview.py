@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import bpy
@@ -12,8 +13,10 @@ from . import runtime
 
 SEEK_PREVIEW_ROLE = "seek_preview"
 ONION_PREVIEW_ROLE = "onion_preview"
-_SDF_CACHE: dict[tuple[Any, ...], Any] = {}
-_REPAIR_CACHE: dict[tuple[Any, ...], Any] = {}
+_SDF_EXECUTOR: ThreadPoolExecutor | None = None
+_SDF_JOBS: dict[tuple[Any, ...], Future[Any]] = {}
+_PENDING_REFRESH: dict[str, tuple[float, tuple[tuple[Any, ...], ...]]] = {}
+_CACHE_GENERATION = 0
 
 
 def _revision(image: Any) -> int:
@@ -21,34 +24,30 @@ def _revision(image: Any) -> int:
 
 
 def _sample_plane(values: Any, maximum: int = 512):
-    import numpy as np
+    from .preview_cache import resize_nearest
 
-    mask = np.asarray(values, dtype=np.bool_)
-    if mask.ndim != 2:
-        raise ValueError(f"Preview masks must be two-dimensional, got {mask.shape}")
-    height, width = mask.shape
-    scale = min(1.0, float(maximum) / max(height, width))
-    target_height = max(1, int(round(height * scale)))
-    target_width = max(1, int(round(width * scale)))
-    if (target_height, target_width) == (height, width):
-        return mask
-    ys = np.minimum(np.arange(target_height) * height // target_height, height - 1)
-    xs = np.minimum(np.arange(target_width) * width // target_width, width - 1)
-    return mask[ys[:, None], xs[None, :]]
+    return resize_nearest(values, maximum).astype("bool", copy=False)
 
 
 def _sample_mask(image: Any, maximum: int = 512):
-    return _sample_plane(runtime.image_mask(image), maximum)
+    from .preview_cache import image_proxy_mask
+
+    return image_proxy_mask(image, maximum)
+
+
+def _image_sdf_key(image: Any) -> tuple[Any, ...]:
+    return ("image-sdf", str(image.name), _revision(image), 512)
 
 
 def _sdf(image: Any):
     from .core import exact_signed_edt
+    from .preview_cache import array_cache_get, array_cache_put
 
-    key = (str(image.name), _revision(image), 512)
-    result = _SDF_CACHE.get(key)
+    key = _image_sdf_key(image)
+    result = array_cache_get(key)
     if result is None:
         result = exact_signed_edt(_sample_mask(image))
-        _SDF_CACHE[key] = result
+        result = array_cache_put(key, result)
     return result
 
 
@@ -78,15 +77,40 @@ def _repaired_preview_stack(project: Any, items: list[Any]):
             for item, display in records
         ),
     )
-    cached = _REPAIR_CACHE.get(key)
+    from .preview_cache import (
+        array_cache_get,
+        array_cache_put,
+        plane_proxy_factory,
+    )
+
+    cache_key = ("repair-stack", key)
+    cached = array_cache_get(cache_key)
     if cached is None:
         display_stack = np.stack([_sample_mask(display) for _item, display in records], axis=0)
         base_stack = np.stack(
-            [_sample_plane(runtime.base_mask(item)) for item, _display in records],
+            [
+                plane_proxy_factory(
+                    (
+                        str(project.uuid), str(getattr(item, "uuid", "")),
+                        "base", int(getattr(item, "base_revision", 0)),
+                    ),
+                    lambda item=item: runtime.base_mask(item),
+                )
+                for item, _display in records
+            ],
             axis=0,
         )
         coverage_stack = np.stack(
-            [_sample_plane(runtime.coverage_mask(item)) for item, _display in records],
+            [
+                plane_proxy_factory(
+                    (
+                        str(project.uuid), str(getattr(item, "uuid", "")),
+                        "coverage", int(getattr(item, "coverage_revision", 0)),
+                    ),
+                    lambda item=item: runtime.coverage_mask(item),
+                )
+                for item, _display in records
+            ],
             axis=0,
         )
         try:
@@ -101,19 +125,114 @@ def _repaired_preview_stack(project: Any, items: list[Any]):
             cached = repair_side_monotonic(
                 display_stack, base_stack, coverage_stack
             ).masks
-        _REPAIR_CACHE[key] = cached
+        cached = array_cache_put(cache_key, cached)
     return cached, key
 
 
 def _repaired_sdf(mask: Any, repair_key: tuple[Any, ...], index: int):
     from .core import exact_signed_edt
+    from .preview_cache import array_cache_get, array_cache_put
 
     key = ("repaired", repair_key, int(index))
-    result = _SDF_CACHE.get(key)
+    result = array_cache_get(key)
     if result is None:
         result = exact_signed_edt(mask)
-        _SDF_CACHE[key] = result
+        result = array_cache_put(key, result)
     return result
+
+
+def _repaired_sdf_key(repair_key: tuple[Any, ...], index: int) -> tuple[Any, ...]:
+    return ("repaired", repair_key, int(index))
+
+
+def _executor() -> ThreadPoolExecutor:
+    global _SDF_EXECUTOR
+    if _SDF_EXECUTOR is None:
+        _SDF_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="QuickSDF-Preview"
+        )
+    return _SDF_EXECUTOR
+
+
+def _compute_sdf_job(
+    entries: tuple[tuple[tuple[Any, ...], Any], ...],
+    generation: int,
+) -> tuple[tuple[Any, ...], ...]:
+    from .core import exact_signed_edt
+    from .preview_cache import array_cache_put
+
+    completed: list[tuple[Any, ...]] = []
+    for key, mask in entries:
+        result = exact_signed_edt(mask)
+        if generation != _CACHE_GENERATION:
+            return ()
+        array_cache_put(key, result)
+        completed.append(key)
+    return tuple(completed)
+
+
+def _queue_sdf_preview(
+    project: Any,
+    angle: float,
+    entries: tuple[tuple[tuple[Any, ...], Any], ...],
+) -> None:
+    from .preview_cache import array_cache_get
+
+    missing = tuple((key, mask) for key, mask in entries if array_cache_get(key) is None)
+    keys = tuple(key for key, _mask in entries)
+    uuid = str(getattr(project, "uuid", ""))
+    _PENDING_REFRESH[uuid] = (float(angle), keys)
+    if missing:
+        job_key = tuple(key for key, _mask in missing)
+        if job_key not in _SDF_JOBS:
+            immutable = tuple((key, mask) for key, mask in missing)
+            _SDF_JOBS[job_key] = _executor().submit(
+                _compute_sdf_job, immutable, _CACHE_GENERATION
+            )
+    if not bpy.app.timers.is_registered(_poll_sdf_jobs):
+        bpy.app.timers.register(_poll_sdf_jobs, first_interval=0.02)
+
+
+def _project_for_uuid(uuid: str) -> Any | None:
+    for scene in bpy.data.scenes:
+        for project in getattr(scene, "quick_sdf_projects", ()):
+            if str(getattr(project, "uuid", "")) == uuid:
+                return project
+    return None
+
+
+def _poll_sdf_jobs() -> float | None:
+    from .preview_cache import array_cache_get
+
+    failed_keys: set[tuple[Any, ...]] = set()
+    for job_key, future in tuple(_SDF_JOBS.items()):
+        if not future.done():
+            continue
+        _SDF_JOBS.pop(job_key, None)
+        try:
+            future.result()
+        except Exception:
+            failed_keys.update(job_key)
+
+    for uuid, (angle, keys) in tuple(_PENDING_REFRESH.items()):
+        if any(key in failed_keys for key in keys):
+            _PENDING_REFRESH.pop(uuid, None)
+            continue
+        if not all(array_cache_get(key) is not None for key in keys):
+            continue
+        _PENDING_REFRESH.pop(uuid, None)
+        project = _project_for_uuid(uuid)
+        if project is None:
+            continue
+        if abs(float(getattr(project, "seek_angle", angle)) - angle) > 1.0e-4:
+            continue
+        try:
+            update_seek_preview(project, angle)
+        except (AttributeError, ReferenceError, RuntimeError, ValueError):
+            pass
+    if _SDF_JOBS or _PENDING_REFRESH:
+        return 0.02
+    return None
 
 
 def _finite_sdf(values: Any):
@@ -174,17 +293,32 @@ def update_onion_preview(project: Any) -> Any | None:
     active = runtime.active_angle(project)
     if not items or active is None or str(getattr(active, "side", "RIGHT")) != side:
         return None
-    masks = np.stack(
-        [runtime.image_mask(runtime.resolve_display_image(project, item)) for item in items],
-        axis=0,
+    active_position = next(
+        (index for index, item in enumerate(items) if str(item.uuid) == str(active.uuid)),
+        -1,
     )
-    angles = np.asarray([float(item.angle) for item in items], dtype=np.float64)
+    if active_position < 0:
+        return None
+    # Onion needs only the edit key and its immediate neighbours.  Loading the
+    # other authored keys served no visual purpose and defeated image residency.
+    first = max(0, active_position - 1)
+    last = min(len(items), active_position + 2)
+    neighbours = items[first:last]
+    records = [
+        (item, runtime.resolve_display_image(project, item)) for item in neighbours
+    ]
+    if any(image is None for _item, image in records):
+        return None
+    masks = np.stack([_sample_mask(image) for _item, image in records], axis=0)
+    angles = np.asarray([float(item.angle) for item, _image in records], dtype=np.float64)
     from .review import review_onion_difference
 
-    rgba = review_onion_difference(masks, angles, float(active.angle))
+    rgba = review_onion_difference(masks, angles, float(active.angle), maximum=512)
     height, width = rgba.shape[:2]
     image = _onion_image(project, width, height)
-    runtime.write_image_rgba(image, rgba)
+    runtime.write_image_rgba8(
+        image, np.rint(np.clip(rgba, 0.0, 1.0) * 255.0).astype(np.uint8)
+    )
     try:
         from .studio import active_session, find_window
 
@@ -233,21 +367,43 @@ def update_seek_preview(project: Any, angle: float) -> Any | None:
     else:
         factor = (value - lower_angle) / (upper_angle - lower_angle)
         if repaired_stack is not None:
-            first = _finite_sdf(
-                _repaired_sdf(repaired_stack[lower_index], repair_key, lower_index)
-            )
-            second = _finite_sdf(
-                _repaired_sdf(repaired_stack[upper_index], repair_key, upper_index)
-            )
+            from .preview_cache import array_cache_get
+
+            first_key = _repaired_sdf_key(repair_key, lower_index)
+            second_key = _repaired_sdf_key(repair_key, upper_index)
+            first = array_cache_get(first_key)
+            second = array_cache_get(second_key)
+            if first is None or second is None:
+                # Keep scrubbing responsive: show the nearest repaired key now,
+                # compute exact SDFs on one bounded worker, then refresh this
+                # angle from Blender's main-thread timer.
+                mask = repaired_stack[
+                    lower_index if factor < 0.5 else upper_index
+                ]
+                _queue_sdf_preview(
+                    project,
+                    value,
+                    (
+                        (first_key, repaired_stack[lower_index]),
+                        (second_key, repaired_stack[upper_index]),
+                    ),
+                )
+                first = second = None
+            if first is not None and second is not None:
+                first = _finite_sdf(first)
+                second = _finite_sdf(second)
         else:
             first = _finite_sdf(_sdf(lower_image))
             second = _finite_sdf(_sdf(upper_image))
-        mask = ((1.0 - factor) * first + factor * second) <= 0.0
+        if first is not None and second is not None:
+            mask = ((1.0 - factor) * first + factor * second) <= 0.0
     height, width = mask.shape
-    rgba = np.ones((height, width, 4), dtype=np.float32)
-    rgba[..., :3] = mask[..., None]
+    rgba = np.empty((height, width, 4), dtype=np.uint8)
+    luminance = mask.astype(np.uint8, copy=False) * np.uint8(255)
+    rgba[..., :3] = luminance[..., None]
+    rgba[..., 3] = 255
     image = _preview_image(project, width, height)
-    runtime.write_image_rgba(image, rgba)
+    runtime.write_image_rgba8(image, rgba)
     from .preview import set_preview_image
 
     set_preview_image(project, image)
@@ -255,10 +411,18 @@ def update_seek_preview(project: Any, angle: float) -> Any | None:
 
 
 def invalidate(project_uuid: str | None = None) -> None:
-    # Revision-bearing cache keys make selective invalidation unnecessary; a
-    # full clear bounds memory after long paint sessions.
-    _SDF_CACHE.clear()
-    _REPAIR_CACHE.clear()
+    global _CACHE_GENERATION
+    _CACHE_GENERATION += 1
+    for future in _SDF_JOBS.values():
+        future.cancel()
+    _SDF_JOBS.clear()
+    if project_uuid:
+        _PENDING_REFRESH.pop(str(project_uuid), None)
+    else:
+        _PENDING_REFRESH.clear()
+    from .preview_cache import invalidate as invalidate_preview_cache
+
+    invalidate_preview_cache(project_uuid)
 
 
 def _detach_temporary_images(project_uuid: str = "", replacement: Any | None = None) -> None:
@@ -336,8 +500,17 @@ def release_project(project: Any | None) -> None:
 
 
 def cleanup() -> None:
+    global _SDF_EXECUTOR
     _detach_temporary_images()
     invalidate()
+    if bpy.app.timers.is_registered(_poll_sdf_jobs):
+        try:
+            bpy.app.timers.unregister(_poll_sdf_jobs)
+        except ValueError:
+            pass
+    if _SDF_EXECUTOR is not None:
+        _SDF_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _SDF_EXECUTOR = None
 
 
 __all__ = [
