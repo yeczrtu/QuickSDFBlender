@@ -65,6 +65,17 @@ class ReleaseNamingTests(unittest.TestCase):
                 violations.append(path.relative_to(ADDON).as_posix())
         self.assertEqual(violations, [])
 
+    def test_readme_places_sdf_terminology_after_the_user_workflow(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        workflow = readme.index("## 5つの操作")
+        export = readme.index("## スレッショルドマップの出力")
+        terminology = readme.index("## 出力とSDF")
+        development = readme.index("## Development")
+
+        self.assertLess(workflow, export)
+        self.assertLess(export, terminology)
+        self.assertLess(terminology, development)
+
     def test_internal_compatibility_versions_remain_unchanged(self) -> None:
         model_source = (ADDON / "model.py").read_text(encoding="utf-8")
         self.assertIn("SCHEMA_VERSION = 6", model_source)
