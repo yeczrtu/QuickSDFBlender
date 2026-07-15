@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { deflateSync } from "node:zlib";
+import { normalizedThresholdBlur } from "./threshold-study-math.mjs";
 
 function parseArguments(argv) {
   const options = {};
@@ -206,36 +207,12 @@ function firstKeyThreshold(keyMasks) {
   return threshold;
 }
 
-function boxBlur(values, radius = 8) {
-  const temporary = new Float32Array(values.length);
-  const output = new Float32Array(values.length);
-  for (let y = 0; y < SIZE; y += 1) {
-    let sum = 0;
-    for (let x = -radius; x <= radius; x += 1) {
-      const sx = Math.max(0, Math.min(SIZE - 1, x));
-      sum += values[y * SIZE + sx];
-    }
-    for (let x = 0; x < SIZE; x += 1) {
-      temporary[y * SIZE + x] = sum / (radius * 2 + 1);
-      const remove = Math.max(0, x - radius);
-      const add = Math.min(SIZE - 1, x + radius + 1);
-      sum += values[y * SIZE + add] - values[y * SIZE + remove];
-    }
-  }
-  for (let x = 0; x < SIZE; x += 1) {
-    let sum = 0;
-    for (let y = -radius; y <= radius; y += 1) {
-      const sy = Math.max(0, Math.min(SIZE - 1, y));
-      sum += temporary[sy * SIZE + x];
-    }
-    for (let y = 0; y < SIZE; y += 1) {
-      output[y * SIZE + x] = sum / (radius * 2 + 1);
-      const remove = Math.max(0, y - radius);
-      const add = Math.min(SIZE - 1, y + radius + 1);
-      sum += temporary[add * SIZE + x] - temporary[remove * SIZE + x];
-    }
-  }
-  return output;
+function midpointThresholdFromFirstKey(firstThreshold) {
+  const halfKeyInterval = 0.5 / (KEY_COUNT - 1);
+  return Float32Array.from(firstThreshold, (value) => {
+    if (value < 0 || value > 1) return value;
+    return Math.max(0, value - halfKeyInterval);
+  });
 }
 
 function maskAtThreshold(threshold, t) {
@@ -284,7 +261,26 @@ function temporalChangeSeries(method) {
   return { mean, standardDeviation: Math.sqrt(variance), peak: Math.max(...changes) };
 }
 
-function evaluateMethod(method, scene) {
+function transitionAngleError(methodThreshold, scene) {
+  let errorSum = 0;
+  let transitionPixelCount = 0;
+  for (let y = 0; y < SIZE; y += 1) {
+    for (let x = 0; x < SIZE; x += 1) {
+      const p = y * SIZE + x;
+      const nx = (x + 0.5) / SIZE;
+      const ny = (y + 0.5) / SIZE;
+      const expected = thresholdField(scene, nx, ny);
+      if (expected < 0 || expected > 1) continue;
+      const actual = methodThreshold[p];
+      const boundedActual = Math.max(0, Math.min(1, actual));
+      errorSum += Math.abs(boundedActual - expected) * 90;
+      transitionPixelCount += 1;
+    }
+  }
+  return transitionPixelCount ? errorSum / transitionPixelCount : 0;
+}
+
+function evaluateMethod(method, methodThreshold, scene) {
   const mismatch = [];
   const overlaps = [];
   for (let angle = 1; angle < 90; angle += 1) {
@@ -301,6 +297,7 @@ function evaluateMethod(method, scene) {
     meanIoU: average(overlaps),
     temporalChangeStdDevPercent: temporal.standardDeviation * 100,
     peakOneDegreeChangePercent: temporal.peak * 100,
+    meanTransitionAngleErrorDegrees: transitionAngleError(methodThreshold, scene),
   };
 }
 
@@ -425,6 +422,39 @@ function blitNearest(target, targetWidth, targetHeight, source, sourceWidth, sou
   }
 }
 
+function fillRectangle(target, targetWidth, targetHeight, x, y, width, height, color) {
+  const left = Math.max(0, x);
+  const top = Math.max(0, y);
+  const right = Math.min(targetWidth, x + width);
+  const bottom = Math.min(targetHeight, y + height);
+  for (let py = top; py < bottom; py += 1) {
+    for (let px = left; px < right; px += 1) {
+      const offset = (py * targetWidth + px) * 4;
+      target[offset] = color[0];
+      target[offset + 1] = color[1];
+      target[offset + 2] = color[2];
+      target[offset + 3] = 255;
+    }
+  }
+}
+
+function drawRightArrow(target, targetWidth, targetHeight, centerX, centerY, color) {
+  fillRectangle(target, targetWidth, targetHeight, centerX - 8, centerY - 2, 11, 5, color);
+  for (let step = 0; step < 7; step += 1) {
+    const halfHeight = 6 - step;
+    fillRectangle(
+      target,
+      targetWidth,
+      targetHeight,
+      centerX + 3 + step,
+      centerY - halfHeight,
+      1,
+      halfHeight * 2 + 1,
+      color,
+    );
+  }
+}
+
 function buildOverviewCard(study) {
   const width = 1200;
   const height = 630;
@@ -437,16 +467,29 @@ function buildOverviewCard(study) {
   }
 
   const stagePanels = [
-    maskPanel(study.keyMasks[2]),
-    valuePanel(study.signedDistances[2], -80, 80),
-    maskPanel(study.keyMasks[3]),
+    maskPanel(study.keyMasks[1]),
+    maskPanel(study.keyMasks[4]),
     valuePanel(study.sdfThreshold, 0, 1),
+    maskPanel(maskAtThreshold(study.sdfThreshold, 37.5 / 90), [135, 220, 176]),
+  ];
+  const stageColors = [
+    [244, 162, 76],
+    [244, 162, 76],
+    [87, 169, 255],
+    [135, 220, 176],
   ];
   stagePanels.forEach((panel, index) => {
-    blitNearest(pixels, width, height, panel, SIZE, SIZE, 30 + index * 290, 30, 270, 270);
+    const x = 30 + index * 290;
+    blitNearest(pixels, width, height, panel, SIZE, SIZE, x, 30, 270, 270);
+    fillRectangle(pixels, width, height, x, 30, 270, 6, stageColors[index]);
+    if (index < stagePanels.length - 1) {
+      drawRightArrow(pixels, width, height, x + 280, 165, [182, 193, 205]);
+    }
   });
   study.keyMasks.forEach((mask, index) => {
-    blitNearest(pixels, width, height, maskPanel(mask), SIZE, SIZE, 30 + index * 165, 420, 150, 150);
+    const x = 30 + index * 165;
+    blitNearest(pixels, width, height, maskPanel(mask), SIZE, SIZE, x, 420, 150, 150);
+    fillRectangle(pixels, width, height, x, 420, 150, 4, [244, 162, 76]);
   });
   return { width, height, pixels };
 }
@@ -458,14 +501,21 @@ function buildStudy(scene) {
   const signedDistances = keyMasks.map(signedDistance);
   const sdfThreshold = thresholdFromKeys(keyMasks, signedDistances);
   const firstThreshold = firstKeyThreshold(keyMasks);
-  const blurredThreshold = boxBlur(firstThreshold);
+  const midpointThreshold = midpointThresholdFromFirstKey(firstThreshold);
+  const blurredThreshold = normalizedThresholdBlur(firstThreshold, SIZE);
   const methods = {
     nearestKey: (t) => nearestMask(keyMasks, t),
     pixelLinear: (t) => pixelLinearMask(keyMasks, t),
     blurredCumulative: (t) => maskAtThreshold(blurredThreshold, t),
     sdfDistanceRatio: (t) => maskAtThreshold(sdfThreshold, t),
   };
-  return { scene, keyMasks, signedDistances, sdfThreshold, methods };
+  const methodThresholds = {
+    nearestKey: midpointThreshold,
+    pixelLinear: midpointThreshold,
+    blurredCumulative: blurredThreshold,
+    sdfDistanceRatio: sdfThreshold,
+  };
+  return { scene, keyMasks, signedDistances, sdfThreshold, methods, methodThresholds };
 }
 
 const studies = new Map();
@@ -479,7 +529,10 @@ const sceneResults = Object.fromEntries(SCENES.map((scene) => {
   return [scene.id, {
     label: scene.label,
     methods: Object.fromEntries(
-      Object.entries(study.methods).map(([name, method]) => [name, evaluateMethod(method, scene.id)]),
+      Object.entries(study.methods).map(([name, method]) => [
+        name,
+        evaluateMethod(method, study.methodThresholds[name], scene.id),
+      ]),
     ),
   }];
 }));
@@ -493,6 +546,7 @@ const aggregate = Object.fromEntries(methodNames.map((methodName) => {
     meanIoU: average(values.map((value) => value.meanIoU)),
     temporalChangeStdDevPercent: average(values.map((value) => value.temporalChangeStdDevPercent)),
     peakOneDegreeChangePercent: values.reduce((maximum, value) => Math.max(maximum, value.peakOneDegreeChangePercent), 0),
+    meanTransitionAngleErrorDegrees: average(values.map((value) => value.meanTransitionAngleErrorDegrees)),
   }];
 }));
 

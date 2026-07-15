@@ -56,8 +56,8 @@ export const metadata: Metadata = {
     images: [
       {
         url: socialImage,
-        width: 2048,
-        height: 1080,
+        width: 1920,
+        height: 1001,
         alt: "Quick SDF Paintで顔影スレッショルドマップを編集している画面",
       },
     ],

@@ -77,11 +77,11 @@ export function ArticleLayout({
 
       <main>
         <nav className="article-breadcrumb page-shell" aria-label="パンくず">
-          <a href={`${basePath}/`}>Quick SDF Paint</a>
-          <span aria-hidden="true">/</span>
-          <a href={`${basePath}/articles/`}>解説記事</a>
-          <span aria-hidden="true">/</span>
-          <span aria-current="page">{article.shortTitle}</span>
+          <ol>
+            <li><a href={`${basePath}/`}>Quick SDF Paint</a></li>
+            <li><a href={`${basePath}/articles/`}>解説記事</a></li>
+            <li><span aria-current="page">{article.shortTitle}</span></li>
+          </ol>
         </nav>
 
         <header className="article-hero page-shell">
@@ -92,7 +92,11 @@ export function ArticleLayout({
             <div><dt>対象</dt><dd>{article.audience}</dd></div>
             <div><dt>読了目安</dt><dd>{article.readingTime}</dd></div>
             <div><dt>公開日</dt><dd><time dateTime={article.published}>{formatArticleDate(article.published)}</time></dd></div>
-            <div><dt>執筆・検証</dt><dd>Quick SDF Paint</dd></div>
+            <div>
+              <dt>執筆・検証</dt>
+              <dd><a href="https://github.com/yeczrtu/QuickSDFBlender">Quick SDF Paint contributors</a></dd>
+            </div>
+            <div><dt>公開</dt><dd><a href={`${basePath}/`}>Quick SDF Paint</a></dd></div>
           </dl>
         </header>
 
@@ -124,9 +128,10 @@ export function ArticleFigure({
   src,
   alt,
   caption,
-  width = 2048,
-  height = 1080,
+  width = 1920,
+  height = 1001,
   contain = false,
+  reducedMotionSrc,
 }: {
   src: string;
   alt: string;
@@ -134,13 +139,16 @@ export function ArticleFigure({
   width?: number;
   height?: number;
   contain?: boolean;
+  reducedMotionSrc?: string;
 }) {
   return (
     <figure className={`article-figure${contain ? " contain" : ""}`}>
       <a href={src} target="_blank" rel="noreferrer" aria-label={`${alt}を原寸で開く`}>
-        {/* Static GitHub Pages export keeps the original research image byte-for-byte. */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={src} alt={alt} width={width} height={height} loading="lazy" />
+        <picture>
+          {reducedMotionSrc ? <source media="(prefers-reduced-motion: reduce)" srcSet={reducedMotionSrc} /> : null}
+          {/* Static GitHub Pages export keeps the original research image byte-for-byte. */}
+          <img src={src} alt={alt} width={width} height={height} loading="lazy" />
+        </picture>
       </a>
       <figcaption>{caption}</figcaption>
     </figure>

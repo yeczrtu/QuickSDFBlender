@@ -15,6 +15,44 @@ const mediaFiles = [
   "quick-sdf-threshold-example.png",
 ];
 
+function rasterDimensions(bytes) {
+  if (bytes.subarray(1, 4).toString("ascii") === "PNG") {
+    return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+  }
+  const signature = bytes.subarray(0, 6).toString("ascii");
+  if (signature === "GIF87a" || signature === "GIF89a") {
+    return [bytes.readUInt16LE(6), bytes.readUInt16LE(8)];
+  }
+  throw new Error("Unsupported raster format");
+}
+
+function metaContent(html, attribute, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = html.match(new RegExp(`<meta ${attribute}="${escapedKey}" content="([^"]*)"`));
+  assert.ok(match, `${attribute}=${key} must be present`);
+  return match[1];
+}
+
+function articleJsonLd(html) {
+  const match = html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/);
+  assert.ok(match, "article JSON-LD must be present");
+  return JSON.parse(match[1]);
+}
+
+function assertFiniteNumbers(value, path = "results") {
+  if (typeof value === "number") {
+    assert.ok(Number.isFinite(value), `${path} must be finite`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertFiniteNumbers(entry, `${path}[${index}]`));
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) assertFiniteNumbers(entry, `${path}.${key}`);
+  }
+}
+
 test("exports a GitHub Pages document with project-relative assets", async () => {
   const html = await readFile(new URL("../out/index.html", import.meta.url), "utf8");
 
@@ -185,6 +223,39 @@ test("ships the documented captures and the Pages marker", async () => {
   assert.equal(basePath, "/QuickSDFBlender");
 });
 
+test("uses intrinsic raster dimensions and a reduced-motion timeline poster", async () => {
+  const pages = [
+    "../out/index.html",
+    "../out/articles/face-shadow-threshold-map/index.html",
+    "../out/articles/sdf-threshold-interpolation/index.html",
+    "../out/articles/blender-threshold-map-workflow/index.html",
+  ];
+
+  for (const page of pages) {
+    const html = await readFile(new URL(page, import.meta.url), "utf8");
+    const imageTags = [...html.matchAll(/<img\b[^>]*\bsrc="([^"]+)"[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"[^>]*>/g)];
+    for (const [, source, width, height] of imageTags) {
+      if (!source.startsWith(`${basePath}/media/`) && !source.startsWith(`${basePath}/research/`)) continue;
+      const bytes = await readFile(new URL(`../public/${source.slice(basePath.length + 1)}`, import.meta.url));
+      assert.deepEqual(
+        [Number(width), Number(height)],
+        rasterDimensions(bytes),
+        `${source} must use its intrinsic dimensions`,
+      );
+    }
+  }
+
+  const workflow = await readFile(
+    new URL("../out/articles/blender-threshold-map-workflow/index.html", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /<source media="\(prefers-reduced-motion: reduce\)" srcSet="\/QuickSDFBlender\/media\/quick-sdf-angle-seek-poster\.png"\/>/,
+  );
+  assert.match(workflow, /<img src="\/QuickSDFBlender\/media\/quick-sdf-angle-seek\.gif"/);
+});
+
 const articlePages = [
   {
     slug: "face-shadow-threshold-map",
@@ -196,51 +267,100 @@ const articlePages = [
     slug: "sdf-threshold-interpolation",
     title: "SDF距離補間の比較検証",
     uniqueText: "比較する4つの方法",
-    evidence: "この記事で独自に行ったこと",
+    evidence: "比較実験の条件",
   },
   {
     slug: "blender-threshold-map-workflow",
-    title: "Blenderで顔影スレッショルドマップを作る",
-    uniqueText: "顔の部位ごとの判断基準",
-    evidence: "この記事で独自に行ったこと",
+    title: "Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る",
+    uniqueText: "完成までの最短5手順",
+    evidence: "動作確認条件",
   },
 ];
 
 test("exports an index and three distinct long-form articles", async () => {
   const index = await readFile(new URL("../out/articles/index.html", import.meta.url), "utf8");
   assert.match(index, /顔影スレッショルドマップを[^<]*仕組みから理解する/);
-  assert.match(index, /既存資料の要約だけでなく/);
+  assert.match(index, /基礎構造、同一条件での補間比較、Blender 5\.1での実践手順/);
+  assert.doesNotMatch(index, /既存資料の要約だけでなく|既存要約ではない/);
+
+  assert.equal(metaContent(index, "property", "og:title"), metaContent(index, "name", "twitter:title"));
+  assert.equal(metaContent(index, "property", "og:description"), metaContent(index, "name", "twitter:description"));
+  assert.equal(metaContent(index, "property", "og:image"), metaContent(index, "name", "twitter:image"));
+  assert.equal(metaContent(index, "name", "twitter:card"), "summary_large_image");
 
   for (const article of articlePages) {
     const html = await readFile(new URL(`../out/articles/${article.slug}/index.html`, import.meta.url), "utf8");
     assert.match(html, new RegExp(article.title));
     assert.match(html, new RegExp(article.uniqueText));
     assert.match(html, new RegExp(article.evidence));
-    assert.match(html, /application\/ld\+json/);
-    assert.match(html, /"@type":"TechArticle"/);
-    assert.match(html, /"@type":"BreadcrumbList"/);
+    const jsonLd = articleJsonLd(html);
+    assert.ok(Array.isArray(jsonLd["@graph"]));
+    const techArticle = jsonLd["@graph"].find((entry) => entry["@type"] === "TechArticle");
+    const breadcrumbs = jsonLd["@graph"].find((entry) => entry["@type"] === "BreadcrumbList");
+    assert.ok(techArticle);
+    assert.ok(breadcrumbs);
+    assert.deepEqual(techArticle.author, {
+      "@type": "Organization",
+      name: "Quick SDF Paint contributors",
+      url: "https://github.com/yeczrtu/QuickSDFBlender",
+    });
+    assert.equal(techArticle.publisher.name, "Quick SDF Paint");
+    assert.equal(breadcrumbs.itemListElement.length, 3);
+    assert.match(html, /<nav class="article-breadcrumb page-shell" aria-label="パンくず"><ol>/);
     assert.match(html, new RegExp(`https://yeczrtu\\.github\\.io/QuickSDFBlender/articles/${article.slug}/`));
-    assert.match(html, new RegExp(`<meta name="twitter:title" content="[^"]*${article.title}`));
+    assert.equal(metaContent(html, "property", "og:title"), metaContent(html, "name", "twitter:title"));
+    assert.equal(metaContent(html, "property", "og:description"), metaContent(html, "name", "twitter:description"));
+    assert.equal(metaContent(html, "property", "og:image"), metaContent(html, "name", "twitter:image"));
+    assert.equal(metaContent(html, "name", "twitter:card"), "summary_large_image");
     assert.match(html, /執筆・検証/);
+    assert.match(html, /Quick SDF Paint contributors/);
+    assert.match(html, /<dt>公開<\/dt><dd><a href="\/QuickSDFBlender\/">Quick SDF Paint<\/a><\/dd>/);
     assert.match(html, /関連する解説/);
+    assert.doesNotMatch(html, /この記事で独自に行ったこと/);
     assert.doesNotMatch(html, /Face\s?SDF(?:は|とは)[^<。]{0,20}(?:一般名称です|標準名称です|一般的な名称です)/i);
   }
 });
 
+test("keeps article tables and cross-links accessible and contextual", async () => {
+  const articleHtml = Object.fromEntries(await Promise.all(articlePages.map(async ({ slug }) => [
+    slug,
+    await readFile(new URL(`../out/articles/${slug}/index.html`, import.meta.url), "utf8"),
+  ])));
+
+  for (const html of Object.values(articleHtml)) {
+    for (const match of html.matchAll(/<table\b[\s\S]*?<\/table>/g)) {
+      const table = match[0];
+      assert.match(table, /<caption>[^<]+<\/caption>/);
+      const headers = [...table.matchAll(/<th\b([^>]*)>/g)];
+      assert.ok(headers.length > 0);
+      for (const [, attributes] of headers) assert.match(attributes, /scope="(?:col|row)"/);
+    }
+    assert.doesNotMatch(html, /大形|停止画/);
+  }
+
+  assert.match(articleHtml["face-shadow-threshold-map"], /articles\/sdf-threshold-interpolation\//);
+  assert.match(articleHtml["face-shadow-threshold-map"], /articles\/blender-threshold-map-workflow\//);
+  assert.match(articleHtml["sdf-threshold-interpolation"], /articles\/blender-threshold-map-workflow\//);
+  assert.match(articleHtml["face-shadow-threshold-map"], /物理的なライト角/);
+  assert.match(articleHtml["face-shadow-threshold-map"], /そのものではありません/);
+  assert.match(articleHtml["sdf-threshold-interpolation"], /物理的なライト角/);
+  assert.match(articleHtml["sdf-threshold-interpolation"], /ではありません/);
+  assert.match(articleHtml["blender-threshold-map-workflow"], /物理的なライト角ではありません/);
+});
+
 test("publishes source-backed original research rather than unsupported SDF claims", async () => {
-  const [html, resultsText, generator] = await Promise.all([
+  const [html, resultsText, generator, studyMath] = await Promise.all([
     readFile(new URL("../out/articles/sdf-threshold-interpolation/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/research/threshold-study/results.json", import.meta.url), "utf8"),
     readFile(new URL("../scripts/generate-threshold-study.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/threshold-study-math.mjs", import.meta.url), "utf8"),
   ]);
   const results = JSON.parse(resultsText);
 
+  assertFiniteNumbers(results);
   assert.deepEqual(results.resolution, [512, 512]);
   assert.equal(Object.keys(results.scenes).length, 6);
-  assert.equal(
-    results.aggregate.nearestKey.meanPixelErrorPercent,
-    results.aggregate.pixelLinear.meanPixelErrorPercent,
-  );
+  assert.deepEqual(results.aggregate.nearestKey, results.aggregate.pixelLinear);
   assert.ok(
     results.aggregate.sdfDistanceRatio.meanPixelErrorPercent
       < results.aggregate.nearestKey.meanPixelErrorPercent,
@@ -249,13 +369,55 @@ test("publishes source-backed original research rather than unsupported SDF clai
   assert.match(generator, /function exactSquaredDistance/);
   assert.match(generator, /function thresholdField/);
   assert.match(generator, /const ALL_SCENES/);
+  assert.match(studyMath, /function normalizedThresholdBlur/);
+  assert.match(studyMath, /blurredValues\[p\] \/ blurredWeights\[p\]/);
+
+  const labels = {
+    nearestKey: "最近傍キー",
+    pixelLinear: "画素線形＋二値化",
+    blurredCumulative: "初回キー＋Box Blur",
+    sdfDistanceRatio: "Exact SDF距離比",
+  };
+  for (const [method, label] of Object.entries(labels)) {
+    const metrics = results.aggregate[method];
+    const row = [
+      `<th scope="row">${label}</th>`,
+      `<td>${metrics.meanPixelErrorPercent.toFixed(2)}%</td>`,
+      `<td>${metrics.meanIoU.toFixed(3)}</td>`,
+      `<td>${metrics.temporalChangeStdDevPercent.toFixed(2)}%</td>`,
+      `<td>${metrics.peakOneDegreeChangePercent.toFixed(2)}%</td>`,
+      `<td>${metrics.meanTransitionAngleErrorDegrees.toFixed(3)}°</td>`,
+    ].join("");
+    assert.ok(html.includes(row), `${method} metrics must match results.json`);
+  }
   assert.match(html, /結果を見た後のパラメーター調整なし/);
   assert.match(html, /89評価角度/);
   assert.match(html, /既定8キーとは別/);
-  assert.doesNotMatch(html, /89中間角度|5度刻みの36枚|d_i\+1|S_i\+1/);
+  assert.doesNotMatch(html, /89中間角度|5度刻みの36枚|d_i\+1|S_i\+1|C0連続/);
+  assert.match(html, /画素中心上で最寄りの反対クラスの画素中心まで測る/);
+  assert.match(html, /連続境界を復元できるという意味ではありません/);
+  assert.match(html, /website\/scripts\/generate-threshold-study\.mjs/);
+  assert.match(html, /website\/public\/research\/threshold-study\/results\.json/);
   assert.match(html, /SDFなら真の形状変化を復元できる[^<]*証明ではありません/);
   assert.match(html, /theoryofcomputing\.org\/articles\/v008a019/);
   assert.match(html, /TPAMI\.2003\.1177156/);
+});
+
+test("documents the Quick SDF Paint 0.7.1 artist workflow without hidden steps", async () => {
+  const html = await readFile(
+    new URL("../out/articles/blender-threshold-map-workflow/index.html", import.meta.url),
+    "utf8",
+  );
+  assert.match(html, /Quick SDF Paint 0\.7\.1を使い/);
+  assert.match(html, /完成までの最短5手順/);
+  assert.match(html, /16-bit RGBA PNG/);
+  assert.match(html, /0度はLight Starts、90度はFull Light/);
+  assert.match(html, /Shadow Amount[\s\S]{0,80}調整し、その後に<code>Update Shadow Guide<\/code>/);
+  assert.match(html, /実際に画素を変えた場合だけ自動キー/);
+  assert.match(html, /スクラブして確認するだけでは画像もキーも増えません/);
+  assert.match(html, /Undo[^<]*Delete/);
+  assert.match(html, /SDF Area[\s\S]{0,100}Quick SDF Paint共通の補助マスク/);
+  assert.match(html, /同じUV座標へ重なっている場合[^<]*Material SlotまたはUVを分ける必要/);
 });
 
 test("limits production claims to what the cited public sources support", async () => {

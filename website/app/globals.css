@@ -8,7 +8,7 @@
   --text: #f1f4f7;
   --soft: #c8d0d8;
   --muted: #98a3af;
-  --dim: #87929e;
+  --dim: #929da8;
   --orange: #f4a24c;
   --orange-soft: #ffd2a1;
   --blue: #57a9ff;
@@ -1181,11 +1181,29 @@ h3 {
 }
 
 .article-breadcrumb {
-  display: flex;
-  gap: 9px;
   padding-top: 34px;
   color: var(--dim);
   font-size: 11px;
+}
+
+.article-breadcrumb ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.article-breadcrumb li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.article-breadcrumb li + li::before {
+  color: var(--line);
+  content: "/";
 }
 
 .article-breadcrumb a:hover {
@@ -1243,6 +1261,13 @@ h3 {
 .article-meta dd {
   margin: 0;
   color: var(--soft);
+}
+
+.article-meta a {
+  color: var(--blue-soft);
+  text-decoration: underline;
+  text-decoration-color: rgba(87, 169, 255, 0.4);
+  text-underline-offset: 3px;
 }
 
 .article-frame {
@@ -1365,6 +1390,7 @@ h3 {
 }
 
 .article-body caption {
+  caption-side: top;
   padding: 0 0 9px;
   color: var(--soft);
   font-size: 12px;
@@ -1434,6 +1460,10 @@ h3 {
   display: block;
   width: 100%;
   height: auto;
+}
+
+.article-figure picture {
+  display: block;
 }
 
 .article-figure.contain img {
@@ -1915,8 +1945,13 @@ h3 {
   }
 
   .article-breadcrumb {
-    overflow: hidden;
+    overflow-x: auto;
     white-space: nowrap;
+  }
+
+  .article-breadcrumb ol {
+    width: max-content;
+    flex-wrap: nowrap;
   }
 
   .article-hero {

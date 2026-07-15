@@ -5,15 +5,73 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { normalizedThresholdBlur } from "../scripts/threshold-study-math.mjs";
 
 const websiteRoot = resolve(import.meta.dirname, "..");
 const generator = resolve(websiteRoot, "scripts/generate-threshold-study.mjs");
 
-function generate(output, extra = []) {
+test("keeps valid Box Blur values independent of the always-Shadow sentinel", () => {
+  const size = 5;
+  const withSentinelTwo = Float32Array.from([
+    2, 2, 2, 2, 2,
+    2, 0.1, 0.2, 0.3, 2,
+    2, 0.2, 0.4, 0.6, 2,
+    2, 0.3, 0.6, 0.9, 2,
+    2, 2, 2, 2, 2,
+  ]);
+  const withSentinelNine = Float32Array.from(
+    withSentinelTwo,
+    (value) => value === 2 ? 9 : value,
+  );
+
+  const blurredWithTwo = normalizedThresholdBlur(withSentinelTwo, size, 1, 2);
+  const blurredWithNine = normalizedThresholdBlur(withSentinelNine, size, 1, 9);
+  for (let p = 0; p < withSentinelTwo.length; p += 1) {
+    if (withSentinelTwo[p] === 2) {
+      assert.equal(blurredWithTwo[p], 2);
+      assert.equal(blurredWithNine[p], 9);
+    } else {
+      assert.equal(blurredWithTwo[p], blurredWithNine[p]);
+    }
+  }
+});
+
+function studyEnvironment(overrides = {}) {
+  const environment = { ...process.env };
+  delete environment.QSDF_STUDY_SIZE;
+  delete environment.QSDF_STUDY_OUTPUT;
+  delete environment.QSDF_STUDY_SCENE;
+  return { ...environment, ...overrides };
+}
+
+function generate(output, extra = [], environment = {}) {
   const result = spawnSync(
     process.execPath,
     [generator, "--resolution", "64", "--output", output, ...extra],
-    { cwd: websiteRoot, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+    {
+      cwd: websiteRoot,
+      encoding: "utf8",
+      env: studyEnvironment(environment),
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function generateFromEnvironment(output, scene) {
+  const result = spawnSync(
+    process.execPath,
+    [generator],
+    {
+      cwd: websiteRoot,
+      encoding: "utf8",
+      env: studyEnvironment({
+        QSDF_STUDY_SIZE: "64",
+        QSDF_STUDY_OUTPUT: output,
+        QSDF_STUDY_SCENE: scene,
+      }),
+      maxBuffer: 4 * 1024 * 1024,
+    },
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
@@ -108,6 +166,15 @@ test("regenerates the complete 64px study byte-for-byte", async (context) => {
     results.aggregate.sdfDistanceRatio.meanPixelErrorPercent
       < results.aggregate.nearestKey.meanPixelErrorPercent,
   );
+  for (const method of Object.values(results.aggregate)) {
+    assert.ok(Number.isFinite(method.meanTransitionAngleErrorDegrees));
+    assert.ok(method.meanTransitionAngleErrorDegrees >= 0);
+    assert.ok(method.meanTransitionAngleErrorDegrees <= 90);
+  }
+  assert.equal(
+    results.aggregate.nearestKey.meanTransitionAngleErrorDegrees,
+    results.aggregate.pixelLinear.meanTransitionAngleErrorDegrees,
+  );
   assert.ok(results.quantization.uint8.maxAngleErrorDegrees <= 90 / (2 * 255) + 1e-6);
   assert.ok(results.quantization.uint16.maxAngleErrorDegrees <= 90 / (2 * 65535) + 1e-6);
 });
@@ -124,4 +191,14 @@ test("supports generating a single named study scene", async (context) => {
     "sdf-stages.png",
     "threshold-map-overview-card.png",
   ]);
+});
+
+test("keeps the documented environment-variable interface", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "qsdf-study-env-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  generateFromEnvironment(root, "linear");
+  const results = JSON.parse(await readFile(join(root, "results.json"), "utf8"));
+  assert.deepEqual(results.resolution, [64, 64]);
+  assert.deepEqual(Object.keys(results.scenes), ["linear"]);
+  assert.ok(Number.isFinite(results.aggregate.blurredCumulative.meanTransitionAngleErrorDegrees));
 });
