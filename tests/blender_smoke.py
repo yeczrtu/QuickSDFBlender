@@ -1,4 +1,4 @@
-"""End-to-end Blender 5.1 smoke test for the Quick SDF extension.
+"""End-to-end Blender 5.1/5.2 smoke test for the Quick SDF extension.
 
 Run from the repository root with::
 
@@ -288,8 +288,8 @@ def _assert_export_worker_side_contracts() -> None:
 
 
 def run(output_directory: Path) -> None:
-    assert bpy.app.version[:2] == (5, 1), (
-        f"this smoke test targets Blender 5.1, got {bpy.app.version_string}"
+    assert (5, 1) <= bpy.app.version[:2] < (5, 3), (
+        f"this smoke test targets Blender 5.1/5.2, got {bpy.app.version_string}"
     )
     output_directory = output_directory.expanduser().resolve()
     output_directory.mkdir(parents=True, exist_ok=True)

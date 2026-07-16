@@ -35,6 +35,8 @@ $extensionVersion = $Matches[1]
 $extensionArchive = Join-Path $buildDirectory "quick_sdf_blender-$extensionVersion-windows-x64.zip"
 $studioResult = Join-Path $buildDirectory 'studio_smoke_result.txt'
 $studioSavedBlend = Join-Path $buildDirectory 'studio_adjusted_save.blend'
+$studioAutosaveBlend = Join-Path $buildDirectory 'studio_autosave.blend'
+$studioAutosaveFingerprints = Join-Path $buildDirectory 'studio_autosave_fingerprints.json'
 $studioSwitchResult = Join-Path $buildDirectory 'studio_switch_smoke_result.txt'
 $timelineIsolationResult = Join-Path $buildDirectory 'timeline_isolation_smoke_result.txt'
 $autoKeyResult = Join-Path $buildDirectory 'auto_key_smoke_result.txt'
@@ -48,6 +50,19 @@ if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
 if (-not (Get-Command $PythonPath -ErrorAction SilentlyContinue)) {
     throw "Python executable was not found: $PythonPath"
 }
+$blenderVersionOutput = & $BlenderPath --version
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not query Blender version from $BlenderPath"
+}
+$blenderVersionLine = [string]($blenderVersionOutput | Select-Object -First 1)
+if ($blenderVersionLine -notmatch '^Blender\s+(\d+\.\d+\.\d+)') {
+    throw "Could not parse Blender version from: $blenderVersionLine"
+}
+$blenderVersion = [version]$Matches[1]
+if ($blenderVersion -lt [version]'5.1.0' -or $blenderVersion -ge [version]'5.3.0') {
+    throw "Quick SDF Paint supports Blender 5.1 and 5.2; got $blenderVersion"
+}
+$blenderLabel = "Blender $($blenderVersion.ToString(3))"
 New-Item -ItemType Directory -Force -Path $buildDirectory | Out-Null
 
 Push-Location $repositoryRoot
@@ -76,7 +91,7 @@ try {
         throw "Unit tests failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 3/19 Run Blender 5.1 background smoke test'
+    Write-Host "==> 3/19 Run $blenderLabel background smoke test"
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $smokeTest -- --output-dir $buildDirectory
     if ($LASTEXITCODE -ne 0) {
@@ -111,9 +126,14 @@ try {
         throw "Blender interactive paint smoke test failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host '==> 8/19 Run Blender 5.1 interactive Studio lifecycle smoke test'
+    Write-Host "==> 8/19 Run $blenderLabel interactive Studio lifecycle smoke test"
     if (Test-Path -LiteralPath $studioResult) {
         Remove-Item -Force -LiteralPath $studioResult
+    }
+    foreach ($autosaveArtifact in @($studioAutosaveBlend, $studioAutosaveFingerprints)) {
+        if (Test-Path -LiteralPath $autosaveArtifact) {
+            Remove-Item -Force -LiteralPath $autosaveArtifact
+        }
     }
     & $BlenderPath --enable-event-simulate --factory-startup --python-exit-code 1 `
         --python $studioSmokeTest
@@ -129,6 +149,14 @@ try {
     }
     if (-not (Test-Path -LiteralPath $studioSavedBlend -PathType Leaf)) {
         throw 'Blender Studio smoke test did not produce its active-session save'
+    }
+    if ($blenderVersion -ge [version]'5.2.0') {
+        if (-not (Test-Path -LiteralPath $studioAutosaveBlend -PathType Leaf)) {
+            throw 'Blender Studio smoke test did not preserve its Texture Paint autosave'
+        }
+        if (-not (Test-Path -LiteralPath $studioAutosaveFingerprints -PathType Leaf)) {
+            throw 'Blender Studio smoke test did not record its autosave source fingerprints'
+        }
     }
 
     Write-Host '==> 9/19 Verify one-click Studio model switching'
@@ -230,12 +258,20 @@ try {
         throw "Blender Icosphere paint smoke test failed:`n$icospherePaintOutcome"
     }
 
-    Write-Host '==> 15/19 Verify active Studio save in a fresh Blender process'
+    Write-Host '==> 15/19 Verify normal save and Texture Paint autosave recovery'
     & $BlenderPath --background --factory-startup --python-exit-code 1 `
         --python $savedStateSmokeTest `
         -- --blend $studioSavedBlend
     if ($LASTEXITCODE -ne 0) {
         throw "Blender saved-state smoke test failed with exit code $LASTEXITCODE"
+    }
+    if ($blenderVersion -ge [version]'5.2.0') {
+        & $BlenderPath --background --factory-startup --python-exit-code 1 `
+            --python $savedStateSmokeTest `
+            -- --blend $studioAutosaveBlend --fingerprints $studioAutosaveFingerprints
+        if ($LASTEXITCODE -ne 0) {
+            throw "Blender autosave recovery smoke test failed with exit code $LASTEXITCODE"
+        }
     }
 
     Write-Host '==> 16/19 Verify 2048px/16-key performance and memory budgets'

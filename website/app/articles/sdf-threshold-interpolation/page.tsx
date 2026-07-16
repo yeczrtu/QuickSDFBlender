@@ -98,7 +98,7 @@ export default function SdfThresholdInterpolationArticle() {
       <pre><code>Light(t, p) = [t ≥ u(p)]</code></pre>
       <p>実際のシェーダーでは、頭部ローカルの<code>L</code>から水平ライト角<code>φ</code>を求め、設定した開始角と終了角の間を制作進行度<code>t</code>へ写像して比較します。シェーダーによって値や比較方向を反転して保存する場合はありますが、情報の意味は同じです。</p>
       <p><code>u</code>は距離でも物理角でもなく、制作進行度上の切替位置です。SDFが持つ境界付近の距離や勾配は、完成テクスチャには残りません。</p>
-      <p>Quick SDF Paint 0.7.1のlilToon向け既定出力では、<code>u</code>を反転して16-bitの値へ量子化します。</p>
+      <p>Quick SDF Paint 0.7.2のlilToon向け既定出力では、<code>u</code>を反転して16-bitの値へ量子化します。</p>
       <pre><code>q_lilToon(p) = round((1 - u(p)) × 65535)</code></pre>
       <p><a href="https://media.gdcvault.com/gdc2024/Slides/GDC%2Bslide%2Bpresentations/Tanaka_Kosuke_3D_Toon_Rendering.pdf">『Hi-Fi RUSH』GDC資料</a>にも、固定角度の二値マスクをDCC上で生成・修正し、1枚のthreshold mapへまとめる制作工程があります。ただし公開資料だけから内部生成式の詳細までは判断できません。本記事の数式と結果は、公開された別実装と本記事の検証コードに基づきます。</p>
 
@@ -139,7 +139,7 @@ export default function SdfThresholdInterpolationArticle() {
 
       <h2 id="experiment">比較実験の条件</h2>
       <p>手描き画像を選ぶと、特定の方式に都合のよい形を採用する余地があります。そこで制作進行度<code>t</code>に対して連続する正解形状を数式で定義し、0°、15°、30°、45°、60°、75°、90°の制作目盛りに対応する7枚だけを取り出しました。各方式にはこの7枚だけを渡し、元の連続式は与えません。</p>
-      <p>この7キー構成は、比較条件を等間隔に揃えるための実験用です。Quick SDF Paint 0.7.1の新規プロジェクトが作る既定8キーとは異なり、製品のキー数を推奨するための実験ではありません。</p>
+      <p>この7キー構成は、比較条件を等間隔に揃えるための実験用です。Quick SDF Paint 0.7.2の新規プロジェクトが作る既定8キーとは異なり、製品のキー数を推奨するための実験ではありません。</p>
       <ul>
         <li>解像度：512 × 512 px</li>
         <li>中間評価：1°～89°の89点を1°刻み</li>
@@ -261,7 +261,7 @@ export default function SdfThresholdInterpolationArticle() {
         <li>1画素につき1値の形式では、制作進行度方向の単調性が必要である</li>
       </ul>
       <p>SDF補間は万能な影生成ではなく、角度別マスクを少ない手作業で連続化するための道具です。性質と失敗条件を理解し、破綻する場所だけを人が直すことで、実制作での反復量を減らせます。</p>
-      <p>この補間をBlender上で確認し、必要な区間だけキーを増やす手順は、<a href={articlePath("blender-threshold-map-workflow")}>Quick SDF Paint 0.7.1で顔影スレッショルドマップを作る：Blenderでの実践手順</a>で説明します。</p>
+      <p>この補間をBlender上で確認し、必要な区間だけキーを増やす手順は、<a href={articlePath("blender-threshold-map-workflow")}>Quick SDF Paint 0.7.2で顔影スレッショルドマップを作る：Blenderでの実践手順</a>で説明します。</p>
 
       <SourceList>
         <h2>検証データと主な参考資料</h2>

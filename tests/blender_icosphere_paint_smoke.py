@@ -1,6 +1,6 @@
 """Artist-path regression for Quick SDF painting on a UV Icosphere.
 
-This interactive Blender 5.1 smoke test reproduces the model and defaults from
+This interactive Blender 5.1/5.2 smoke test reproduces the model and defaults from
 the reported black-viewport regression. It keeps the default normal guide,
 middle light-sweep key, and Overlay preview, then drives the public 3D paint macro.
 
@@ -524,7 +524,7 @@ def _tick() -> float | None:
             assert max_seconds < 0.75, timings
 
             # Light and Shadow are the only artist-facing paint actions.  A
-            # Blender 5.1 Brush Asset can keep the active Palette swatch, so a
+            # Blender 5.1/5.2 Brush Asset can keep the active Palette swatch, so a
             # regression here previously made the Light button paint Shadow.
             project.paint_value = 1
             before_light = runtime.image_rgba(canvas)

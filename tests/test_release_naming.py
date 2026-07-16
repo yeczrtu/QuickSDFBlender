@@ -12,7 +12,7 @@ ADDON = ROOT / "quick_sdf_blender"
 
 
 class ReleaseNamingTests(unittest.TestCase):
-    def test_manifest_and_bl_info_are_071_quick_sdf_paint(self) -> None:
+    def test_manifest_and_bl_info_are_072_quick_sdf_paint(self) -> None:
         manifest_source = (ADDON / "blender_manifest.toml").read_text(encoding="utf-8")
 
         def manifest_string(key: str) -> str:
@@ -24,7 +24,9 @@ class ReleaseNamingTests(unittest.TestCase):
 
         self.assertEqual(manifest_string("id"), "quick_sdf_blender")
         self.assertEqual(manifest_string("name"), "Quick SDF Paint")
-        self.assertEqual(manifest_string("version"), "0.7.1")
+        self.assertEqual(manifest_string("version"), "0.7.2")
+        self.assertEqual(manifest_string("blender_version_min"), "5.1.0")
+        self.assertEqual(manifest_string("blender_version_max"), "5.3.0")
         self.assertIn("threshold map", manifest_string("tagline").lower())
 
         module = ast.parse((ADDON / "__init__.py").read_text(encoding="utf-8"))
@@ -35,7 +37,7 @@ class ReleaseNamingTests(unittest.TestCase):
         )
         bl_info = ast.literal_eval(assignment.value)
         self.assertEqual(bl_info["name"], "Quick SDF Paint")
-        self.assertEqual(bl_info["version"], (0, 7, 1))
+        self.assertEqual(bl_info["version"], (0, 7, 2))
         self.assertIn("threshold map", bl_info["description"].lower())
 
     def test_old_product_name_is_only_the_workspace_migration_alias(self) -> None:

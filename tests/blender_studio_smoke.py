@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
+import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 
@@ -582,6 +586,30 @@ def check() -> float | None:
         assert project.onion_enabled
         assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
         assert image_area.spaces.active.image.get(runtime.ROLE_KEY) == ONION_PREVIEW_ROLE
+        if bpy.app.version >= (5, 2, 0):
+            # Blender 5.2 includes Texture Paint images in autosave.  The same
+            # save transaction must keep Quick SDF's source data intact and
+            # restore the transient Studio material, Canvas, and Onion preview.
+            # Texture Paint image recovery is a Blender 5.2 compatibility path.
+            before_autosave = _source_fingerprints(project, runtime)
+            assert bpy.ops.wm.save_auto_save() == {"FINISHED"}
+            assert _source_fingerprints(project, runtime) == before_autosave
+            autosave_source = (
+                Path(tempfile.gettempdir())
+                / f"{save_path.stem}_{os.getpid()}_autosave.blend"
+            )
+            assert autosave_source.is_file(), autosave_source
+            autosave_copy = ROOT / "build" / "studio_autosave.blend"
+            shutil.copy2(autosave_source, autosave_copy)
+            (ROOT / "build" / "studio_autosave_fingerprints.json").write_text(
+                json.dumps(before_autosave, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            assert studio.is_studio_active(bpy.context, str(project.uuid))
+            assert obj.material_slots[0].material != STATE["original_material"]
+            assert bpy.context.scene.tool_settings.image_paint.canvas == canvas
+            assert project.onion_enabled
+            assert image_area.spaces.active.image.get(runtime.ROLE_KEY) == ONION_PREVIEW_ROLE
         edit_uuid = str(runtime.active_angle(project).uuid)
         edit_angle = float(runtime.active_angle(project).angle)
         assert bpy.ops.quicksdf.seek_set(angle=22.5) == {"FINISHED"}

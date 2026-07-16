@@ -207,7 +207,7 @@ function ArticleFooter({ current }: { current: ArticleSlug }) {
       <div className="page-shell">
         <RelatedArticles current={current} />
         <div className="article-footer-line">
-          <span>Quick SDF Paint v0.7.1 — Blender 5.1 / Windows x64</span>
+          <span>Quick SDF Paint v0.7.2 — Blender 5.1 / 5.2 LTS · Windows x64</span>
           <span><a href={`${basePath}/`}>操作ガイド</a> · <a href="https://github.com/yeczrtu/QuickSDFBlender">GitHub</a></span>
         </div>
       </div>

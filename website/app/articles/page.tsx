@@ -6,7 +6,7 @@ const pageUrl = `${siteOrigin}${basePath}/articles/`;
 const articleCardTitles = {
   "face-shadow-threshold-map": <>顔影スレッショルドマップ<wbr />とは</>,
   "sdf-threshold-interpolation": <>SDF距離補間の比較</>,
-  "blender-threshold-map-workflow": <>Quick SDF Paint 0.7.1の<wbr />実践手順</>,
+  "blender-threshold-map-workflow": <>Quick SDF Paint 0.7.2の<wbr />実践手順</>,
 };
 
 export const metadata: Metadata = {
@@ -71,7 +71,7 @@ export default function ArticlesIndex() {
             <span className="article-title-line">顔影スレッショルド<wbr />マップの<wbr /></span>
             <span className="article-title-line">仕組みと制作方法</span>
           </h1>
-          <p>角度別の白黒マスクを、光の向きに応じた1枚のデータテクスチャへ変換する手法を扱います。基本的な仕組み、同一条件での補間比較、Blender 5.1での実践手順を順番に説明します。</p>
+          <p>角度別の白黒マスクを、光の向きに応じた1枚のデータテクスチャへ変換する手法を扱います。基本的な仕組み、同一条件での補間比較、Blender 5.1／5.2 LTSでの実践手順を順番に説明します。</p>
         </header>
 
         <section className="articles-index-grid page-shell" aria-label="解説記事">
@@ -94,7 +94,7 @@ export default function ArticlesIndex() {
           <h2 id="articles-method-title">調査と検証の範囲</h2>
           <div>
             <p>公開資料から用語、既存事例、アルゴリズムを確認し、複数実装に共通する処理を制作工程に沿って整理しています。</p>
-            <p>比較記事の画像と数値は、同じ入力から同じ結果を再生成できる、リポジトリ内の検証スクリプトで作成しています。実践記事はBlender 5.1とQuick SDF Paint 0.7.1で動作を確認しています。</p>
+            <p>比較記事の画像と数値は、同じ入力から同じ結果を再生成できる、リポジトリ内の検証スクリプトで作成しています。実践記事はBlender 5.1／5.2 LTSとQuick SDF Paint 0.7.2で動作を確認しています。</p>
           </div>
         </section>
       </main>

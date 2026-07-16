@@ -61,15 +61,15 @@ export default function BlenderWorkflowArticle() {
     <ArticleLayout
       article={article}
       titleParts={[
-        <>Quick SDF Paint <wbr />0.7.1で</>,
+        <>Quick SDF Paint <wbr />0.7.2で</>,
         <>顔影スレッショルド<wbr />マップを作る：</>,
         <>Blenderでの<wbr />実践手順</>,
       ]}
       toc={toc}
-      lead="Quick SDF Paint 0.7.1を使い、法線ガイドから顔影スレッショルドマップを書き出す実践手順です。角度ごとに別の影絵を完成させるのではなく、一つの影境界が制作上の進行度に応じて顔の上をどう移動するかを設計します。"
+      lead="Quick SDF Paint 0.7.2を使い、法線ガイドから顔影スレッショルドマップを書き出す実践手順です。角度ごとに別の影絵を完成させるのではなく、一つの影境界が制作上の進行度に応じて顔の上をどう移動するかを設計します。"
     >
       <EvidenceNote title="動作確認条件">
-        <p>Blender 5.1、Quick SDF Paint 0.7.1、1024 px、0°～90°の既定8キー、左右ミラーを有効にした状態で確認しました。操作の列挙ではなく、設定の誤りを先に見分ける方法、大きな形から直す順番、顔の部位ごとの判断、静止画と動きの評価を中心にしています。</p>
+        <p>Blender 5.1／5.2 LTS、Quick SDF Paint 0.7.2、1024 px、0°～90°の既定8キー、左右ミラーを有効にした状態で確認しました。操作の列挙ではなく、設定の誤りを先に見分ける方法、大きな形から直す順番、顔の部位ごとの判断、静止画と動きの評価を中心にしています。</p>
       </EvidenceNote>
 
       <h2 id="quick-start">完成までの最短5手順</h2>
